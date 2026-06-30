@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+.venv-mac/
 
 # Runtime data (may contain candidate information)
 logs/

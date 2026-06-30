@@ -1,0 +1,6 @@
+# Use Python 3.10+ for the Mac OCR development environment.
+rapidocr
+onnxruntime
+mss
+Pillow
+numpy
