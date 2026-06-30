@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime data (may contain candidate information)
+logs/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
