@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 venv/
 .venv/
 .venv-mac/
@@ -15,8 +16,12 @@ logs/
 
 # Local project documentation
 *.md
+!README.md
+!release-notes/
+!release-notes/*.md
 
 # Local packaging artifacts
 /build/
+/dist/
 /release/
 /release-lean/

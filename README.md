@@ -200,6 +200,22 @@ venv\Scripts\python.exe simple_brush.py --keywords '"测试关键词"' --no-forw
 venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
+### Windows 发布构建
+
+在 Windows 10/11 x64 上运行：
+
+```text
+build-windows.bat
+```
+
+脚本会安装构建依赖、运行全量测试、使用 `BossOCR.spec` 生成控制台版 one-dir 应用，并以 `--no-forward --auto` 做安全冒烟测试。成功后发布压缩包位于：
+
+```text
+release\BossOCR-Windows-x64.zip
+```
+
+`build/`、`dist/`、`release/`、虚拟环境、日志和缓存均为本地产物，不应提交到 Git。
+
 ## 代码结构
 
 ```text
