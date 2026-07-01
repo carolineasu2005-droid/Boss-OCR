@@ -253,7 +253,7 @@ def get_user_input(
     while True:
         raw = input(
             '请输入触发转发的关键词规则（关键词用英文双引号包裹，'
-            '规则用 ; 分隔，留空跳过转发）:\n> '
+            '支持 and、or、not，规则用 ; 分隔，留空跳过转发）:\n> '
         ).strip()
         if not raw:
             forward_keywords = []
@@ -267,7 +267,7 @@ def get_user_input(
             break
         except ValueError as exc:
             print(f'  关键词规则格式错误：{exc}')
-            print('  格式示例："Python"; "剪映" and "信息流"')
+            print('  格式示例："Python"; "短剧" and not "销售"')
 
     if forward_enabled and not no_forward:
         backup_email = input('\n请输入备选邮箱（最近联系中无邮箱时兜底）:\n> ').strip()

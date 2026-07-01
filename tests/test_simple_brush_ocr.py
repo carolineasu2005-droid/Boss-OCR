@@ -61,6 +61,22 @@ class SimpleBrushOCRTests(unittest.TestCase):
         clipboard.assert_not_called()
         detector.detect.assert_called_once_with(simple_brush.forward_keywords)
 
+    def test_detect_keywords_passes_the_complete_not_rule_to_ocr(self):
+        rules = simple_brush.parse_keyword_rules('"短剧" and not "销售"')
+        detector = Mock()
+        detector.detect.return_value = DetectionResult(
+            success=True,
+            confirmed_match=True,
+            matched_keyword='"短剧" and not "销售"',
+            scans_completed=1,
+            observations=[],
+        )
+        simple_brush.forward_keywords = rules
+        simple_brush.ocr_detector = detector
+
+        self.assertTrue(simple_brush.detect_keywords())
+        detector.detect.assert_called_once_with(rules)
+
     def test_no_forward_mode_never_calls_real_forward(self):
         simple_brush.no_forward_mode = True
         with (
@@ -392,11 +408,31 @@ class SimpleBrushOCRTests(unittest.TestCase):
             ['"PR" and "AE"', '"剪映"'],
         )
 
+    def test_auto_mode_parses_complete_not_keyword_rules(self):
+        simple_brush.get_user_input(
+            keywords_str='"A" or not "B" and "C"',
+            auto=True,
+        )
+        self.assertTrue(simple_brush.forward_enabled)
+        self.assertEqual(
+            simple_brush.keyword_rule_sources(),
+            ['"A" or not "B" and "C"'],
+        )
+
     def test_auto_mode_rejects_unquoted_legacy_keywords(self):
         with patch.object(
             simple_brush.sys,
             "argv",
             ["simple_brush.py", "--keywords", "Python;短剧", "--auto"],
+        ), patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
+            self.assertEqual(simple_brush.run(), 2)
+        bring_edge.assert_not_called()
+
+    def test_auto_mode_rejects_pure_not_branch_before_opening_edge(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--keywords", 'not "销售" or "短剧"', "--auto"],
         ), patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
             self.assertEqual(simple_brush.run(), 2)
         bring_edge.assert_not_called()
@@ -410,6 +446,22 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertEqual(
             simple_brush.keyword_rule_sources(),
             ['"Python" or "短剧"'],
+        )
+
+    def test_interactive_keyword_rules_retry_pure_not_branch(self):
+        with patch(
+            "builtins.input",
+            side_effect=[
+                'not "销售"',
+                '"短剧" and not "销售"',
+                "n",
+                "",
+            ],
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(
+            simple_brush.keyword_rule_sources(),
+            ['"短剧" and not "销售"'],
         )
 
     def test_interactive_mode_can_request_focus_restore_calibration(self):
