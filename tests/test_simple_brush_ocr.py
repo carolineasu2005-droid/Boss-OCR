@@ -80,51 +80,72 @@ class SimpleBrushOCRTests(unittest.TestCase):
             self.assertTrue(simple_brush.view_candidate(0))
         forward.assert_not_called()
 
-    def assert_focus_restored_once(self, click):
-        focus_call = call(450, 375, offset=3)
+    def assert_focus_restored_once(self, click, choose_point):
+        focus_call = call(500, 400, offset=0)
+        choose_point.assert_called_once_with(simple_brush.focus_restore_region)
         self.assertEqual(click.call_args_list.count(focus_call), 1)
         self.assertEqual(click.call_args_list[-1], focus_call)
 
     def test_forward_restores_focus_after_success(self):
         with (
             patch.object(simple_brush, "human_click") as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(500, 400),
+            ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value="test@example.com"),
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
 
-        self.assert_focus_restored_once(click)
+        self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_at_consecutive_limit(self):
         simple_brush.forward_consecutive = simple_brush.FORWARD_MAX_CONSEC
         with (
             patch.object(simple_brush, "human_click") as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(500, 400),
+            ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
 
-        self.assert_focus_restored_once(click)
+        self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_without_backup_email(self):
         with (
             patch.object(simple_brush, "human_click") as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(500, 400),
+            ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value=""),
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
 
-        self.assert_focus_restored_once(click)
+        self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_when_wait_is_interrupted(self):
         with (
             patch.object(simple_brush, "human_click") as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(500, 400),
+            ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=False),
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
 
-        self.assert_focus_restored_once(click)
+        self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_when_forwarding_raises(self):
         with (
@@ -133,12 +154,42 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "human_click",
                 side_effect=[RuntimeError("forward failed"), None],
             ) as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(500, 400),
+            ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
         ):
             with self.assertRaisesRegex(RuntimeError, "forward failed"):
                 simple_brush.forward_one_candidate()
 
-        self.assert_focus_restored_once(click)
+        self.assert_focus_restored_once(click, choose_point)
+
+    def test_forward_restores_focus_from_calibrated_runtime_region(self):
+        simple_brush.focus_restore_region = simple_brush.ScreenRegion(
+            left=600,
+            top=300,
+            width=120,
+            height=60,
+        )
+        with (
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(650, 330),
+            ) as choose_point,
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(simple_brush, "get_clipboard_text", return_value="test@example.com"),
+            patch.object(simple_brush.time, "sleep"),
+        ):
+            self.assertTrue(simple_brush.forward_one_candidate())
+
+        choose_point.assert_called_once_with(simple_brush.focus_restore_region)
+        focus_call = call(650, 330, offset=0)
+        self.assertEqual(click.call_args_list.count(focus_call), 1)
+        self.assertEqual(click.call_args_list[-1], focus_call)
 
     def test_calibration_escape_does_not_stop_browsing(self):
         simple_brush.ocr_calibration_in_progress = True
