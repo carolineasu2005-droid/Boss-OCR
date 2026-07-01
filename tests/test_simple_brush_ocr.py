@@ -23,6 +23,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "ocr_calibration_in_progress",
                 "stop_event",
                 "paused",
+                "run_duration_seconds",
             )
         }
         simple_brush.forward_enabled = True
@@ -32,6 +33,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.no_forward_mode = False
         simple_brush.stop_event = False
         simple_brush.paused = False
+        simple_brush.run_duration_seconds = 0
 
     def tearDown(self):
         for name, value in self.saved.items():
@@ -165,6 +167,97 @@ class SimpleBrushOCRTests(unittest.TestCase):
             args = simple_brush.parse_args()
         self.assertTrue(args["no_forward"])
         self.assertEqual(args["keywords"], "Python")
+
+    def test_duration_argument_is_parsed(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--duration-seconds", "60", "--auto"],
+        ):
+            args = simple_brush.parse_args()
+        self.assertEqual(args["duration_seconds"], "60")
+
+    def test_duration_argument_requires_a_value(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--duration-seconds"],
+        ):
+            with self.assertRaisesRegex(ValueError, "缺少秒数"):
+                simple_brush.parse_args()
+
+    def test_duration_parser_accepts_empty_zero_and_positive_integer(self):
+        self.assertEqual(simple_brush.parse_duration_seconds(""), 0)
+        self.assertEqual(simple_brush.parse_duration_seconds(" 0 "), 0)
+        self.assertEqual(simple_brush.parse_duration_seconds("3600"), 3600)
+
+    def test_duration_parser_rejects_invalid_values(self):
+        for value in ("-1", "1.5", "abc", "10秒", "+1", "１"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    simple_brush.parse_duration_seconds(value)
+
+    def test_interactive_duration_retries_invalid_input(self):
+        with patch("builtins.input", side_effect=["", "invalid", "3"]):
+            simple_brush.get_user_input()
+        self.assertEqual(simple_brush.run_duration_seconds, 3)
+
+    def test_auto_mode_rejects_invalid_duration(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--duration-seconds", "invalid", "--auto"],
+        ), patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
+            self.assertEqual(simple_brush.run(), 2)
+        bring_edge.assert_not_called()
+
+    def test_zero_duration_does_not_create_timer(self):
+        with patch.object(simple_brush.threading, "Timer") as timer_factory:
+            self.assertIsNone(simple_brush.start_run_timer(0))
+        timer_factory.assert_not_called()
+
+    def test_positive_duration_starts_timer(self):
+        timer = Mock()
+        with patch.object(simple_brush.threading, "Timer", return_value=timer) as factory:
+            self.assertIs(simple_brush.start_run_timer(60), timer)
+        factory.assert_called_once_with(60, simple_brush.request_timed_stop)
+        self.assertTrue(timer.daemon)
+        timer.start.assert_called_once_with()
+
+    def test_timed_stop_sets_existing_stop_flag(self):
+        simple_brush.request_timed_stop()
+        self.assertTrue(simple_brush.stop_event)
+
+    def test_run_cancels_timer_when_countdown_is_interrupted(self):
+        timer = Mock()
+        with (
+            patch.object(
+                simple_brush.sys,
+                "argv",
+                ["simple_brush.py", "--duration-seconds", "5", "--auto"],
+            ),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "start_run_timer", return_value=timer),
+            patch.object(simple_brush, "safe_wait", return_value=False),
+            patch.object(simple_brush.listener, "start"),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+        timer.cancel.assert_called_once_with()
+
+    def test_stop_prevents_new_navigation_actions(self):
+        simple_brush.stop_event = True
+        with (
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+        ):
+            self.assertFalse(simple_brush.click_first_candidate(10, 20))
+            self.assertFalse(simple_brush.next_candidate())
+            self.assertFalse(simple_brush.refresh_page())
+            simple_brush.human_scroll_once()
+        click.assert_not_called()
+        press.assert_not_called()
+        scroll.assert_not_called()
 
     def test_ocr_time_is_deducted_from_stay_budget(self):
         self.assertEqual(simple_brush.remaining_stay_seconds(12.0, 100.0, 107.5), 4.5)

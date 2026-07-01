@@ -20,6 +20,7 @@ from ctypes import wintypes
 import time
 import random
 import logging
+import threading
 from pathlib import Path
 import win32gui
 import win32con
@@ -39,7 +40,13 @@ from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
 # ─── 命令行参数解析 ───────────────────────────────
 def parse_args():
     """解析命令行参数"""
-    args = {'keywords': '', 'email': '', 'no_forward': False, 'auto': False}
+    args = {
+        'keywords': '',
+        'email': '',
+        'duration_seconds': '',
+        'no_forward': False,
+        'auto': False,
+    }
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == '--keywords' and i + 1 < len(sys.argv):
@@ -47,6 +54,11 @@ def parse_args():
             i += 2
         elif sys.argv[i] == '--email' and i + 1 < len(sys.argv):
             args['email'] = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == '--duration-seconds':
+            if i + 1 >= len(sys.argv):
+                raise ValueError('--duration-seconds 缺少秒数')
+            args['duration_seconds'] = sys.argv[i + 1]
             i += 2
         elif sys.argv[i] == '--no-forward':
             args['no_forward'] = True
@@ -137,6 +149,7 @@ logger.addHandler(console)
 # ─── 运行时状态 ─────────────────────────────────────
 stop_event = False
 paused = False
+run_duration_seconds = 0
 
 # 转发状态（全局）
 forward_keywords = []       # 启动时输入的关键词列表
@@ -177,15 +190,32 @@ listener = keyboard.Listener(on_press=on_press)
 
 
 # ─── 用户交互输入 ───────────────────────────────────
-def get_user_input(keywords_str='', email_str='', auto=False, no_forward=False):
+def parse_duration_seconds(raw_value):
+    """Parse an optional non-negative integer duration in seconds."""
+    value = '' if raw_value is None else str(raw_value).strip()
+    if not value:
+        return 0
+    if not value.isascii() or not value.isdigit():
+        raise ValueError('运行时间必须为 0、正整数秒数或留空')
+    return int(value)
+
+
+def get_user_input(
+    keywords_str='',
+    email_str='',
+    duration_str='',
+    auto=False,
+    no_forward=False,
+):
     """
-    获取关键词和备选邮箱。
+    获取关键词、备选邮箱和本次运行时间。
     auto=True 或 keywords 已传入时跳过交互。
     """
-    global forward_keywords, backup_email, forward_enabled
+    global forward_keywords, backup_email, forward_enabled, run_duration_seconds
 
     # ── 非交互模式（命令行传参或 --auto） ──
     if auto or keywords_str:
+        run_duration_seconds = parse_duration_seconds(duration_str)
         if keywords_str:
             forward_keywords = [k.strip() for k in keywords_str.split(';') if k.strip()]
             forward_enabled = True
@@ -196,6 +226,7 @@ def get_user_input(keywords_str='', email_str='', auto=False, no_forward=False):
         print()
         print(f'  关键词: {forward_keywords if forward_keywords else "(无，转发已禁用)"}')
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
+        print(f'  运行时间: {run_duration_seconds or "持续运行"}')
         print()
         return
 
@@ -216,6 +247,16 @@ def get_user_input(keywords_str='', email_str='', auto=False, no_forward=False):
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
     else:
         backup_email = ""
+
+    while True:
+        duration_raw = input('\n请输入本次运行时间（秒，留空或 0 表示持续运行）:\n> ')
+        try:
+            run_duration_seconds = parse_duration_seconds(duration_raw)
+            break
+        except ValueError as exc:
+            print(f'  输入错误：{exc}')
+
+    print(f'  运行时间: {run_duration_seconds or "持续运行"}')
 
     print()
 
@@ -296,6 +337,22 @@ def safe_wait(seconds):
             time.sleep(0.2)
         time.sleep(0.2)
     return True
+
+
+def request_timed_stop():
+    """Request a normal stop when the configured run duration expires."""
+    global stop_event
+    stop_event = True
+
+
+def start_run_timer(duration_seconds):
+    """Start the optional run timer and return it for later cancellation."""
+    if duration_seconds <= 0:
+        return None
+    timer = threading.Timer(duration_seconds, request_timed_stop)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def human_delay(min_s=FORWARD_MIN_DELAY, max_s=FORWARD_MAX_DELAY):
@@ -506,6 +563,8 @@ def forward_one_candidate():
         if forward_consecutive >= FORWARD_MAX_CONSEC:
             logger.warning(f'⚠ 连续转发已达上限 ({FORWARD_MAX_CONSEC} 次)，本次跳过')
             return False
+        if stop_event:
+            return False
 
         logger.info('📧 ────── 开始转发流程 ──────')
 
@@ -531,10 +590,16 @@ def forward_one_candidate():
         # 检测邮箱是否已填入
         human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
         time.sleep(0.1)
+        if stop_event:
+            return False
         pyautogui.hotkey('ctrl', 'a')
         time.sleep(0.05)
+        if stop_event:
+            return False
         pyautogui.hotkey('ctrl', 'c')
         time.sleep(0.08)
+        if stop_event:
+            return False
         box_text = get_clipboard_text().strip()
 
         if '@' in box_text and '.' in box_text:
@@ -546,11 +611,16 @@ def forward_one_candidate():
                 logger.info(f'  ⌨ 正在手动输入备选邮箱: {backup_email}')
                 human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
                 time.sleep(0.1)
+                if stop_event:
+                    return False
                 pyautogui.hotkey('ctrl', 'a')
                 time.sleep(0.05)
+                if stop_event:
+                    return False
                 pyautogui.press('delete')
                 time.sleep(0.05)
-                type_text_human(backup_email)
+                if stop_event or not type_text_human(backup_email):
+                    return False
                 if not human_delay(0.3, 0.5):
                     return False
             else:
@@ -562,6 +632,8 @@ def forward_one_candidate():
                 return False
 
         # ── 步骤 4：点击"转发"按钮 ──
+        if stop_event:
+            return False
         logger.info(f'  [4/5] 点击"转发"按钮')
         human_click(FORWARD_BTN_X, FORWARD_BTN_Y)
         if not human_delay(1.0, 2.0):
@@ -583,6 +655,8 @@ def forward_one_candidate():
 
 def click_first_candidate(x, y):
     """在鼠标当前位置点击一次，打开第一位候选人详情"""
+    if stop_event:
+        return False
     logger.info(f'🖱️ 点击第一位候选人: ({x}, {y})')
     pyautogui.click(x, y, duration=0)
     return safe_wait(CLICK_WAIT_SECONDS)
@@ -590,6 +664,8 @@ def click_first_candidate(x, y):
 
 def human_scroll_once():
     """严格鼠标不动，仅在当前位置触发小幅度滚轮。"""
+    if stop_event:
+        return
     if random.random() > SCROLL_PROBABILITY:
         return
 
@@ -599,6 +675,8 @@ def human_scroll_once():
     logger.info(f'🖱️ 滚动 {times} 次，方向 {"下" if direction == -1 else "上"}')
 
     for _ in range(times):
+        if stop_event:
+            return
         steps = random.randint(SCROLL_MIN_STEPS, SCROLL_MAX_STEPS)
         if random.random() < 0.3:
             direction *= -1
@@ -621,6 +699,9 @@ def view_candidate(index_in_batch):
     keyword_hit = False
     if forward_enabled and forward_keywords:
         keyword_hit = detect_keywords()
+
+        if stop_event:
+            return False
 
         if keyword_hit and no_forward_mode:
             logger.info('🛡 --no-forward 已启用：保留 OCR 命中记录，禁止真实邮件转发')
@@ -668,6 +749,8 @@ def next_candidate():
 
 def refresh_page():
     """按 F5 刷新页面"""
+    if stop_event:
+        return False
     logger.info('🔄 已查看 100 位，按 F5 刷新页面')
     pyautogui.press('f5')
     return safe_wait(REFRESH_WAIT_SECONDS)
@@ -677,12 +760,22 @@ def refresh_page():
 
 def run():
     global stop_event, forward_consecutive, no_forward_mode
+    stop_event = False
 
     # ── 交互/参数输入 ──
-    cli_args = parse_args()
-    no_forward_mode = cli_args['no_forward']
-    get_user_input(keywords_str=cli_args['keywords'], email_str=cli_args['email'],
-                   auto=cli_args['auto'], no_forward=no_forward_mode)
+    try:
+        cli_args = parse_args()
+        no_forward_mode = cli_args['no_forward']
+        get_user_input(
+            keywords_str=cli_args['keywords'],
+            email_str=cli_args['email'],
+            duration_str=cli_args['duration_seconds'],
+            auto=cli_args['auto'],
+            no_forward=no_forward_mode,
+        )
+    except ValueError as exc:
+        print(f'[错误] {exc}')
+        return 2
 
     # 提前初始化并复用 OCR 引擎；校准仍延迟到第一位详情打开之后。
     if forward_enabled and forward_keywords:
@@ -706,19 +799,20 @@ def run():
     logger.info('=' * 50)
 
     if not bring_edge_foreground():
-        return
+        return 0
 
-    logger.info(f'\n请将鼠标移到第一位候选人卡片上，{COUNTDOWN_SECONDS} 秒后开始...')
-    if not safe_wait(COUNTDOWN_SECONDS):
-        return
-
-    click_x, click_y = pyautogui.position()
-    logger.info(f'📍 固定点击位置: ({click_x}, {click_y})')
-
+    run_timer = start_run_timer(run_duration_seconds)
     total_viewed = 0
     forward_consecutive = 0
 
     try:
+        logger.info(f'\n请将鼠标移到第一位候选人卡片上，{COUNTDOWN_SECONDS} 秒后开始...')
+        if not safe_wait(COUNTDOWN_SECONDS):
+            return 0
+
+        click_x, click_y = pyautogui.position()
+        logger.info(f'📍 固定点击位置: ({click_x}, {click_y})')
+
         while not stop_event:
             # 打开第一位候选人
             if not click_first_candidate(click_x, click_y):
@@ -750,15 +844,21 @@ def run():
     except Exception as e:
         logger.exception(f'运行异常: {e}')
     finally:
+        if run_timer is not None:
+            run_timer.cancel()
         logger.info(f'\n🏁 停止运行。累计查看 {total_viewed} 位候选人。')
         logger.info(f'日志文件: logs/simple_brush.log\n')
+    return 0
 
 
 if __name__ == '__main__':
+    exit_code = 0
     try:
-        run()
+        exit_code = run() or 0
     except KeyboardInterrupt:
         pass
     finally:
         stop_event = True
         listener.stop()
+    if exit_code:
+        sys.exit(exit_code)
