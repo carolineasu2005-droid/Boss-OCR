@@ -103,7 +103,11 @@ class CalibrationCancelled(RuntimeError):
     pass
 
 
-def select_screen_region(min_size: int = 80) -> ScreenRegion:
+def select_screen_region(
+    min_size: int = 80,
+    instruction: str = "拖动框选候选人详情区域 · Esc 取消",
+    subtitle: str = "第一版仅支持主显示器",
+) -> ScreenRegion:
     """Show a primary-monitor Tk overlay and return physical MSS coordinates."""
 
     enable_windows_dpi_awareness()
@@ -130,7 +134,7 @@ def select_screen_region(min_size: int = 80) -> ScreenRegion:
         anchor="nw",
         fill="white",
         font=("Arial", 18, "bold"),
-        text="拖动框选候选人详情区域 · Esc 取消",
+        text=instruction,
     )
     size_text = canvas.create_text(
         24,
@@ -138,7 +142,7 @@ def select_screen_region(min_size: int = 80) -> ScreenRegion:
         anchor="nw",
         fill="white",
         font=("Arial", 13),
-        text="第一版仅支持主显示器",
+        text=subtitle,
     )
 
     state = {
