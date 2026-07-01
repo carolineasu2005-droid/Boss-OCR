@@ -6,7 +6,7 @@ import time
 from typing import Callable, Iterable, List, Optional, Protocol, Sequence
 
 from ocr_calibration import ScreenRegion
-from ocr_text import OCRItem, exact_keyword_match, searchable_text
+from ocr_text import KeywordRule, OCRItem, matching_keyword_rule, searchable_text
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ class ScanObservation:
     item_count: int
     elapsed_seconds: float
     matched_keyword: Optional[str] = None
+    matched_rule: Optional[KeywordRule] = None
 
 
 @dataclass
@@ -131,23 +132,24 @@ class OCRKeywordDetector:
         self.settle_seconds = settle_seconds
         self.confirmation_seconds = confirmation_seconds
 
-    def _observe(self, scan_number: int, keywords: Iterable[str]):
+    def _observe(self, scan_number: int, rules: Iterable[KeywordRule]):
         started = time.perf_counter()
         image = self.capture.capture(self.region)
         items = list(self.backend.recognize(image))
         text = searchable_text(items, min_confidence=self.min_confidence)
-        keyword = exact_keyword_match(text, keywords)
+        matched_rule = matching_keyword_rule(text, rules)
         return ScanObservation(
             scan_number=scan_number,
             text=text,
             item_count=len(items),
             elapsed_seconds=time.perf_counter() - started,
-            matched_keyword=keyword,
+            matched_keyword=matched_rule.source if matched_rule else None,
+            matched_rule=matched_rule,
         )
 
-    def detect(self, keywords: Iterable[str]) -> DetectionResult:
-        keywords = [keyword.strip() for keyword in keywords if keyword.strip()]
-        if not keywords:
+    def detect(self, rules: Iterable[KeywordRule]) -> DetectionResult:
+        rules = list(rules)
+        if not rules:
             return DetectionResult(success=True, confirmed_match=False)
 
         observations = []
@@ -159,7 +161,7 @@ class OCRKeywordDetector:
                     self.scroll()
                     self.wait(self.settle_seconds)
 
-                first = self._observe(scan_number, keywords)
+                first = self._observe(scan_number, rules)
                 observations.append(first)
                 logger.info(
                     "OCR scan %s/%s: %s items, %.3fs, match=%r",
@@ -169,13 +171,13 @@ class OCRKeywordDetector:
                     first.elapsed_seconds,
                     first.matched_keyword,
                 )
-                if not first.matched_keyword:
+                if first.matched_rule is None:
                     continue
 
                 self.wait(self.confirmation_seconds)
-                confirmation = self._observe(scan_number, [first.matched_keyword])
+                confirmation = self._observe(scan_number, [first.matched_rule])
                 observations.append(confirmation)
-                confirmed = confirmation.matched_keyword == first.matched_keyword
+                confirmed = confirmation.matched_rule == first.matched_rule
                 return DetectionResult(
                     success=True,
                     confirmed_match=confirmed,

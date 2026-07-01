@@ -3,11 +3,11 @@
 BOSS 直聘推荐牛人自动刷简历 v4 —— 键盘翻页 + 智能邮件转发版
 
 交互方案：
-1. 启动时输入触发关键词（多个用 ; 分隔）和备选邮箱
+1. 启动时输入触发关键词规则（规则用 ; 分隔）和备选邮箱
 2. 鼠标保持不动，脚本只执行一次左键点击打开第一位候选人
 3. 后续全部用键盘右方向键（→）切换下一位候选人
 4. 每位候选人详情页停留 12-18 秒（随机），期间随机滚动
-5. 停留期间检测详情页内容，命中任意关键词则触发邮件转发
+5. 停留期间检测详情页内容，命中任意关键词规则则触发邮件转发
 6. 转发完成后右键恢复键盘焦点，继续用右方向键翻页
 7. 每 100 人自动 F5 刷新
 8. ESC 停止 / 空格暂停
@@ -36,6 +36,7 @@ from ocr_calibration import (
     select_screen_region,
 )
 from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
+from ocr_text import parse_keyword_rules
 
 # ─── 命令行参数解析 ───────────────────────────────
 def parse_args():
@@ -152,7 +153,7 @@ paused = False
 run_duration_seconds = 0
 
 # 转发状态（全局）
-forward_keywords = []       # 启动时输入的关键词列表
+forward_keywords = []       # 启动时解析完成的关键词规则列表
 backup_email = ""           # 备选邮箱
 forward_enabled = False     # 是否启用转发
 forward_consecutive = 0     # 连续转发计数
@@ -200,6 +201,11 @@ def parse_duration_seconds(raw_value):
     return int(value)
 
 
+def keyword_rule_sources():
+    """Return stable display strings for the configured keyword rules."""
+    return [rule.source for rule in forward_keywords]
+
+
 def get_user_input(
     keywords_str='',
     email_str='',
@@ -217,14 +223,14 @@ def get_user_input(
     if auto or keywords_str:
         run_duration_seconds = parse_duration_seconds(duration_str)
         if keywords_str:
-            forward_keywords = [k.strip() for k in keywords_str.split(';') if k.strip()]
-            forward_enabled = True
+            forward_keywords = parse_keyword_rules(keywords_str)
+            forward_enabled = bool(forward_keywords)
         else:
             forward_keywords = []
             forward_enabled = False
         backup_email = email_str
         print()
-        print(f'  关键词: {forward_keywords if forward_keywords else "(无，转发已禁用)"}')
+        print(f'  关键词规则: {keyword_rule_sources() if forward_keywords else "(无，转发已禁用)"}')
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
         print(f'  运行时间: {run_duration_seconds or "持续运行"}')
         print()
@@ -232,15 +238,24 @@ def get_user_input(
 
     # ── 交互模式 ──
     print()
-    raw = input('请输入触发转发的关键词（多个用 ; 分隔，留空跳过转发）:\n> ').strip()
-    if raw:
-        forward_keywords = [k.strip() for k in raw.split(';') if k.strip()]
-        forward_enabled = True
-        print(f'  已录入 {len(forward_keywords)} 个关键词: {forward_keywords}')
-    else:
-        forward_keywords = []
-        forward_enabled = False
-        print('  未设置关键词，转发功能已禁用')
+    while True:
+        raw = input(
+            '请输入触发转发的关键词规则（关键词用英文双引号包裹，'
+            '规则用 ; 分隔，留空跳过转发）:\n> '
+        ).strip()
+        if not raw:
+            forward_keywords = []
+            forward_enabled = False
+            print('  未设置关键词规则，转发功能已禁用')
+            break
+        try:
+            forward_keywords = parse_keyword_rules(raw)
+            forward_enabled = True
+            print(f'  已录入 {len(forward_keywords)} 条关键词规则: {keyword_rule_sources()}')
+            break
+        except ValueError as exc:
+            print(f'  关键词规则格式错误：{exc}')
+            print('  格式示例："Python"; "剪映" and "信息流"')
 
     if forward_enabled and not no_forward:
         backup_email = input('\n请输入备选邮箱（最近联系中无邮箱时兜底）:\n> ').strip()
@@ -518,14 +533,14 @@ def detect_keywords():
         logger.warning('🛡 OCR 未就绪，因安全原因跳过转发')
         return False
 
-    logger.info(f'🔍 OCR 关键词检测中... 目标: {forward_keywords}')
+    logger.info(f'🔍 OCR 关键词规则检测中... 目标: {keyword_rule_sources()}')
     result = ocr_detector.detect(forward_keywords)
     for sequence, observation in enumerate(result.observations, start=1):
         phase = '二次确认' if sequence > 1 and (
             observation.scan_number == result.observations[sequence - 2].scan_number
         ) else '扫描'
         logger.info(
-            '  OCR %s: 屏=%s 耗时=%.3fs 文字框=%s 命中=%s 关键词=%s',
+            '  OCR %s: 屏=%s 耗时=%.3fs 文字框=%s 命中=%s 规则=%s',
             phase,
             observation.scan_number,
             observation.elapsed_seconds,
@@ -541,7 +556,7 @@ def detect_keywords():
         logger.warning(f'🛡 OCR 二次确认失败，因安全原因跳过转发: {result.error}')
         return False
     if result.confirmed_match:
-        logger.info(f'🔑 OCR 二次确认命中: "{result.matched_keyword}"')
+        logger.info(f'🔑 OCR 二次确认命中规则: {result.matched_keyword}')
         return True
 
     logger.info('  → OCR 最多 8 屏未确认命中，跳过转发')
@@ -788,7 +803,7 @@ def run():
     logger.info('BOSS 直聘极简刷简历 v4 启动')
     logger.info(f'停留: {MIN_STAY_SECONDS}-{MAX_STAY_SECONDS}s | 每 {BATCH_SIZE} 人刷新')
     if forward_enabled:
-        logger.info(f'转发关键词: {forward_keywords}')
+        logger.info(f'转发关键词规则: {keyword_rule_sources()}')
         if no_forward_mode:
             logger.info('模式: 只执行 OCR 检测，真实邮件转发已禁用 (--no-forward)')
         else:

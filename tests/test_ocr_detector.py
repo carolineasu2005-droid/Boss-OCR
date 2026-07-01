@@ -2,7 +2,11 @@ import unittest
 
 from ocr_calibration import ScreenRegion
 from ocr_detector import OCRKeywordDetector, RapidOCRBackend
-from ocr_text import OCRItem
+from ocr_text import OCRItem, parse_keyword_rules
+
+
+def single_rule(keyword):
+    return parse_keyword_rules(f'"{keyword}"')
 
 
 class FakeCapture:
@@ -41,15 +45,15 @@ class DetectorTests(unittest.TestCase):
 
     def test_match_requires_second_confirmation(self):
         detector = self.make_detector(["数字媒体", "数字媒体"])
-        result = detector.detect(["数字媒体"])
+        result = detector.detect(single_rule("数字媒体"))
         self.assertTrue(result.success)
         self.assertTrue(result.confirmed_match)
-        self.assertEqual(result.matched_keyword, "数字媒体")
+        self.assertEqual(result.matched_keyword, '"数字媒体"')
         self.assertEqual(len(result.observations), 2)
 
     def test_unconfirmed_match_does_not_trigger(self):
         detector = self.make_detector(["数字媒体", "其他内容"])
-        result = detector.detect(["数字媒体"])
+        result = detector.detect(single_rule("数字媒体"))
         self.assertTrue(result.success)
         self.assertFalse(result.confirmed_match)
         self.assertIsNone(result.matched_keyword)
@@ -61,7 +65,7 @@ class DetectorTests(unittest.TestCase):
             max_scans=3,
             scroll=lambda: scroll_calls.append(True),
         )
-        result = detector.detect(["不存在"])
+        result = detector.detect(single_rule("不存在"))
         self.assertTrue(result.success)
         self.assertFalse(result.confirmed_match)
         self.assertEqual(result.scans_completed, 3)
@@ -74,7 +78,7 @@ class DetectorTests(unittest.TestCase):
             max_scans=8,
             scroll=lambda: scroll_calls.append(True),
         )
-        result = detector.detect(["Python"])
+        result = detector.detect(single_rule("Python"))
         self.assertTrue(result.confirmed_match)
         self.assertEqual(result.scans_completed, 2)
         self.assertEqual(len(scroll_calls), 1)
@@ -86,7 +90,7 @@ class DetectorTests(unittest.TestCase):
             max_scans=8,
             scroll=lambda: scroll_calls.append(True),
         )
-        result = detector.detect(["不存在"])
+        result = detector.detect(single_rule("不存在"))
         self.assertTrue(result.success)
         self.assertFalse(result.confirmed_match)
         self.assertEqual(result.scans_completed, 8)
@@ -103,14 +107,14 @@ class DetectorTests(unittest.TestCase):
             region=self.region,
             wait=lambda _seconds: None,
         )
-        result = detector.detect(["关键词"])
+        result = detector.detect(single_rule("关键词"))
         self.assertFalse(result.success)
         self.assertFalse(result.confirmed_match)
         self.assertIn("OCR unavailable", result.error)
 
     def test_empty_ocr_result_does_not_match(self):
         detector = self.make_detector([""], max_scans=1)
-        result = detector.detect(["关键词"])
+        result = detector.detect(single_rule("关键词"))
         self.assertTrue(result.success)
         self.assertFalse(result.confirmed_match)
 
@@ -127,8 +131,26 @@ class DetectorTests(unittest.TestCase):
             max_scans=1,
             min_confidence=0.85,
         )
-        result = detector.detect(["关键词"])
+        result = detector.detect(single_rule("关键词"))
         self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+
+    def test_combination_rule_requires_full_second_confirmation(self):
+        detector = self.make_detector(["PR AE", "只有 PR"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"PR" and "AE"'))
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertIsNone(result.matched_keyword)
+
+    def test_same_combination_rule_is_confirmed(self):
+        detector = self.make_detector(["PR AE", "AE 与 PR"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"PR" and "AE"'))
+        self.assertTrue(result.confirmed_match)
+        self.assertEqual(result.matched_keyword, '"PR" and "AE"')
+
+    def test_different_rule_cannot_complete_confirmation(self):
+        detector = self.make_detector(["技能 A", "技能 B"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"A"; "B"'))
         self.assertFalse(result.confirmed_match)
 
 

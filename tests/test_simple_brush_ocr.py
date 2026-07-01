@@ -27,7 +27,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
             )
         }
         simple_brush.forward_enabled = True
-        simple_brush.forward_keywords = ["Python"]
+        simple_brush.forward_keywords = simple_brush.parse_keyword_rules('"Python"')
         simple_brush.forward_consecutive = 0
         simple_brush.backup_email = ""
         simple_brush.no_forward_mode = False
@@ -54,7 +54,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         with patch.object(simple_brush, "get_clipboard_text") as clipboard:
             self.assertTrue(simple_brush.detect_keywords())
         clipboard.assert_not_called()
-        detector.detect.assert_called_once_with(["Python"])
+        detector.detect.assert_called_once_with(simple_brush.forward_keywords)
 
     def test_no_forward_mode_never_calls_real_forward(self):
         simple_brush.no_forward_mode = True
@@ -210,6 +210,37 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ), patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
             self.assertEqual(simple_brush.run(), 2)
         bring_edge.assert_not_called()
+
+    def test_auto_mode_parses_quoted_keyword_rules(self):
+        simple_brush.get_user_input(
+            keywords_str='"PR" and "AE"; "剪映"',
+            auto=True,
+        )
+        self.assertTrue(simple_brush.forward_enabled)
+        self.assertEqual(
+            simple_brush.keyword_rule_sources(),
+            ['"PR" and "AE"', '"剪映"'],
+        )
+
+    def test_auto_mode_rejects_unquoted_legacy_keywords(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--keywords", "Python;短剧", "--auto"],
+        ), patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
+            self.assertEqual(simple_brush.run(), 2)
+        bring_edge.assert_not_called()
+
+    def test_interactive_keyword_rules_retry_invalid_input(self):
+        with patch(
+            "builtins.input",
+            side_effect=["Python", '"Python" or "短剧"', ""],
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(
+            simple_brush.keyword_rule_sources(),
+            ['"Python" or "短剧"'],
+        )
 
     def test_zero_duration_does_not_create_timer(self):
         with patch.object(simple_brush.threading, "Timer") as timer_factory:
