@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import simple_brush
 from ocr_detector import DetectionResult, ScanObservation
@@ -13,6 +13,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "forward_enabled",
                 "forward_keywords",
                 "forward_consecutive",
+                "backup_email",
                 "no_forward_mode",
                 "ocr_backend",
                 "ocr_capture",
@@ -27,6 +28,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.forward_enabled = True
         simple_brush.forward_keywords = ["Python"]
         simple_brush.forward_consecutive = 0
+        simple_brush.backup_email = ""
         simple_brush.no_forward_mode = False
         simple_brush.stop_event = False
         simple_brush.paused = False
@@ -70,6 +72,66 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             self.assertTrue(simple_brush.view_candidate(0))
         forward.assert_not_called()
+
+    def assert_focus_restored_once(self, click):
+        focus_call = call(450, 375, offset=3)
+        self.assertEqual(click.call_args_list.count(focus_call), 1)
+        self.assertEqual(click.call_args_list[-1], focus_call)
+
+    def test_forward_restores_focus_after_success(self):
+        with (
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(simple_brush, "get_clipboard_text", return_value="test@example.com"),
+            patch.object(simple_brush.time, "sleep"),
+        ):
+            self.assertTrue(simple_brush.forward_one_candidate())
+
+        self.assert_focus_restored_once(click)
+
+    def test_forward_restores_focus_at_consecutive_limit(self):
+        simple_brush.forward_consecutive = simple_brush.FORWARD_MAX_CONSEC
+        with (
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush, "human_delay", return_value=True),
+        ):
+            self.assertFalse(simple_brush.forward_one_candidate())
+
+        self.assert_focus_restored_once(click)
+
+    def test_forward_restores_focus_without_backup_email(self):
+        with (
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(simple_brush, "get_clipboard_text", return_value=""),
+            patch.object(simple_brush.time, "sleep"),
+        ):
+            self.assertFalse(simple_brush.forward_one_candidate())
+
+        self.assert_focus_restored_once(click)
+
+    def test_forward_restores_focus_when_wait_is_interrupted(self):
+        with (
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush, "human_delay", return_value=False),
+        ):
+            self.assertFalse(simple_brush.forward_one_candidate())
+
+        self.assert_focus_restored_once(click)
+
+    def test_forward_restores_focus_when_forwarding_raises(self):
+        with (
+            patch.object(
+                simple_brush,
+                "human_click",
+                side_effect=[RuntimeError("forward failed"), None],
+            ) as click,
+            patch.object(simple_brush, "human_delay", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forward failed"):
+                simple_brush.forward_one_candidate()
+
+        self.assert_focus_restored_once(click)
 
     def test_calibration_escape_does_not_stop_browsing(self):
         simple_brush.ocr_calibration_in_progress = True

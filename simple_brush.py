@@ -108,10 +108,10 @@ FORWARD_BTN_Y    = 740
 # 转发后右键恢复键盘焦点位置（详情页中央偏右）
 RIGHT_CLICK_X    = 960
 RIGHT_CLICK_Y    = 500
-# 详情页中央（邮件转发完成后用于恢复键盘焦点）
-# 注意：必须在右侧详情弹窗区域内（左列表区结束于 x≈800）
-DETAIL_CENTER_X  = 1200
-DETAIL_CENTER_Y  = 500
+# 候选人详情页空白区域（转发处理函数退出前统一恢复焦点）
+# 加上 ±3 像素随机偏移后仍须位于 X:400-500, Y:350-400
+FOCUS_RESTORE_X  = 450
+FOCUS_RESTORE_Y  = 375
 
 # 转发反检测
 FORWARD_CLICK_OFFSET = 5    # 点击位置随机偏移范围（像素）
@@ -501,79 +501,82 @@ def forward_one_candidate():
     global forward_consecutive
     global _programmatic_esc
 
-    # ── 检查连续转发上限 ──
-    if forward_consecutive >= FORWARD_MAX_CONSEC:
-        logger.warning(f'⚠ 连续转发已达上限 ({FORWARD_MAX_CONSEC} 次)，本次跳过')
-        return False
-
-    logger.info('📧 ────── 开始转发流程 ──────')
-
-    # ── 步骤 1：点击"转发牛人"图标 ──
-    logger.info(f'  [1/5] 点击"转发牛人"图标 →')
-    human_click(FORWARD_ICON_X, FORWARD_ICON_Y)
-    if not human_delay(0.5, 1.5):
-        return False
-
-    # ── 步骤 2：点击"邮件转发" Tab ──
-    logger.info(f'  [2/5] 点击"邮件转发"')
-    human_click(EMAIL_TAB_X, EMAIL_TAB_Y)
-    if not human_delay(0.5, 1.0):
-        return False
-
-    # ── 步骤 3：尝试填入邮箱 ──
-    logger.info(f'  [3/5] 填入邮箱')
-    # 先点"最近联系"中的邮箱标签
-    human_click(RECENT_EMAIL_X, RECENT_EMAIL_Y)
-    if not human_delay(0.3, 0.8):
-        return False
-
-    # 检测邮箱是否已填入
-    human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
-    time.sleep(0.1)
-    pyautogui.hotkey('ctrl', 'a')
-    time.sleep(0.05)
-    pyautogui.hotkey('ctrl', 'c')
-    time.sleep(0.08)
-    box_text = get_clipboard_text().strip()
-
-    if '@' in box_text and '.' in box_text:
-        logger.info(f'  ✓ 邮箱已自动填入: {box_text}')
-    else:
-        logger.warning(f'  ⚠ "最近联系"未自动填入邮箱 (读到: "{box_text}")')
-        if backup_email:
-            # 手动输入备选邮箱
-            logger.info(f'  ⌨ 正在手动输入备选邮箱: {backup_email}')
-            human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
-            time.sleep(0.1)
-            pyautogui.hotkey('ctrl', 'a')
-            time.sleep(0.05)
-            pyautogui.press('delete')
-            time.sleep(0.05)
-            type_text_human(backup_email)
-            if not human_delay(0.3, 0.5):
-                return False
-        else:
-            logger.warning('  ✗ 无备选邮箱，放弃本次转发')
-            # 关闭弹窗（程序触发 ESC，不停止主循环）
-            _programmatic_esc = True
-            pyautogui.press('esc')
-            _programmatic_esc = False
+    try:
+        # ── 检查连续转发上限 ──
+        if forward_consecutive >= FORWARD_MAX_CONSEC:
+            logger.warning(f'⚠ 连续转发已达上限 ({FORWARD_MAX_CONSEC} 次)，本次跳过')
             return False
 
-    # ── 步骤 4：点击"转发"按钮 ──
-    logger.info(f'  [4/5] 点击"转发"按钮')
-    human_click(FORWARD_BTN_X, FORWARD_BTN_Y)
-    if not human_delay(1.0, 2.0):
-        return False
+        logger.info('📧 ────── 开始转发流程 ──────')
 
-    forward_consecutive += 1
-    logger.info(f'📧 ✓ 转发完成！(连续转发 {forward_consecutive}/{FORWARD_MAX_CONSEC})')
+        # ── 步骤 1：点击"转发牛人"图标 ──
+        logger.info(f'  [1/5] 点击"转发牛人"图标 →')
+        human_click(FORWARD_ICON_X, FORWARD_ICON_Y)
+        if not human_delay(0.5, 1.5):
+            return False
 
-    # 点击详情页中央，恢复焦点，确保右键翻页正常
-    human_click(DETAIL_CENTER_X, DETAIL_CENTER_Y, offset=3)
-    if not human_delay(0.3, 0.5):
-        return False
-    return True
+        # ── 步骤 2：点击"邮件转发" Tab ──
+        logger.info(f'  [2/5] 点击"邮件转发"')
+        human_click(EMAIL_TAB_X, EMAIL_TAB_Y)
+        if not human_delay(0.5, 1.0):
+            return False
+
+        # ── 步骤 3：尝试填入邮箱 ──
+        logger.info(f'  [3/5] 填入邮箱')
+        # 先点"最近联系"中的邮箱标签
+        human_click(RECENT_EMAIL_X, RECENT_EMAIL_Y)
+        if not human_delay(0.3, 0.8):
+            return False
+
+        # 检测邮箱是否已填入
+        human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
+        time.sleep(0.1)
+        pyautogui.hotkey('ctrl', 'a')
+        time.sleep(0.05)
+        pyautogui.hotkey('ctrl', 'c')
+        time.sleep(0.08)
+        box_text = get_clipboard_text().strip()
+
+        if '@' in box_text and '.' in box_text:
+            logger.info(f'  ✓ 邮箱已自动填入: {box_text}')
+        else:
+            logger.warning(f'  ⚠ "最近联系"未自动填入邮箱 (读到: "{box_text}")')
+            if backup_email:
+                # 手动输入备选邮箱
+                logger.info(f'  ⌨ 正在手动输入备选邮箱: {backup_email}')
+                human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
+                time.sleep(0.1)
+                pyautogui.hotkey('ctrl', 'a')
+                time.sleep(0.05)
+                pyautogui.press('delete')
+                time.sleep(0.05)
+                type_text_human(backup_email)
+                if not human_delay(0.3, 0.5):
+                    return False
+            else:
+                logger.warning('  ✗ 无备选邮箱，放弃本次转发')
+                # 关闭弹窗（程序触发 ESC，不停止主循环）
+                _programmatic_esc = True
+                pyautogui.press('esc')
+                _programmatic_esc = False
+                return False
+
+        # ── 步骤 4：点击"转发"按钮 ──
+        logger.info(f'  [4/5] 点击"转发"按钮')
+        human_click(FORWARD_BTN_X, FORWARD_BTN_Y)
+        if not human_delay(1.0, 2.0):
+            return False
+
+        forward_consecutive += 1
+        logger.info(f'📧 ✓ 转发完成！(连续转发 {forward_consecutive}/{FORWARD_MAX_CONSEC})')
+        return True
+    finally:
+        # 只要进入转发处理函数，所有退出路径都统一恢复详情页焦点。
+        try:
+            human_click(FOCUS_RESTORE_X, FOCUS_RESTORE_Y, offset=3)
+            human_delay(0.3, 0.5)
+        except Exception as exc:
+            logger.error(f'❌ 转发流程焦点恢复点击失败: {exc}')
 
 
 # ─── 刷简历核心 ─────────────────────────────────────
