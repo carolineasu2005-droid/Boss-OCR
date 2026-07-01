@@ -18,11 +18,20 @@ import os
 import time
 import random
 import logging
+from pathlib import Path
 import win32gui
 import win32con
 import win32clipboard
 import pyautogui
 from pynput import keyboard
+
+from ocr_calibration import (
+    CalibrationCancelled,
+    enable_windows_dpi_awareness,
+    save_region_preview,
+    select_screen_region,
+)
+from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
 
 # ─── 命令行参数解析 ───────────────────────────────
 def parse_args():
@@ -61,6 +70,15 @@ REFRESH_WAIT_SECONDS = 5
 CLICK_WAIT_SECONDS = 2
 COUNTDOWN_SECONDS = 3
 
+# OCR 关键词检测
+OCR_MAX_SCANS = 8
+OCR_MIN_CONFIDENCE = 0.85
+OCR_SCROLL_MIN_STEPS = 5
+OCR_SCROLL_MAX_STEPS = 7
+OCR_SETTLE_SECONDS = 0.6
+OCR_CONFIRMATION_SECONDS = 0.7
+OCR_PREVIEW_PATH = Path('logs/ocr_calibration_preview.png')
+
 # 滚动
 SCROLL_PROBABILITY = 0.8
 SCROLL_MIN_STEPS = 10
@@ -87,7 +105,7 @@ FORWARD_BTN_Y    = 740
 # 转发后右键恢复键盘焦点位置（详情页中央偏右）
 RIGHT_CLICK_X    = 960
 RIGHT_CLICK_Y    = 500
-# 详情页中央（用于获取键盘焦点以便 Ctrl+A）
+# 详情页中央（邮件转发完成后用于恢复键盘焦点）
 # 注意：必须在右侧详情弹窗区域内（左列表区结束于 x≈800）
 DETAIL_CENTER_X  = 1200
 DETAIL_CENTER_Y  = 500
@@ -122,6 +140,15 @@ forward_keywords = []       # 启动时输入的关键词列表
 backup_email = ""           # 备选邮箱
 forward_enabled = False     # 是否启用转发
 forward_consecutive = 0     # 连续转发计数
+no_forward_mode = False     # 只检测，不执行真实邮件转发
+
+# OCR 状态（每次运行只初始化、校准一次）
+ocr_backend = None
+ocr_capture = None
+ocr_detector = None
+ocr_initialization_attempted = False
+ocr_calibration_attempted = False
+ocr_calibration_in_progress = False
 
 
 # ─── 安全控制 ───────────────────────────────────────
@@ -132,6 +159,8 @@ def on_press(key):
     if key == keyboard.Key.esc:
         if _programmatic_esc:
             return True  # 程序触发的 ESC，忽略
+        if ocr_calibration_in_progress:
+            return True  # 交给 Tk 校准窗口处理，只取消校准，不停止浏览
         stop_event = True
         logger.info('⚡ 收到 ESC，准备停止')
         return False
@@ -145,7 +174,7 @@ listener = keyboard.Listener(on_press=on_press)
 
 
 # ─── 用户交互输入 ───────────────────────────────────
-def get_user_input(keywords_str='', email_str='', auto=False):
+def get_user_input(keywords_str='', email_str='', auto=False, no_forward=False):
     """
     获取关键词和备选邮箱。
     auto=True 或 keywords 已传入时跳过交互。
@@ -179,7 +208,7 @@ def get_user_input(keywords_str='', email_str='', auto=False):
         forward_enabled = False
         print('  未设置关键词，转发功能已禁用')
 
-    if forward_enabled:
+    if forward_enabled and not no_forward:
         backup_email = input('\n请输入备选邮箱（最近联系中无邮箱时兜底）:\n> ').strip()
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
     else:
@@ -276,19 +305,6 @@ def get_clipboard_text():
         return ""
 
 
-def select_all_and_copy(target_x=DETAIL_CENTER_X, target_y=DETAIL_CENTER_Y):
-    """
-    在详情弹窗中全选并复制文本。
-    先点击详情页中央获取键盘焦点，然后 Ctrl+A、Ctrl+C。
-    """
-    human_click(target_x, target_y, offset=3)
-    time.sleep(random.uniform(0.1, 0.2))
-    pyautogui.hotkey('ctrl', 'a')
-    time.sleep(random.uniform(0.05, 0.12))
-    pyautogui.hotkey('ctrl', 'c')
-    time.sleep(random.uniform(0.08, 0.15))
-
-
 def type_text_human(text):
     """
     人类化文本输入。
@@ -303,38 +319,143 @@ def type_text_human(text):
 
 # ─── 关键词检测 ─────────────────────────────────────
 
+class OCRInterrupted(RuntimeError):
+    """Raised when Esc stops the run during an OCR wait or scroll."""
+
+
+def initialize_ocr():
+    """Initialize one RapidOCR engine for the entire process."""
+    global ocr_backend, ocr_capture, ocr_initialization_attempted
+
+    if ocr_initialization_attempted:
+        return ocr_backend is not None and ocr_capture is not None
+    ocr_initialization_attempted = True
+    try:
+        dpi_mode = enable_windows_dpi_awareness()
+        ocr_backend = RapidOCRBackend()
+        ocr_capture = MSSScreenCapture()
+        logger.info(f'✅ OCR 初始化成功 (RapidOCR + ONNX Runtime, DPI={dpi_mode})')
+        return True
+    except Exception as exc:
+        ocr_backend = None
+        ocr_capture = None
+        logger.exception(f'❌ OCR 初始化失败，自动转发已安全禁用: {exc}')
+        return False
+
+
+def ocr_wait(seconds):
+    """OCR wait hook that keeps Esc and Space responsive."""
+    if not safe_wait(seconds):
+        raise OCRInterrupted('OCR scan interrupted by stop request')
+
+
+def ocr_scroll_down():
+    """Scroll down roughly half to two-thirds of the visible detail region."""
+    if stop_event:
+        raise OCRInterrupted('OCR scan interrupted by stop request')
+    while paused and not stop_event:
+        time.sleep(0.2)
+    if stop_event:
+        raise OCRInterrupted('OCR scan interrupted by stop request')
+    steps = random.randint(OCR_SCROLL_MIN_STEPS, OCR_SCROLL_MAX_STEPS)
+    logger.info(f'  OCR 有序向下滚动 {steps} 格')
+    pyautogui.scroll(-steps)
+
+
+def remaining_stay_seconds(target_seconds, started_at, now=None):
+    """Return only the unspent part of the original candidate stay budget."""
+    current = time.monotonic() if now is None else now
+    return max(0.0, target_seconds - (current - started_at))
+
+
+def ensure_ocr_region_calibrated():
+    """Calibrate once after the first candidate detail is visible."""
+    global ocr_detector, ocr_calibration_attempted, ocr_calibration_in_progress
+
+    if ocr_detector is not None:
+        return True
+    if ocr_calibration_attempted:
+        return False
+    ocr_calibration_attempted = True
+
+    if not initialize_ocr():
+        logger.warning('🛡 因 OCR 不可用跳过关键词检测和转发')
+        return False
+
+    logger.info('请框选主显示器上的候选人详情正文区域；按 Esc 取消校准。')
+    ocr_calibration_in_progress = True
+    try:
+        region = select_screen_region()
+        preview = save_region_preview(region, OCR_PREVIEW_PATH, ocr_capture.capture)
+    except CalibrationCancelled:
+        logger.warning('🛡 OCR 校准已取消，本次运行禁用自动转发并继续浏览')
+        return False
+    except Exception as exc:
+        logger.exception(f'🛡 OCR 校准失败，本次运行禁用自动转发并继续浏览: {exc}')
+        return False
+    finally:
+        ocr_calibration_in_progress = False
+
+    ocr_detector = OCRKeywordDetector(
+        backend=ocr_backend,
+        capture=ocr_capture,
+        region=region,
+        max_scans=OCR_MAX_SCANS,
+        min_confidence=OCR_MIN_CONFIDENCE,
+        scroll=ocr_scroll_down,
+        wait=ocr_wait,
+        settle_seconds=OCR_SETTLE_SECONDS,
+        confirmation_seconds=OCR_CONFIRMATION_SECONDS,
+    )
+    logger.info(
+        '✅ OCR 校准完成: left=%s top=%s width=%s height=%s',
+        region.left,
+        region.top,
+        region.width,
+        region.height,
+    )
+    logger.info(f'校准预览已保存: {preview}')
+    return True
+
 def detect_keywords():
     """
-    在详情弹窗中检测关键词。任一命中即返回 True。
-    步骤：点击详情页 → Ctrl+A → Ctrl+C → 读取剪贴板 → 遍历关键词。
+    截取已校准的屏幕区域并执行最多 8 屏 OCR 精确匹配。
+    OCR 失败、空结果、低置信度或二次确认失败均返回 False。
     """
     if not forward_enabled or not forward_keywords:
         return False
 
-    logger.info(f'🔍 关键词检测中... 目标: {forward_keywords}')
-
-    select_all_and_copy(DETAIL_CENTER_X, DETAIL_CENTER_Y)
-    text = get_clipboard_text()
-
-    # 调试：打印剪贴板前200字符
-    snippet = (text[:200] + '...') if len(text) > 200 else text
-    logger.info(f'  📋 剪贴板({len(text)}字): {repr(snippet)}')
-
-    # 调试：完整剪贴板写入文件，方便 ctrl+F 关键词
-    if text:
-        with open('logs/clipboard_dump.txt', 'w', encoding='utf-8') as f:
-            f.write(text)
-
-    if not text:
-        logger.warning('  ⚠ 剪贴板为空，无法检测关键词')
+    if not ensure_ocr_region_calibrated():
+        logger.warning('🛡 OCR 未就绪，因安全原因跳过转发')
         return False
 
-    for kw in forward_keywords:
-        if kw.lower() in text.lower():
-            logger.info(f'🔑 关键词命中: "{kw}" → 触发转发')
-            return True
+    logger.info(f'🔍 OCR 关键词检测中... 目标: {forward_keywords}')
+    result = ocr_detector.detect(forward_keywords)
+    for sequence, observation in enumerate(result.observations, start=1):
+        phase = '二次确认' if sequence > 1 and (
+            observation.scan_number == result.observations[sequence - 2].scan_number
+        ) else '扫描'
+        logger.info(
+            '  OCR %s: 屏=%s 耗时=%.3fs 文字框=%s 命中=%s 关键词=%s',
+            phase,
+            observation.scan_number,
+            observation.elapsed_seconds,
+            observation.item_count,
+            bool(observation.matched_keyword),
+            observation.matched_keyword or '-',
+        )
 
-    logger.info('  → 未命中')
+    if not result.success:
+        logger.error(f'🛡 OCR 错误，因安全原因跳过转发: {result.error}')
+        return False
+    if result.error:
+        logger.warning(f'🛡 OCR 二次确认失败，因安全原因跳过转发: {result.error}')
+        return False
+    if result.confirmed_match:
+        logger.info(f'🔑 OCR 二次确认命中: "{result.matched_keyword}"')
+        return True
+
+    logger.info('  → OCR 最多 8 屏未确认命中，跳过转发')
     return False
 
 
@@ -457,26 +578,38 @@ def view_candidate(index_in_batch):
     """
     global forward_consecutive
 
+    # OCR 扫描耗时计入原有 12-18 秒停留时间。
+    stay = random.uniform(MIN_STAY_SECONDS, MAX_STAY_SECONDS)
+    stay_started = time.monotonic()
+
     # ── 关键词检测（在浏览开始前） ──
     keyword_hit = False
     if forward_enabled and forward_keywords:
         keyword_hit = detect_keywords()
 
-        if keyword_hit:
+        if keyword_hit and no_forward_mode:
+            logger.info('🛡 --no-forward 已启用：保留 OCR 命中记录，禁止真实邮件转发')
+        elif keyword_hit:
             forward_one_candidate()
         else:
             # 未命中关键词，重置连续转发计数
             forward_consecutive = 0
 
     # ── 停留浏览 ──
-    stay = random.uniform(MIN_STAY_SECONDS, MAX_STAY_SECONDS)
     status = '🔑' if keyword_hit else '👤'
-    logger.info(f'{status} 第 {index_in_batch + 1}/{BATCH_SIZE} 位，停留 {stay:.1f} 秒...')
+    now = time.monotonic()
+    elapsed = now - stay_started
+    remaining_stay = remaining_stay_seconds(stay, stay_started, now)
+    logger.info(
+        f'{status} 第 {index_in_batch + 1}/{BATCH_SIZE} 位，'
+        f'目标停留 {stay:.1f} 秒，OCR/处理已用 {elapsed:.1f} 秒，'
+        f'剩余 {remaining_stay:.1f} 秒...'
+    )
 
-    end_time = time.time() + stay
-    while time.time() < end_time:
+    end_time = time.monotonic() + remaining_stay
+    while time.monotonic() < end_time:
         segment = random.uniform(2, 5)
-        remaining = end_time - time.time()
+        remaining = end_time - time.monotonic()
         if segment > remaining:
             segment = remaining
         if segment <= 0:
@@ -508,12 +641,17 @@ def refresh_page():
 # ─── 主循环 ─────────────────────────────────────────
 
 def run():
-    global stop_event, forward_consecutive
+    global stop_event, forward_consecutive, no_forward_mode
 
     # ── 交互/参数输入 ──
     cli_args = parse_args()
+    no_forward_mode = cli_args['no_forward']
     get_user_input(keywords_str=cli_args['keywords'], email_str=cli_args['email'],
-                   auto=cli_args['auto'])
+                   auto=cli_args['auto'], no_forward=no_forward_mode)
+
+    # 提前初始化并复用 OCR 引擎；校准仍延迟到第一位详情打开之后。
+    if forward_enabled and forward_keywords:
+        initialize_ocr()
 
     # ── 启动键盘监听（必须在交互输入之后，避免 exe 中 input() 冲突） ──
     listener.start()
@@ -523,8 +661,11 @@ def run():
     logger.info(f'停留: {MIN_STAY_SECONDS}-{MAX_STAY_SECONDS}s | 每 {BATCH_SIZE} 人刷新')
     if forward_enabled:
         logger.info(f'转发关键词: {forward_keywords}')
-        logger.info(f'备选邮箱: {backup_email}')
-        logger.info(f'连续转发上限: {FORWARD_MAX_CONSEC}')
+        if no_forward_mode:
+            logger.info('模式: 只执行 OCR 检测，真实邮件转发已禁用 (--no-forward)')
+        else:
+            logger.info(f'备选邮箱: {backup_email}')
+            logger.info(f'连续转发上限: {FORWARD_MAX_CONSEC}')
     else:
         logger.info('转发: 已禁用')
     logger.info('=' * 50)

@@ -1,5 +1,7 @@
 import unittest
 
+import numpy as np
+
 from ocr_text import OCRItem, exact_keyword_match, normalize_text, searchable_text
 
 
@@ -27,6 +29,31 @@ class OCRTextTests(unittest.TestCase):
             OCRItem("广东", 0.9, [[0, 10], [50, 10], [50, 20], [0, 20]]),
         ]
         self.assertEqual(searchable_text(items), "广东学院")
+
+    def test_numpy_boxes_from_rapidocr_are_supported(self):
+        items = [
+            OCRItem(
+                "Python",
+                0.99,
+                np.asarray([[10, 20], [100, 20], [100, 50], [10, 50]]),
+            )
+        ]
+        self.assertEqual(searchable_text(items, min_confidence=0.85), "python")
+
+    def test_large_same_line_boxes_use_left_to_right_order(self):
+        items = [
+            OCRItem(
+                "OCR Test",
+                0.99,
+                np.asarray([[256, 49], [626, 52], [625, 163], [255, 160]]),
+            ),
+            OCRItem(
+                "Python",
+                0.99,
+                np.asarray([[22, 60], [287, 62], [286, 168], [21, 166]]),
+            ),
+        ]
+        self.assertEqual(searchable_text(items), "pythonocrtest")
 
 
 if __name__ == "__main__":

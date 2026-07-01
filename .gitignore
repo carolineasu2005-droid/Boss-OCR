@@ -12,3 +12,6 @@ logs/
 .idea/
 .vscode/
 .DS_Store
+
+# Local project documentation
+*.md

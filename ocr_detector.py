@@ -50,7 +50,7 @@ class MSSScreenCapture:
             import numpy as np
         except ImportError as exc:
             raise RuntimeError("mss and NumPy are required for screen capture") from exc
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             shot = sct.grab(region.as_mss_monitor())
         # Drop alpha. MSS byte order is BGRA, which RapidOCR accepts as BGR.
         return np.asarray(shot)[:, :, :3].copy()
@@ -65,7 +65,7 @@ class RapidOCRBackend:
                 from rapidocr import RapidOCR
             except ImportError as exc:
                 raise RuntimeError(
-                    "RapidOCR is not installed; install the Mac OCR requirements"
+                    "RapidOCR is not installed; install requirements-ocr.txt"
                 ) from exc
             engine = RapidOCR()
         self.engine = engine

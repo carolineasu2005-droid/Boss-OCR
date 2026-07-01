@@ -16,11 +16,18 @@ class OCRItem:
 
     @property
     def anchor(self) -> Tuple[float, float]:
-        if not self.box:
+        if self.box is None or len(self.box) == 0:
             return (0.0, 0.0)
         xs = [float(point[0]) for point in self.box]
         ys = [float(point[1]) for point in self.box]
         return (min(xs), min(ys))
+
+    @property
+    def vertical_bounds(self) -> Optional[Tuple[float, float]]:
+        if self.box is None or len(self.box) == 0:
+            return None
+        ys = [float(point[1]) for point in self.box]
+        return (min(ys), max(ys))
 
 
 def normalize_text(value: str) -> str:
@@ -31,9 +38,39 @@ def normalize_text(value: str) -> str:
 
 
 def order_items(items: Iterable[OCRItem]) -> List[OCRItem]:
-    """Return OCR boxes in a stable top-to-bottom, left-to-right order."""
+    """Return OCR boxes in adaptive line order, then left-to-right order."""
 
-    return sorted(items, key=lambda item: (round(item.anchor[1] / 8.0), item.anchor[0]))
+    items = list(items)
+    positioned = [item for item in items if item.vertical_bounds is not None]
+    unpositioned = [item for item in items if item.vertical_bounds is None]
+    positioned.sort(key=lambda item: (item.anchor[1], item.anchor[0]))
+
+    lines = []
+    for item in positioned:
+        top, bottom = item.vertical_bounds
+        center = (top + bottom) / 2.0
+        height = max(1.0, bottom - top)
+        target = None
+        for line in lines:
+            tolerance = max(8.0, min(height, line["height"]) * 0.5)
+            if abs(center - line["center"]) <= tolerance:
+                target = line
+                break
+        if target is None:
+            lines.append(
+                {"items": [item], "center": center, "height": height}
+            )
+        else:
+            target["items"].append(item)
+            count = len(target["items"])
+            target["center"] = ((target["center"] * (count - 1)) + center) / count
+            target["height"] = ((target["height"] * (count - 1)) + height) / count
+
+    ordered = []
+    for line in sorted(lines, key=lambda value: value["center"]):
+        ordered.extend(sorted(line["items"], key=lambda item: item.anchor[0]))
+    ordered.extend(unpositioned)
+    return ordered
 
 
 def searchable_text(items: Iterable[OCRItem], min_confidence: float = 0.0) -> str:

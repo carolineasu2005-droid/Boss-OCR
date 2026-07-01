@@ -34,8 +34,8 @@ def main() -> int:
         return 2
 
     capture = MSSScreenCapture()
-    preview = save_region_preview(region, Path(args.preview), capture.capture)
     print(f"Selected region: {region}")
+    preview = save_region_preview(region, Path(args.preview), capture.capture)
     print(f"Preview saved to: {preview}")
 
     detector = OCRKeywordDetector(

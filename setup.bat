@@ -37,8 +37,8 @@ if exist "venv" (
 )
 echo.
 
-echo [3/3] 安装依赖包...
-"venv\Scripts\pip.exe" install -r requirements.txt
+echo [3/3] 安装主程序和 OCR 依赖包...
+"venv\Scripts\python.exe" -m pip install -r requirements.txt -r requirements-ocr.txt
 if errorlevel 1 (
     echo [错误] 安装依赖失败
     pause

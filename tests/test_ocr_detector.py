@@ -67,6 +67,31 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(result.scans_completed, 3)
         self.assertEqual(len(scroll_calls), 2)
 
+    def test_keyword_on_later_screen_is_confirmed(self):
+        scroll_calls = []
+        detector = self.make_detector(
+            ["第一页", "第二页 Python", "第二页 Python"],
+            max_scans=8,
+            scroll=lambda: scroll_calls.append(True),
+        )
+        result = detector.detect(["Python"])
+        self.assertTrue(result.confirmed_match)
+        self.assertEqual(result.scans_completed, 2)
+        self.assertEqual(len(scroll_calls), 1)
+
+    def test_eight_screens_without_keyword_never_match(self):
+        scroll_calls = []
+        detector = self.make_detector(
+            [f"第{number}页" for number in range(1, 9)],
+            max_scans=8,
+            scroll=lambda: scroll_calls.append(True),
+        )
+        result = detector.detect(["不存在"])
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertEqual(result.scans_completed, 8)
+        self.assertEqual(len(scroll_calls), 7)
+
     def test_backend_failure_is_fail_closed(self):
         class BrokenBackend:
             def recognize(self, _image):
@@ -82,6 +107,29 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertFalse(result.confirmed_match)
         self.assertIn("OCR unavailable", result.error)
+
+    def test_empty_ocr_result_does_not_match(self):
+        detector = self.make_detector([""], max_scans=1)
+        result = detector.detect(["关键词"])
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+
+    def test_low_confidence_match_does_not_trigger(self):
+        class LowConfidenceBackend:
+            def recognize(self, _image):
+                return [OCRItem("关键词", 0.4)]
+
+        detector = OCRKeywordDetector(
+            backend=LowConfidenceBackend(),
+            capture=FakeCapture(),
+            region=self.region,
+            wait=lambda _seconds: None,
+            max_scans=1,
+            min_confidence=0.85,
+        )
+        result = detector.detect(["关键词"])
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
 
 
 class RapidOCRAdapterTests(unittest.TestCase):
