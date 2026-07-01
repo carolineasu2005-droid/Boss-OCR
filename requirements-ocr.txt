@@ -1,0 +1,6 @@
+# Cross-platform RapidOCR dependencies. Use Python 3.10+ (3.11 x64 preferred).
+rapidocr
+onnxruntime
+mss
+Pillow
+numpy

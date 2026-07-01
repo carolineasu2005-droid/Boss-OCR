@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+.venv-mac/
 
 # Runtime data (may contain candidate information)
 logs/
@@ -11,3 +12,11 @@ logs/
 .idea/
 .vscode/
 .DS_Store
+
+# Local project documentation
+*.md
+
+# Local packaging artifacts
+/build/
+/release/
+/release-lean/
