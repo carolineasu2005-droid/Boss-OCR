@@ -76,8 +76,8 @@ COUNTDOWN_SECONDS = 3
 # OCR 关键词检测
 OCR_MAX_SCANS = 8
 OCR_MIN_CONFIDENCE = 0.85
-OCR_SCROLL_MIN_STEPS = 5
-OCR_SCROLL_MAX_STEPS = 7
+OCR_SCROLL_MIN_STEPS = 100
+OCR_SCROLL_MAX_STEPS = 140
 OCR_SETTLE_SECONDS = 0.6
 OCR_CONFIRMATION_SECONDS = 0.7
 OCR_PREVIEW_PATH = Path('logs/ocr_calibration_preview.png')
@@ -382,7 +382,7 @@ def ocr_wait(seconds):
 
 
 def ocr_scroll_down():
-    """Scroll down roughly half to two-thirds of the visible detail region."""
+    """Scroll down by the configured OCR scan distance."""
     if stop_event:
         raise OCRInterrupted('OCR scan interrupted by stop request')
     while paused and not stop_event:

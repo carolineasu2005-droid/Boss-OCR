@@ -113,6 +113,18 @@ class SimpleBrushOCRTests(unittest.TestCase):
             with self.assertRaises(simple_brush.OCRInterrupted):
                 simple_brush.ocr_wait(0.6)
 
+    def test_ocr_scroll_uses_twenty_times_the_previous_range(self):
+        for steps in (100, 140):
+            with self.subTest(steps=steps):
+                with (
+                    patch.object(simple_brush.random, "randint", return_value=steps) as randint,
+                    patch.object(simple_brush.pyautogui, "scroll") as scroll,
+                ):
+                    simple_brush.ocr_scroll_down()
+
+                randint.assert_called_once_with(100, 140)
+                scroll.assert_called_once_with(-steps)
+
     def test_window_match_rejects_vscode_project_title(self):
         self.assertFalse(
             simple_brush.is_boss_edge_window(
