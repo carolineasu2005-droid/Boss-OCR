@@ -153,6 +153,45 @@ class DetectorTests(unittest.TestCase):
         result = detector.detect(parse_keyword_rules('"A"; "B"'))
         self.assertFalse(result.confirmed_match)
 
+    def test_not_rule_is_confirmed_when_both_passes_satisfy_the_full_rule(self):
+        detector = self.make_detector(["短剧编导", "短剧制作"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"短剧" and not "销售"'))
+        self.assertTrue(result.success)
+        self.assertTrue(result.confirmed_match)
+        self.assertEqual(result.matched_keyword, '"短剧" and not "销售"')
+        self.assertEqual(len(result.observations), 2)
+
+    def test_not_rule_fails_confirmation_when_excluded_keyword_appears(self):
+        detector = self.make_detector(["短剧编导", "短剧销售"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"短剧" and not "销售"'))
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertIsNone(result.matched_keyword)
+        self.assertEqual(len(result.observations), 2)
+
+    def test_not_rule_fails_confirmation_when_positive_keyword_disappears(self):
+        detector = self.make_detector(["短剧编导", "其他岗位"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"短剧" and not "销售"'))
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertIsNone(result.matched_keyword)
+
+    def test_mixed_not_rule_is_rechecked_as_the_same_complete_rule(self):
+        detector = self.make_detector(["只有 C", "B 和 C"], max_scans=1)
+        result = detector.detect(
+            parse_keyword_rules('"A" or not "B" and "C"')
+        )
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertIsNone(result.matched_keyword)
+
+    def test_not_rule_does_not_start_confirmation_when_first_pass_is_excluded(self):
+        detector = self.make_detector(["短剧销售"], max_scans=1)
+        result = detector.detect(parse_keyword_rules('"短剧" and not "销售"'))
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertEqual(len(result.observations), 1)
+
 
 class RapidOCRAdapterTests(unittest.TestCase):
     def test_modern_result_object(self):
