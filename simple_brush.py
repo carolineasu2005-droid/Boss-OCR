@@ -31,6 +31,7 @@ from pynput import keyboard
 
 from ocr_calibration import (
     CalibrationCancelled,
+    ScreenRegion,
     enable_windows_dpi_awareness,
     save_region_preview,
     select_screen_region,
@@ -125,6 +126,12 @@ RIGHT_CLICK_Y    = 500
 # 加上 ±3 像素随机偏移后仍须位于 X:400-500, Y:350-400
 FOCUS_RESTORE_X  = 450
 FOCUS_RESTORE_Y  = 375
+DEFAULT_FOCUS_RESTORE_REGION = ScreenRegion(
+    left=400,
+    top=350,
+    width=101,
+    height=51,
+)
 
 # 转发反检测
 FORWARD_CLICK_OFFSET = 5    # 点击位置随机偏移范围（像素）
@@ -159,6 +166,12 @@ forward_enabled = False     # 是否启用转发
 forward_consecutive = 0     # 连续转发计数
 no_forward_mode = False     # 只检测，不执行真实邮件转发
 
+# 焦点恢复区域状态（仅在当前运行期间有效）
+focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
+focus_restore_calibration_requested = False
+focus_restore_calibration_attempted = False
+focus_restore_calibration_in_progress = False
+
 # OCR 状态（每次运行只初始化、校准一次）
 ocr_backend = None
 ocr_capture = None
@@ -176,7 +189,7 @@ def on_press(key):
     if key == keyboard.Key.esc:
         if _programmatic_esc:
             return True  # 程序触发的 ESC，忽略
-        if ocr_calibration_in_progress:
+        if ocr_calibration_in_progress or focus_restore_calibration_in_progress:
             return True  # 交给 Tk 校准窗口处理，只取消校准，不停止浏览
         stop_event = True
         logger.info('⚡ 收到 ESC，准备停止')
@@ -391,6 +404,16 @@ def human_click(x, y, offset=FORWARD_CLICK_OFFSET):
     pyautogui.mouseUp(tx, ty)
 
 
+def random_point_in_region(region):
+    """Return one point inside a screen region using half-open bounds."""
+    if region.width <= 0 or region.height <= 0:
+        raise ValueError('焦点恢复区域尺寸必须为正数')
+    return (
+        random.randint(region.left, region.left + region.width - 1),
+        random.randint(region.top, region.top + region.height - 1),
+    )
+
+
 def get_clipboard_text():
     """读取剪贴板文本（CF_UNICODETEXT）。失败返回空字符串。"""
     try:
@@ -520,6 +543,57 @@ def ensure_ocr_region_calibrated():
     )
     logger.info(f'校准预览已保存: {preview}')
     return True
+
+
+def reset_focus_restore_calibration():
+    """Reset focus restore calibration to its per-run defaults."""
+    global focus_restore_region
+    global focus_restore_calibration_requested
+    global focus_restore_calibration_attempted
+    global focus_restore_calibration_in_progress
+
+    focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
+    focus_restore_calibration_requested = False
+    focus_restore_calibration_attempted = False
+    focus_restore_calibration_in_progress = False
+
+
+def ensure_focus_restore_region_calibrated():
+    """Calibrate once when requested, falling back to the default region."""
+    global focus_restore_region
+    global focus_restore_calibration_attempted
+    global focus_restore_calibration_in_progress
+
+    if not focus_restore_calibration_requested:
+        return focus_restore_region
+    if focus_restore_calibration_attempted:
+        return focus_restore_region
+
+    focus_restore_calibration_attempted = True
+    focus_restore_calibration_in_progress = True
+    try:
+        focus_restore_region = select_screen_region(
+            min_size=20,
+            instruction='拖动框选候选人详情页空白区域 · Esc 使用默认区域',
+            subtitle='第一版仅支持主显示器',
+        )
+        logger.info(
+            '✅ 焦点恢复区域校准完成: left=%s top=%s width=%s height=%s',
+            focus_restore_region.left,
+            focus_restore_region.top,
+            focus_restore_region.width,
+            focus_restore_region.height,
+        )
+    except CalibrationCancelled:
+        focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
+        logger.warning('焦点恢复区域校准已取消，本次运行使用默认区域')
+    except Exception as exc:
+        focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
+        logger.exception(f'焦点恢复区域校准失败，本次运行使用默认区域: {exc}')
+    finally:
+        focus_restore_calibration_in_progress = False
+
+    return focus_restore_region
 
 def detect_keywords():
     """
@@ -776,6 +850,7 @@ def refresh_page():
 def run():
     global stop_event, forward_consecutive, no_forward_mode
     stop_event = False
+    reset_focus_restore_calibration()
 
     # ── 交互/参数输入 ──
     try:

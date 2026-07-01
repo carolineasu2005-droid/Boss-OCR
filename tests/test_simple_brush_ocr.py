@@ -15,6 +15,10 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "forward_consecutive",
                 "backup_email",
                 "no_forward_mode",
+                "focus_restore_region",
+                "focus_restore_calibration_requested",
+                "focus_restore_calibration_attempted",
+                "focus_restore_calibration_in_progress",
                 "ocr_backend",
                 "ocr_capture",
                 "ocr_detector",
@@ -31,6 +35,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.forward_consecutive = 0
         simple_brush.backup_email = ""
         simple_brush.no_forward_mode = False
+        simple_brush.reset_focus_restore_calibration()
         simple_brush.stop_event = False
         simple_brush.paused = False
         simple_brush.run_duration_seconds = 0
@@ -137,6 +142,120 @@ class SimpleBrushOCRTests(unittest.TestCase):
 
     def test_calibration_escape_does_not_stop_browsing(self):
         simple_brush.ocr_calibration_in_progress = True
+        result = simple_brush.on_press(simple_brush.keyboard.Key.esc)
+        self.assertTrue(result)
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_focus_restore_default_region_includes_original_boundaries(self):
+        self.assertEqual(
+            simple_brush.DEFAULT_FOCUS_RESTORE_REGION,
+            simple_brush.ScreenRegion(left=400, top=350, width=101, height=51),
+        )
+
+    def test_random_focus_restore_point_uses_half_open_region_bounds(self):
+        region = simple_brush.ScreenRegion(left=400, top=350, width=101, height=51)
+        with patch.object(
+            simple_brush.random,
+            "randint",
+            side_effect=[500, 400],
+        ) as randint:
+            self.assertEqual(simple_brush.random_point_in_region(region), (500, 400))
+        self.assertEqual(
+            randint.call_args_list,
+            [call(400, 500), call(350, 400)],
+        )
+
+    def test_random_focus_restore_point_rejects_empty_region(self):
+        with self.assertRaisesRegex(ValueError, "尺寸必须为正数"):
+            simple_brush.random_point_in_region(
+                simple_brush.ScreenRegion(left=400, top=350, width=0, height=51)
+            )
+
+    def test_focus_restore_calibration_is_skipped_when_not_requested(self):
+        with patch.object(simple_brush, "select_screen_region") as select:
+            region = simple_brush.ensure_focus_restore_region_calibrated()
+        self.assertEqual(region, simple_brush.DEFAULT_FOCUS_RESTORE_REGION)
+        select.assert_not_called()
+        self.assertFalse(simple_brush.focus_restore_calibration_attempted)
+
+    def test_focus_restore_calibration_updates_runtime_region(self):
+        calibrated = simple_brush.ScreenRegion(left=600, top=300, width=120, height=60)
+        simple_brush.focus_restore_calibration_requested = True
+        with patch.object(
+            simple_brush,
+            "select_screen_region",
+            return_value=calibrated,
+        ) as select:
+            self.assertEqual(
+                simple_brush.ensure_focus_restore_region_calibrated(),
+                calibrated,
+            )
+        select.assert_called_once_with(
+            min_size=20,
+            instruction="拖动框选候选人详情页空白区域 · Esc 使用默认区域",
+            subtitle="第一版仅支持主显示器",
+        )
+        self.assertEqual(simple_brush.focus_restore_region, calibrated)
+        self.assertTrue(simple_brush.focus_restore_calibration_attempted)
+        self.assertFalse(simple_brush.focus_restore_calibration_in_progress)
+
+    def test_cancelled_focus_restore_calibration_keeps_default_and_runs_once(self):
+        simple_brush.focus_restore_calibration_requested = True
+        with patch.object(
+            simple_brush,
+            "select_screen_region",
+            side_effect=simple_brush.CalibrationCancelled,
+        ) as select:
+            self.assertEqual(
+                simple_brush.ensure_focus_restore_region_calibrated(),
+                simple_brush.DEFAULT_FOCUS_RESTORE_REGION,
+            )
+            self.assertEqual(
+                simple_brush.ensure_focus_restore_region_calibrated(),
+                simple_brush.DEFAULT_FOCUS_RESTORE_REGION,
+            )
+        self.assertEqual(select.call_count, 1)
+        self.assertFalse(simple_brush.focus_restore_calibration_in_progress)
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_failed_focus_restore_calibration_keeps_default_region(self):
+        simple_brush.focus_restore_calibration_requested = True
+        simple_brush.focus_restore_region = simple_brush.ScreenRegion(1, 2, 3, 4)
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=RuntimeError("overlay failed"),
+            ),
+            patch.object(simple_brush.logger, "exception") as log_exception,
+        ):
+            region = simple_brush.ensure_focus_restore_region_calibrated()
+        self.assertEqual(region, simple_brush.DEFAULT_FOCUS_RESTORE_REGION)
+        self.assertTrue(simple_brush.focus_restore_calibration_attempted)
+        self.assertFalse(simple_brush.focus_restore_calibration_in_progress)
+        log_exception.assert_called_once()
+
+    def test_run_resets_focus_restore_calibration_state(self):
+        simple_brush.focus_restore_region = simple_brush.ScreenRegion(1, 2, 3, 4)
+        simple_brush.focus_restore_calibration_requested = True
+        simple_brush.focus_restore_calibration_attempted = True
+        simple_brush.focus_restore_calibration_in_progress = True
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--duration-seconds", "invalid", "--auto"],
+        ):
+            self.assertEqual(simple_brush.run(), 2)
+        self.assertEqual(
+            simple_brush.focus_restore_region,
+            simple_brush.DEFAULT_FOCUS_RESTORE_REGION,
+        )
+        self.assertFalse(simple_brush.focus_restore_calibration_requested)
+        self.assertFalse(simple_brush.focus_restore_calibration_attempted)
+        self.assertFalse(simple_brush.focus_restore_calibration_in_progress)
+
+    def test_focus_restore_calibration_escape_does_not_stop_browsing(self):
+        simple_brush.focus_restore_calibration_in_progress = True
         result = simple_brush.on_press(simple_brush.keyboard.Key.esc)
         self.assertTrue(result)
         self.assertFalse(simple_brush.stop_event)
