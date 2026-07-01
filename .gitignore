@@ -15,3 +15,8 @@ logs/
 
 # Local project documentation
 *.md
+
+# Local packaging artifacts
+/build/
+/release/
+/release-lean/

@@ -113,6 +113,20 @@ class SimpleBrushOCRTests(unittest.TestCase):
             with self.assertRaises(simple_brush.OCRInterrupted):
                 simple_brush.ocr_wait(0.6)
 
+    def test_window_match_rejects_vscode_project_title(self):
+        self.assertFalse(
+            simple_brush.is_boss_edge_window(
+                "BossOCR.spec - BOSSOCR - Visual Studio Code", "code.exe"
+            )
+        )
+
+    def test_window_match_accepts_boss_in_edge(self):
+        self.assertTrue(
+            simple_brush.is_boss_edge_window(
+                "BOSS直聘 - 个人 - Microsoft Edge", "msedge.exe"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
