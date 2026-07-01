@@ -31,11 +31,19 @@ class OCRItem:
 
 
 @dataclass(frozen=True)
+class KeywordTerm:
+    """One positive or negated quoted keyword in an AND group."""
+
+    keyword: str
+    negated: bool = False
+
+
+@dataclass(frozen=True)
 class KeywordRule:
     """One parsed keyword expression represented as OR-ed AND groups."""
 
     source: str
-    or_groups: Tuple[Tuple[str, ...], ...]
+    or_groups: Tuple[Tuple[KeywordTerm, ...], ...]
 
 
 class KeywordRuleSyntaxError(ValueError):
@@ -47,7 +55,7 @@ def _rule_error(message: str, position: int) -> KeywordRuleSyntaxError:
 
 
 def parse_keyword_rules(value: str) -> List[KeywordRule]:
-    """Parse semicolon-separated quoted keyword rules with AND precedence."""
+    """Parse quoted keyword rules with NOT, AND, then OR precedence."""
 
     text = "" if value is None else str(value)
     length = len(text)
@@ -71,6 +79,49 @@ def parse_keyword_rules(value: str) -> List[KeywordRule]:
             raise _rule_error('关键词不能为空', start)
         return keyword, closing_quote + 1
 
+    def starts_token(position, token):
+        end = position + len(token)
+        return text[position:end].lower() == token and (
+            end == length or text[end].isspace()
+        )
+
+    def parse_term(position):
+        if text[position:position + 3].lower() == 'not':
+            not_start = position
+            after_not = position + 3
+            if after_not >= length or not text[after_not].isspace():
+                raise _rule_error('not 后必须是带英文双引号的关键词', not_start)
+            position = skip_whitespace(after_not)
+            if position >= length:
+                raise _rule_error('not 后缺少带英文双引号的关键词', position)
+            if starts_token(position, 'not'):
+                raise _rule_error('not 只能修饰一个带英文双引号的关键词', position)
+            if text[position] != '"':
+                raise _rule_error(
+                    'not 后必须是带英文双引号的关键词，不支持修饰组合表达式',
+                    position,
+                )
+            keyword, position = parse_quoted_keyword(position)
+            return KeywordTerm(keyword=keyword, negated=True), position
+
+        keyword, position = parse_quoted_keyword(position)
+        return KeywordTerm(keyword=keyword), position
+
+    def finish_group(group, position):
+        if not any(not term.negated for term in group):
+            raise _rule_error('每个 OR 分支至少需要一个正向关键词', position)
+        return tuple(group)
+
+    def build_rule(groups):
+        source = ' or '.join(
+            ' and '.join(
+                f'not "{term.keyword}"' if term.negated else f'"{term.keyword}"'
+                for term in group
+            )
+            for group in groups
+        )
+        return KeywordRule(source, tuple(groups))
+
     index = skip_whitespace(index)
     if index >= length:
         return []
@@ -82,8 +133,9 @@ def parse_keyword_rules(value: str) -> List[KeywordRule]:
 
         groups = []
         current_group = []
-        keyword, index = parse_quoted_keyword(index)
-        current_group.append(keyword)
+        term_start = index
+        term, index = parse_term(index)
+        current_group.append(term)
 
         while True:
             whitespace_start = index
@@ -91,21 +143,13 @@ def parse_keyword_rules(value: str) -> List[KeywordRule]:
             had_whitespace = index > whitespace_start
 
             if index >= length:
-                groups.append(tuple(current_group))
-                source = ' or '.join(
-                    ' and '.join(f'"{item}"' for item in group)
-                    for group in groups
-                )
-                rules.append(KeywordRule(source, tuple(groups)))
+                groups.append(finish_group(current_group, term_start))
+                rules.append(build_rule(groups))
                 return rules
 
             if text[index] == ';':
-                groups.append(tuple(current_group))
-                source = ' or '.join(
-                    ' and '.join(f'"{item}"' for item in group)
-                    for group in groups
-                )
-                rules.append(KeywordRule(source, tuple(groups)))
+                groups.append(finish_group(current_group, term_start))
+                rules.append(build_rule(groups))
                 index = skip_whitespace(index + 1)
                 if index >= length:
                     return rules
@@ -118,25 +162,25 @@ def parse_keyword_rules(value: str) -> List[KeywordRule]:
 
             operator = None
             for candidate in ('and', 'or'):
-                end = index + len(candidate)
-                if text[index:end].lower() == candidate and (
-                    end == length or text[end].isspace()
-                ):
+                if starts_token(index, candidate):
                     operator = candidate
-                    index = end
+                    index += len(candidate)
                     break
             if operator is None:
-                raise _rule_error('仅支持 and、or 或分号连接关键词', index)
+                if starts_token(index, 'not'):
+                    raise _rule_error('not 前必须使用 and 或 or 连接关键词', index)
+                raise _rule_error('仅支持 and、or、not 或分号连接关键词', index)
 
             index = skip_whitespace(index)
-            if index >= length or text[index] != '"':
+            if index >= length or text[index] == ';':
                 raise _rule_error(f'{operator} 后缺少带英文双引号的关键词', index)
 
             if operator == 'or':
-                groups.append(tuple(current_group))
+                groups.append(finish_group(current_group, term_start))
                 current_group = []
-            keyword, index = parse_quoted_keyword(index)
-            current_group.append(keyword)
+            term_start = index
+            term, index = parse_term(index)
+            current_group.append(term)
 
     return rules
 
@@ -207,7 +251,14 @@ def keyword_rule_matches(text: str, rule: KeywordRule) -> bool:
 
     normalized_text = normalize_text(text)
     return any(
-        all(normalize_text(keyword) in normalized_text for keyword in group)
+        all(
+            (
+                normalize_text(term.keyword) not in normalized_text
+                if term.negated
+                else normalize_text(term.keyword) in normalized_text
+            )
+            for term in group
+        )
         for group in rule.or_groups
     )
 

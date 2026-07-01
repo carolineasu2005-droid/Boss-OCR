@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from ocr_text import (
+    KeywordTerm,
     OCRItem,
     exact_keyword_match,
     keyword_rule_matches,
@@ -82,6 +83,67 @@ class OCRTextTests(unittest.TestCase):
         self.assertTrue(keyword_rule_matches("只有A", rule))
         self.assertFalse(keyword_rule_matches("只有B", rule))
         self.assertTrue(keyword_rule_matches("B和C", rule))
+
+    def test_not_excludes_text_containing_the_negative_keyword(self):
+        rule = parse_keyword_rules('"短剧" and not "销售"')[0]
+        self.assertTrue(keyword_rule_matches("短剧编导", rule))
+        self.assertFalse(keyword_rule_matches("短剧销售", rule))
+        self.assertFalse(keyword_rule_matches("销售", rule))
+        self.assertFalse(keyword_rule_matches("其他岗位", rule))
+
+    def test_not_has_higher_precedence_than_and_and_or(self):
+        rule = parse_keyword_rules('"A" or not "B" and "C"')[0]
+        self.assertEqual(
+            rule.or_groups,
+            (
+                (KeywordTerm("A"),),
+                (KeywordTerm("B", negated=True), KeywordTerm("C")),
+            ),
+        )
+        self.assertTrue(keyword_rule_matches("只有A和B", rule))
+        self.assertTrue(keyword_rule_matches("只有C", rule))
+        self.assertFalse(keyword_rule_matches("B和C", rule))
+        self.assertFalse(keyword_rule_matches("其他内容", rule))
+
+    def test_and_not_group_before_or_keeps_expected_precedence(self):
+        rule = parse_keyword_rules('"A" and not "B" or "C"')[0]
+        self.assertTrue(keyword_rule_matches("只有A", rule))
+        self.assertFalse(keyword_rule_matches("A和B", rule))
+        self.assertTrue(keyword_rule_matches("只有C", rule))
+
+    def test_not_connectors_are_case_insensitive_and_canonical(self):
+        rule = parse_keyword_rules('  "A" AND NOT "B" Or "C"  ')[0]
+        self.assertEqual(rule.source, '"A" and not "B" or "C"')
+
+    def test_not_inside_quotes_is_plain_keyword_text(self):
+        rule = parse_keyword_rules('"not for sale"')[0]
+        self.assertEqual(rule.or_groups, ((KeywordTerm("not for sale"),),))
+        self.assertTrue(keyword_rule_matches("This is not for sale", rule))
+
+    def test_every_or_branch_requires_a_positive_keyword(self):
+        invalid_values = (
+            'not "B"',
+            'not "B" or "A"',
+            '"A" or not "B"',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "正向关键词.*位置"):
+                    parse_keyword_rules(value)
+
+    def test_invalid_not_forms_report_a_position(self):
+        invalid_values = (
+            '"短剧" and not',
+            '"短剧" not "销售"',
+            '"短剧" and not not "销售"',
+            'not ("销售" or "运营")',
+            '"短剧" and not ("销售")',
+            'not"销售"',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "位置"):
+                    parse_keyword_rules(value)
 
     def test_semicolon_rules_match_independently_in_input_order(self):
         rules = parse_keyword_rules(
