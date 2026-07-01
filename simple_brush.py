@@ -231,9 +231,11 @@ def get_user_input(
     auto=True 或 keywords 已传入时跳过交互。
     """
     global forward_keywords, backup_email, forward_enabled, run_duration_seconds
+    global focus_restore_calibration_requested
 
     # ── 非交互模式（命令行传参或 --auto） ──
     if auto or keywords_str:
+        focus_restore_calibration_requested = False
         run_duration_seconds = parse_duration_seconds(duration_str)
         if keywords_str:
             forward_keywords = parse_keyword_rules(keywords_str)
@@ -275,6 +277,18 @@ def get_user_input(
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
     else:
         backup_email = ""
+
+    if forward_enabled:
+        calibrate_focus = input(
+            '\n是否校准转发结束后的焦点恢复点击区域？[y/N]\n> '
+        ).strip().lower()
+        focus_restore_calibration_requested = calibrate_focus in ('y', 'yes')
+        if focus_restore_calibration_requested:
+            print('  将在第一位候选人详情页打开后进行焦点恢复区域校准')
+        else:
+            print('  焦点恢复点击将使用默认区域 X:400-500, Y:350-400')
+    else:
+        focus_restore_calibration_requested = False
 
     while True:
         duration_raw = input('\n请输入本次运行时间（秒，留空或 0 表示持续运行）:\n> ')
@@ -907,6 +921,10 @@ def run():
             # 打开第一位候选人
             if not click_first_candidate(click_x, click_y):
                 break
+
+            # 仅普通交互模式可请求；详情页可见后再显示框选层。
+            if focus_restore_calibration_requested:
+                ensure_focus_restore_region_calibrated()
 
             # 浏览本批次 100 位
             for i in range(BATCH_SIZE):

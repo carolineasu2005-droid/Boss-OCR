@@ -353,13 +353,108 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_keyword_rules_retry_invalid_input(self):
         with patch(
             "builtins.input",
-            side_effect=["Python", '"Python" or "短剧"', ""],
+            side_effect=["Python", '"Python" or "短剧"', "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertEqual(
             simple_brush.keyword_rule_sources(),
             ['"Python" or "短剧"'],
         )
+
+    def test_interactive_mode_can_request_focus_restore_calibration(self):
+        with patch(
+            "builtins.input",
+            side_effect=['"Python"', "y", ""],
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertTrue(simple_brush.focus_restore_calibration_requested)
+
+    def test_interactive_mode_defaults_to_focus_restore_region_fallback(self):
+        with patch(
+            "builtins.input",
+            side_effect=['"Python"', "", ""],
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertFalse(simple_brush.focus_restore_calibration_requested)
+
+    def test_auto_mode_never_prompts_for_focus_restore_calibration(self):
+        simple_brush.focus_restore_calibration_requested = True
+        with patch("builtins.input") as user_input:
+            simple_brush.get_user_input(keywords_str='"Python"', auto=True)
+        user_input.assert_not_called()
+        self.assertFalse(simple_brush.focus_restore_calibration_requested)
+
+    def test_run_calibrates_after_first_detail_opens_before_viewing(self):
+        events = []
+
+        def configure_input(**_kwargs):
+            simple_brush.focus_restore_calibration_requested = True
+
+        def open_detail(_x, _y):
+            events.append("detail")
+            return True
+
+        def calibrate():
+            events.append("calibrate")
+            return simple_brush.DEFAULT_FOCUS_RESTORE_REGION
+
+        def view(_index):
+            events.append("view")
+            return False
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", side_effect=open_detail),
+            patch.object(
+                simple_brush,
+                "ensure_focus_restore_region_calibrated",
+                side_effect=calibrate,
+            ) as ensure,
+            patch.object(simple_brush, "view_candidate", side_effect=view),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+        self.assertEqual(events, ["detail", "calibrate", "view"])
+        ensure.assert_called_once_with()
+
+    def test_run_does_not_calibrate_when_first_detail_fails_to_open(self):
+        def configure_input(**_kwargs):
+            simple_brush.focus_restore_calibration_requested = True
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", return_value=False),
+            patch.object(
+                simple_brush,
+                "ensure_focus_restore_region_calibrated",
+            ) as ensure,
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+        ensure.assert_not_called()
 
     def test_zero_duration_does_not_create_timer(self):
         with patch.object(simple_brush.threading, "Timer") as timer_factory:
