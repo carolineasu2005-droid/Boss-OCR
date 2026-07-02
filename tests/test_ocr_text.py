@@ -208,6 +208,49 @@ class OCRTextTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "重复关键词.*位置"):
                     parse_keyword_rules(value)
 
+    def test_multiple_any_groups_preserve_outer_and_constraints(self):
+        rule = parse_keyword_rules(
+            'any("魔方","九州") and any("短剧","漫剧")'
+        )[0]
+        self.assertFalse(keyword_rule_matches("魔方", rule))
+        self.assertFalse(keyword_rule_matches("短剧", rule))
+        self.assertTrue(keyword_rule_matches("魔方 短剧", rule))
+
+    def test_not_any_excludes_when_any_negative_keyword_matches(self):
+        rule = parse_keyword_rules(
+            '"魔方" and not any("投放","消耗")'
+        )[0]
+        self.assertFalse(keyword_rule_matches("魔方 投放", rule))
+        self.assertFalse(keyword_rule_matches("魔方 消耗", rule))
+        self.assertTrue(keyword_rule_matches("魔方 剪辑", rule))
+        self.assertFalse(keyword_rule_matches("剪辑", rule))
+
+    def test_any_atom_and_complete_or_branch_match_independently(self):
+        rule = parse_keyword_rules('any("A","B") or "C"')[0]
+        self.assertTrue(keyword_rule_matches("A", rule))
+        self.assertTrue(keyword_rule_matches("B", rule))
+        self.assertTrue(keyword_rule_matches("C", rule))
+        self.assertFalse(keyword_rule_matches("D", rule))
+
+    def test_mixed_any_and_or_expression_keeps_existing_precedence(self):
+        rule = parse_keyword_rules(
+            '"A" and any("B","C") or "D" and any("E","F")'
+        )[0]
+        self.assertTrue(keyword_rule_matches("A B", rule))
+        self.assertFalse(keyword_rule_matches("A", rule))
+        self.assertTrue(keyword_rule_matches("D F", rule))
+        self.assertFalse(keyword_rule_matches("F", rule))
+
+    def test_single_item_any_matches_like_a_plain_keyword(self):
+        any_rule = parse_keyword_rules('any("Ａ B")')[0]
+        plain_rule = parse_keyword_rules('"Ａ B"')[0]
+        for text in ("ab", "Ａ B", "其他内容"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    keyword_rule_matches(text, any_rule),
+                    keyword_rule_matches(text, plain_rule),
+                )
+
     def test_every_or_branch_requires_a_positive_keyword(self):
         invalid_values = (
             'not "B"',

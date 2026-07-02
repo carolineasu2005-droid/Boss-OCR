@@ -192,6 +192,33 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(result.confirmed_match)
         self.assertEqual(len(result.observations), 1)
 
+    def test_any_rule_is_confirmed_as_one_complete_rule(self):
+        detector = self.make_detector(
+            ["魔方 短剧 剪辑", "九州 漫剧 制作"],
+            max_scans=1,
+        )
+        result = detector.detect(parse_keyword_rules(
+            'any("魔方","九州") and any("短剧","漫剧") '
+            'and not any("投放","消耗")'
+        ))
+        self.assertTrue(result.success)
+        self.assertTrue(result.confirmed_match)
+        self.assertEqual(len(result.observations), 2)
+
+    def test_any_rule_fails_confirmation_when_excluded_group_appears(self):
+        detector = self.make_detector(
+            ["魔方 短剧 剪辑", "九州 漫剧 投放"],
+            max_scans=1,
+        )
+        result = detector.detect(parse_keyword_rules(
+            'any("魔方","九州") and any("短剧","漫剧") '
+            'and not any("投放","消耗")'
+        ))
+        self.assertTrue(result.success)
+        self.assertFalse(result.confirmed_match)
+        self.assertIsNone(result.matched_keyword)
+        self.assertEqual(len(result.observations), 2)
+
 
 class RapidOCRAdapterTests(unittest.TestCase):
     def test_modern_result_object(self):

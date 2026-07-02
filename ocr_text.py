@@ -335,19 +335,25 @@ def exact_keyword_match(text: str, keywords: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _keyword_atom_matches(normalized_text: str, atom: KeywordAtom) -> bool:
+    """Return whether one keyword atom matches already-normalized text."""
+
+    if isinstance(atom, KeywordAnyGroup):
+        contains = any(
+            normalize_text(keyword) in normalized_text
+            for keyword in atom.keywords
+        )
+    else:
+        contains = normalize_text(atom.keyword) in normalized_text
+    return not contains if atom.negated else contains
+
+
 def keyword_rule_matches(text: str, rule: KeywordRule) -> bool:
     """Return whether one parsed rule matches normalized OCR text."""
 
     normalized_text = normalize_text(text)
     return any(
-        all(
-            (
-                normalize_text(term.keyword) not in normalized_text
-                if term.negated
-                else normalize_text(term.keyword) in normalized_text
-            )
-            for term in group
-        )
+        all(_keyword_atom_matches(normalized_text, atom) for atom in group)
         for group in rule.or_groups
     )
 
