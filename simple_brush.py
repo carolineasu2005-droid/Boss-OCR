@@ -197,6 +197,9 @@ no_forward_mode = False     # 只检测，不执行真实邮件转发
 
 # 转发关键点击区域（仅在当前运行期间有效）
 forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
+forward_click_calibration_requested = False
+forward_click_calibration_attempted = False
+forward_click_calibration_in_progress = False
 
 # 焦点恢复区域状态（仅在当前运行期间有效）
 focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
@@ -221,7 +224,11 @@ def on_press(key):
     if key == keyboard.Key.esc:
         if _programmatic_esc:
             return True  # 程序触发的 ESC，忽略
-        if ocr_calibration_in_progress or focus_restore_calibration_in_progress:
+        if (
+            ocr_calibration_in_progress
+            or focus_restore_calibration_in_progress
+            or forward_click_calibration_in_progress
+        ):
             return True  # 交给 Tk 校准窗口处理，只取消校准，不停止浏览
         stop_event = True
         logger.info('⚡ 收到 ESC，准备停止')
@@ -264,10 +271,12 @@ def get_user_input(
     """
     global forward_keywords, backup_email, forward_enabled, run_duration_seconds
     global focus_restore_calibration_requested
+    global forward_click_calibration_requested
 
     # ── 非交互模式（命令行传参或 --auto） ──
     if auto or keywords_str:
         focus_restore_calibration_requested = False
+        forward_click_calibration_requested = False
         run_duration_seconds = parse_duration_seconds(duration_str)
         if keywords_str:
             forward_keywords = parse_keyword_rules(keywords_str)
@@ -311,16 +320,19 @@ def get_user_input(
         backup_email = ""
 
     if forward_enabled:
-        calibrate_focus = input(
-            '\n是否校准转发结束后的焦点恢复点击区域？[y/N]\n> '
+        calibrate_forward = input(
+            '\n是否校准完整邮件转发点击区域（包含焦点恢复区域）？[y/N]\n> '
         ).strip().lower()
-        focus_restore_calibration_requested = calibrate_focus in ('y', 'yes')
-        if focus_restore_calibration_requested:
-            print('  将在第一位候选人详情页打开后进行焦点恢复区域校准')
+        calibrate_requested = calibrate_forward in ('y', 'yes')
+        focus_restore_calibration_requested = calibrate_requested
+        forward_click_calibration_requested = calibrate_requested
+        if calibrate_requested:
+            print('  将在第一位候选人详情页打开后进行完整转发点击区域校准')
         else:
-            print('  焦点恢复点击将使用默认区域 X:400-500, Y:350-400')
+            print('  完整转发点击将使用默认区域')
     else:
         focus_restore_calibration_requested = False
+        forward_click_calibration_requested = False
 
     while True:
         duration_raw = input('\n请输入本次运行时间（秒，留空或 0 表示持续运行）:\n> ')
@@ -613,8 +625,97 @@ def reset_focus_restore_calibration():
 def reset_forward_click_calibration():
     """Reset forwarding click regions to their per-run defaults."""
     global forward_click_regions
+    global forward_click_calibration_requested
+    global forward_click_calibration_attempted
+    global forward_click_calibration_in_progress
 
     forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
+    forward_click_calibration_requested = False
+    forward_click_calibration_attempted = False
+    forward_click_calibration_in_progress = False
+
+
+def close_forward_dialog_after_calibration():
+    """Close a possibly open forwarding dialog without stopping the run."""
+    global _programmatic_esc
+
+    _programmatic_esc = True
+    try:
+        pyautogui.press('esc')
+    finally:
+        _programmatic_esc = False
+
+
+def ensure_forward_click_regions_calibrated():
+    """Calibrate all forwarding click regions atomically once per run."""
+    global forward_click_regions
+    global forward_click_calibration_attempted
+    global forward_click_calibration_in_progress
+
+    if not forward_click_calibration_requested:
+        return forward_click_regions
+    if forward_click_calibration_attempted:
+        return forward_click_regions
+
+    forward_click_calibration_attempted = True
+    forward_click_calibration_in_progress = True
+    try:
+        forward_icon = select_screen_region(
+            min_size=12,
+            instruction='框选详情页右上角“转发牛人”图标内部安全区域 · Esc 使用全部默认区域',
+            subtitle='校准 1/5 · 程序将用该区域打开转发弹窗',
+        )
+        click_in_region(forward_icon)
+        if not human_delay(0.8, 1.2):
+            raise RuntimeError('打开转发弹窗的等待被中断')
+
+        email_tab = select_screen_region(
+            min_size=12,
+            instruction='框选弹窗左侧“邮件转发” Tab 内部安全区域 · Esc 使用全部默认区域',
+            subtitle='校准 2/5 · 程序将用该区域进入邮件转发界面',
+        )
+        click_in_region(email_tab)
+        if not human_delay(0.5, 0.8):
+            raise RuntimeError('切换邮件转发 Tab 的等待被中断')
+
+        input_box = select_screen_region(
+            min_size=12,
+            instruction='框选邮箱输入框内部安全点击区域 · Esc 使用全部默认区域',
+            subtitle='校准 3/5 · 只框选，不会输入内容',
+        )
+        recent_email = select_screen_region(
+            min_size=12,
+            instruction='框选“最近联系”中第一个邮箱标签内部安全区域 · Esc 使用全部默认区域',
+            subtitle='校准 4/5 · 只框选，不会触发转发',
+        )
+        forward_button = select_screen_region(
+            min_size=12,
+            instruction='框选右下角“转发”按钮内部安全区域 · Esc 使用全部默认区域',
+            subtitle='校准 5/5 · 只框选，程序绝不点击此按钮',
+        )
+
+        forward_click_regions = ForwardClickRegions(
+            forward_icon=forward_icon,
+            email_tab=email_tab,
+            input_box=input_box,
+            recent_email=recent_email,
+            forward_button=forward_button,
+        )
+        logger.info('✅ 完整转发点击区域校准完成')
+    except CalibrationCancelled:
+        forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
+        logger.warning('完整转发点击区域校准已取消，本次运行全部使用默认区域')
+    except Exception as exc:
+        forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
+        logger.exception(f'完整转发点击区域校准失败，本次运行全部使用默认区域: {exc}')
+    finally:
+        try:
+            close_forward_dialog_after_calibration()
+        except Exception as exc:
+            logger.warning(f'校准后关闭转发弹窗失败，继续本次运行: {exc}')
+        forward_click_calibration_in_progress = False
+
+    return forward_click_regions
 
 
 def ensure_focus_restore_region_calibrated():
@@ -972,6 +1073,8 @@ def run():
             # 仅普通交互模式可请求；详情页可见后再显示框选层。
             if focus_restore_calibration_requested:
                 ensure_focus_restore_region_calibrated()
+            if forward_click_calibration_requested:
+                ensure_forward_click_regions_calibrated()
 
             # 浏览本批次 100 位
             for i in range(BATCH_SIZE):

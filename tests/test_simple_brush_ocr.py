@@ -16,6 +16,9 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "backup_email",
                 "no_forward_mode",
                 "forward_click_regions",
+                "forward_click_calibration_requested",
+                "forward_click_calibration_attempted",
+                "forward_click_calibration_in_progress",
                 "focus_restore_region",
                 "focus_restore_calibration_requested",
                 "focus_restore_calibration_attempted",
@@ -29,6 +32,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "stop_event",
                 "paused",
                 "run_duration_seconds",
+                "_programmatic_esc",
             )
         }
         simple_brush.forward_enabled = True
@@ -41,6 +45,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.stop_event = False
         simple_brush.paused = False
         simple_brush.run_duration_seconds = 0
+        simple_brush._programmatic_esc = False
 
     def tearDown(self):
         for name, value in self.saved.items():
@@ -270,11 +275,137 @@ class SimpleBrushOCRTests(unittest.TestCase):
             recent_email=simple_brush.ScreenRegion(13, 14, 15, 16),
             forward_button=simple_brush.ScreenRegion(17, 18, 19, 20),
         )
+        simple_brush.forward_click_calibration_requested = True
+        simple_brush.forward_click_calibration_attempted = True
+        simple_brush.forward_click_calibration_in_progress = True
         simple_brush.reset_forward_click_calibration()
         self.assertEqual(
             simple_brush.forward_click_regions,
             simple_brush.DEFAULT_FORWARD_CLICK_REGIONS,
         )
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
+        self.assertFalse(simple_brush.forward_click_calibration_attempted)
+        self.assertFalse(simple_brush.forward_click_calibration_in_progress)
+
+    def test_forward_click_calibration_selects_in_order_and_publishes_atomically(self):
+        regions = [
+            simple_brush.ScreenRegion(index * 10, index * 20, 12, 12)
+            for index in range(1, 6)
+        ]
+        simple_brush.forward_click_calibration_requested = True
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=regions,
+            ) as select,
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "human_delay", return_value=True) as delay,
+            patch.object(
+                simple_brush,
+                "close_forward_dialog_after_calibration",
+            ) as close_dialog,
+        ):
+            result = simple_brush.ensure_forward_click_regions_calibrated()
+
+        self.assertEqual(
+            result,
+            simple_brush.ForwardClickRegions(
+                forward_icon=regions[0],
+                email_tab=regions[1],
+                input_box=regions[2],
+                recent_email=regions[3],
+                forward_button=regions[4],
+            ),
+        )
+        self.assertEqual(select.call_count, 5)
+        self.assertEqual(
+            [item.kwargs["subtitle"].split(" · ")[0] for item in select.call_args_list],
+            ["校准 1/5", "校准 2/5", "校准 3/5", "校准 4/5", "校准 5/5"],
+        )
+        self.assertEqual(click.call_args_list, [call(regions[0]), call(regions[1])])
+        self.assertNotIn(call(regions[4]), click.call_args_list)
+        self.assertEqual(delay.call_args_list, [call(0.8, 1.2), call(0.5, 0.8)])
+        close_dialog.assert_called_once_with()
+        self.assertTrue(simple_brush.forward_click_calibration_attempted)
+        self.assertFalse(simple_brush.forward_click_calibration_in_progress)
+
+    def test_cancelled_forward_click_calibration_falls_back_atomically_and_once(self):
+        first = simple_brush.ScreenRegion(10, 20, 12, 12)
+        simple_brush.forward_click_regions = simple_brush.ForwardClickRegions(
+            forward_icon=simple_brush.ScreenRegion(1, 2, 3, 4),
+            email_tab=simple_brush.ScreenRegion(5, 6, 7, 8),
+            input_box=simple_brush.ScreenRegion(9, 10, 11, 12),
+            recent_email=simple_brush.ScreenRegion(13, 14, 15, 16),
+            forward_button=simple_brush.ScreenRegion(17, 18, 19, 20),
+        )
+        simple_brush.forward_click_calibration_requested = True
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=[first, simple_brush.CalibrationCancelled],
+            ) as select,
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(simple_brush, "close_forward_dialog_after_calibration") as close,
+        ):
+            first_result = simple_brush.ensure_forward_click_regions_calibrated()
+            second_result = simple_brush.ensure_forward_click_regions_calibrated()
+
+        self.assertEqual(first_result, simple_brush.DEFAULT_FORWARD_CLICK_REGIONS)
+        self.assertEqual(second_result, simple_brush.DEFAULT_FORWARD_CLICK_REGIONS)
+        self.assertEqual(select.call_count, 2)
+        click.assert_called_once_with(first)
+        close.assert_called_once_with()
+        self.assertTrue(simple_brush.forward_click_calibration_attempted)
+        self.assertFalse(simple_brush.forward_click_calibration_in_progress)
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_failed_forward_click_calibration_falls_back_without_stopping(self):
+        simple_brush.forward_click_calibration_requested = True
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=RuntimeError("overlay failed"),
+            ),
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "close_forward_dialog_after_calibration") as close,
+            patch.object(simple_brush.logger, "exception") as log_exception,
+        ):
+            result = simple_brush.ensure_forward_click_regions_calibrated()
+
+        self.assertEqual(result, simple_brush.DEFAULT_FORWARD_CLICK_REGIONS)
+        click.assert_not_called()
+        close.assert_called_once_with()
+        log_exception.assert_called_once()
+        self.assertFalse(simple_brush.forward_click_calibration_in_progress)
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_forward_click_calibration_is_skipped_when_not_requested(self):
+        with (
+            patch.object(simple_brush, "select_screen_region") as select,
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "close_forward_dialog_after_calibration") as close,
+        ):
+            result = simple_brush.ensure_forward_click_regions_calibrated()
+        self.assertEqual(result, simple_brush.DEFAULT_FORWARD_CLICK_REGIONS)
+        select.assert_not_called()
+        click.assert_not_called()
+        close.assert_not_called()
+
+    def test_forward_click_calibration_escape_does_not_stop_browsing(self):
+        simple_brush.forward_click_calibration_in_progress = True
+        result = simple_brush.on_press(simple_brush.keyboard.Key.esc)
+        self.assertTrue(result)
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_calibration_dialog_close_uses_programmatic_escape(self):
+        with patch.object(simple_brush.pyautogui, "press") as press:
+            simple_brush.close_forward_dialog_after_calibration()
+        press.assert_called_once_with("esc")
+        self.assertFalse(simple_brush._programmatic_esc)
 
     def test_random_focus_restore_point_uses_half_open_region_bounds(self):
         region = simple_brush.ScreenRegion(left=400, top=350, width=101, height=51)
@@ -367,6 +498,9 @@ class SimpleBrushOCRTests(unittest.TestCase):
             recent_email=simple_brush.ScreenRegion(13, 14, 15, 16),
             forward_button=simple_brush.ScreenRegion(17, 18, 19, 20),
         )
+        simple_brush.forward_click_calibration_requested = True
+        simple_brush.forward_click_calibration_attempted = True
+        simple_brush.forward_click_calibration_in_progress = True
         simple_brush.focus_restore_region = simple_brush.ScreenRegion(1, 2, 3, 4)
         simple_brush.focus_restore_calibration_requested = True
         simple_brush.focus_restore_calibration_attempted = True
@@ -388,6 +522,9 @@ class SimpleBrushOCRTests(unittest.TestCase):
             simple_brush.forward_click_regions,
             simple_brush.DEFAULT_FORWARD_CLICK_REGIONS,
         )
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
+        self.assertFalse(simple_brush.forward_click_calibration_attempted)
+        self.assertFalse(simple_brush.forward_click_calibration_in_progress)
 
     def test_focus_restore_calibration_escape_does_not_stop_browsing(self):
         simple_brush.focus_restore_calibration_in_progress = True
@@ -539,6 +676,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertTrue(simple_brush.focus_restore_calibration_requested)
+        self.assertTrue(simple_brush.forward_click_calibration_requested)
 
     def test_interactive_mode_defaults_to_focus_restore_region_fallback(self):
         with patch(
@@ -547,12 +685,22 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
 
     def test_auto_mode_never_prompts_for_focus_restore_calibration(self):
         simple_brush.focus_restore_calibration_requested = True
+        simple_brush.forward_click_calibration_requested = True
         with patch("builtins.input") as user_input:
             simple_brush.get_user_input(keywords_str='"Python"', auto=True)
         user_input.assert_not_called()
+        self.assertFalse(simple_brush.focus_restore_calibration_requested)
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
+
+    def test_interactive_mode_without_keywords_does_not_offer_forward_calibration(self):
+        with patch("builtins.input", side_effect=["", ""]) as user_input:
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(user_input.call_count, 2)
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
 
     def test_run_calibrates_after_first_detail_opens_before_viewing(self):
@@ -560,14 +708,19 @@ class SimpleBrushOCRTests(unittest.TestCase):
 
         def configure_input(**_kwargs):
             simple_brush.focus_restore_calibration_requested = True
+            simple_brush.forward_click_calibration_requested = True
 
         def open_detail(_x, _y):
             events.append("detail")
             return True
 
         def calibrate():
-            events.append("calibrate")
+            events.append("focus_calibrate")
             return simple_brush.DEFAULT_FOCUS_RESTORE_REGION
+
+        def calibrate_forward():
+            events.append("forward_calibrate")
+            return simple_brush.DEFAULT_FORWARD_CLICK_REGIONS
 
         def view(_index):
             events.append("view")
@@ -593,16 +746,26 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "ensure_focus_restore_region_calibrated",
                 side_effect=calibrate,
             ) as ensure,
+            patch.object(
+                simple_brush,
+                "ensure_forward_click_regions_calibrated",
+                side_effect=calibrate_forward,
+            ) as ensure_forward,
             patch.object(simple_brush, "view_candidate", side_effect=view),
             patch.object(simple_brush, "refresh_page", return_value=False),
         ):
             self.assertEqual(simple_brush.run(), 0)
-        self.assertEqual(events, ["detail", "calibrate", "view"])
+        self.assertEqual(
+            events,
+            ["detail", "focus_calibrate", "forward_calibrate", "view"],
+        )
         ensure.assert_called_once_with()
+        ensure_forward.assert_called_once_with()
 
     def test_run_does_not_calibrate_when_first_detail_fails_to_open(self):
         def configure_input(**_kwargs):
             simple_brush.focus_restore_calibration_requested = True
+            simple_brush.forward_click_calibration_requested = True
 
         with (
             patch.object(simple_brush, "parse_args", return_value={
@@ -623,9 +786,14 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 simple_brush,
                 "ensure_focus_restore_region_calibrated",
             ) as ensure,
+            patch.object(
+                simple_brush,
+                "ensure_forward_click_regions_calibrated",
+            ) as ensure_forward,
         ):
             self.assertEqual(simple_brush.run(), 0)
         ensure.assert_not_called()
+        ensure_forward.assert_not_called()
 
     def test_zero_duration_does_not_create_timer(self):
         with patch.object(simple_brush.threading, "Timer") as timer_factory:
