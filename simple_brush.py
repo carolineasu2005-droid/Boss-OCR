@@ -892,13 +892,14 @@ def forward_one_candidate():
         logger.info(f'📧 ✓ 转发完成！(连续转发 {forward_consecutive}/{FORWARD_MAX_CONSEC})')
         return True
     finally:
-        # 只要进入转发处理函数，所有退出路径都统一恢复详情页焦点。
-        try:
-            focus_x, focus_y = random_point_in_region(focus_restore_region)
-            human_click(focus_x, focus_y, offset=0)
-            human_delay(0.3, 0.5)
-        except Exception as exc:
-            logger.error(f'❌ 转发流程焦点恢复点击失败: {exc}')
+        # 只要进入转发处理函数，所有退出路径都统一恢复详情页焦点两次。
+        for attempt in range(1, 3):
+            try:
+                focus_x, focus_y = random_point_in_region(focus_restore_region)
+                human_click(focus_x, focus_y, offset=0)
+                human_delay(0.3, 0.5)
+            except Exception as exc:
+                logger.error(f'❌ 转发流程第 {attempt} 次焦点恢复点击失败: {exc}')
 
 
 # ─── 刷简历核心 ─────────────────────────────────────
