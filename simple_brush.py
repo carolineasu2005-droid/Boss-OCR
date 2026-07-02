@@ -819,25 +819,25 @@ def forward_one_candidate():
 
         # ── 步骤 1：点击"转发牛人"图标 ──
         logger.info(f'  [1/5] 点击"转发牛人"图标 →')
-        human_click(FORWARD_ICON_X, FORWARD_ICON_Y)
+        click_in_region(forward_click_regions.forward_icon)
         if not human_delay(0.5, 1.5):
             return False
 
         # ── 步骤 2：点击"邮件转发" Tab ──
         logger.info(f'  [2/5] 点击"邮件转发"')
-        human_click(EMAIL_TAB_X, EMAIL_TAB_Y)
+        click_in_region(forward_click_regions.email_tab)
         if not human_delay(0.5, 1.0):
             return False
 
         # ── 步骤 3：尝试填入邮箱 ──
         logger.info(f'  [3/5] 填入邮箱')
         # 先点"最近联系"中的邮箱标签
-        human_click(RECENT_EMAIL_X, RECENT_EMAIL_Y)
+        click_in_region(forward_click_regions.recent_email)
         if not human_delay(0.3, 0.8):
             return False
 
         # 检测邮箱是否已填入
-        human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
+        click_in_region(forward_click_regions.input_box)
         time.sleep(0.1)
         if stop_event:
             return False
@@ -858,7 +858,7 @@ def forward_one_candidate():
             if backup_email:
                 # 手动输入备选邮箱
                 logger.info(f'  ⌨ 正在手动输入备选邮箱: {backup_email}')
-                human_click(INPUT_BOX_X, INPUT_BOX_Y, offset=3)
+                click_in_region(forward_click_regions.input_box)
                 time.sleep(0.1)
                 if stop_event:
                     return False
@@ -884,7 +884,7 @@ def forward_one_candidate():
         if stop_event:
             return False
         logger.info(f'  [4/5] 点击"转发"按钮')
-        human_click(FORWARD_BTN_X, FORWARD_BTN_Y)
+        click_in_region(forward_click_regions.forward_button)
         if not human_delay(1.0, 2.0):
             return False
 

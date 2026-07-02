@@ -111,6 +111,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
 
     def test_forward_restores_focus_after_success(self):
         with (
+            patch.object(simple_brush, "click_in_region") as region_click,
             patch.object(simple_brush, "human_click") as click,
             patch.object(
                 simple_brush,
@@ -123,11 +124,60 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
 
+        self.assertEqual(
+            region_click.call_args_list,
+            [
+                call(simple_brush.forward_click_regions.forward_icon),
+                call(simple_brush.forward_click_regions.email_tab),
+                call(simple_brush.forward_click_regions.recent_email),
+                call(simple_brush.forward_click_regions.input_box),
+                call(simple_brush.forward_click_regions.forward_button),
+            ],
+        )
+        self.assert_focus_restored_once(click, choose_point)
+
+    def test_forward_uses_calibrated_regions_and_reuses_input_box_region(self):
+        calibrated = simple_brush.ForwardClickRegions(
+            forward_icon=simple_brush.ScreenRegion(10, 20, 12, 12),
+            email_tab=simple_brush.ScreenRegion(30, 40, 12, 12),
+            input_box=simple_brush.ScreenRegion(50, 60, 20, 12),
+            recent_email=simple_brush.ScreenRegion(70, 80, 12, 12),
+            forward_button=simple_brush.ScreenRegion(90, 100, 20, 12),
+        )
+        simple_brush.forward_click_regions = calibrated
+        simple_brush.backup_email = "backup@example.com"
+        with (
+            patch.object(simple_brush, "click_in_region") as region_click,
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(500, 400),
+            ) as choose_point,
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(simple_brush, "get_clipboard_text", return_value=""),
+            patch.object(simple_brush, "type_text_human", return_value=True),
+            patch.object(simple_brush.time, "sleep"),
+        ):
+            self.assertTrue(simple_brush.forward_one_candidate())
+
+        self.assertEqual(
+            region_click.call_args_list,
+            [
+                call(calibrated.forward_icon),
+                call(calibrated.email_tab),
+                call(calibrated.recent_email),
+                call(calibrated.input_box),
+                call(calibrated.input_box),
+                call(calibrated.forward_button),
+            ],
+        )
         self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_at_consecutive_limit(self):
         simple_brush.forward_consecutive = simple_brush.FORWARD_MAX_CONSEC
         with (
+            patch.object(simple_brush, "click_in_region") as region_click,
             patch.object(simple_brush, "human_click") as click,
             patch.object(
                 simple_brush,
@@ -138,10 +188,12 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
 
+        region_click.assert_not_called()
         self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_without_backup_email(self):
         with (
+            patch.object(simple_brush, "click_in_region") as region_click,
             patch.object(simple_brush, "human_click") as click,
             patch.object(
                 simple_brush,
@@ -154,10 +206,20 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
 
+        self.assertEqual(
+            region_click.call_args_list,
+            [
+                call(simple_brush.forward_click_regions.forward_icon),
+                call(simple_brush.forward_click_regions.email_tab),
+                call(simple_brush.forward_click_regions.recent_email),
+                call(simple_brush.forward_click_regions.input_box),
+            ],
+        )
         self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_when_wait_is_interrupted(self):
         with (
+            patch.object(simple_brush, "click_in_region") as region_click,
             patch.object(simple_brush, "human_click") as click,
             patch.object(
                 simple_brush,
@@ -168,14 +230,19 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
 
+        region_click.assert_called_once_with(simple_brush.forward_click_regions.forward_icon)
         self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_when_forwarding_raises(self):
         with (
             patch.object(
                 simple_brush,
+                "click_in_region",
+                side_effect=RuntimeError("forward failed"),
+            ) as region_click,
+            patch.object(
+                simple_brush,
                 "human_click",
-                side_effect=[RuntimeError("forward failed"), None],
             ) as click,
             patch.object(
                 simple_brush,
@@ -187,6 +254,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "forward failed"):
                 simple_brush.forward_one_candidate()
 
+        region_click.assert_called_once_with(simple_brush.forward_click_regions.forward_icon)
         self.assert_focus_restored_once(click, choose_point)
 
     def test_forward_restores_focus_from_calibrated_runtime_region(self):
@@ -197,6 +265,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
             height=60,
         )
         with (
+            patch.object(simple_brush, "click_in_region") as region_click,
             patch.object(simple_brush, "human_click") as click,
             patch.object(
                 simple_brush,
@@ -209,6 +278,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
 
+        self.assertEqual(region_click.call_count, 5)
         choose_point.assert_called_once_with(simple_brush.focus_restore_region)
         focus_call = call(650, 330, offset=0)
         self.assertEqual(click.call_args_list.count(focus_call), 1)
