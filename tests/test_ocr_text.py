@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from ocr_text import (
+    KeywordAnyGroup,
     KeywordTerm,
     OCRItem,
     exact_keyword_match,
@@ -119,6 +120,93 @@ class OCRTextTests(unittest.TestCase):
         rule = parse_keyword_rules('"not for sale"')[0]
         self.assertEqual(rule.or_groups, ((KeywordTerm("not for sale"),),))
         self.assertTrue(keyword_rule_matches("This is not for sale", rule))
+
+    def test_any_groups_remain_atomic_inside_an_and_group(self):
+        rule = parse_keyword_rules(
+            'any("魔方","九州") and any("短剧", "漫剧")'
+        )[0]
+        self.assertEqual(
+            rule.or_groups,
+            ((
+                KeywordAnyGroup(("魔方", "九州")),
+                KeywordAnyGroup(("短剧", "漫剧")),
+            ),),
+        )
+        self.assertEqual(
+            rule.source,
+            'any("魔方", "九州") and any("短剧", "漫剧")',
+        )
+
+    def test_any_can_be_negated_when_the_branch_has_a_positive_atom(self):
+        rule = parse_keyword_rules(
+            '"魔方" and NOT any ( "投放" , "消耗" )'
+        )[0]
+        self.assertEqual(
+            rule.or_groups,
+            ((
+                KeywordTerm("魔方"),
+                KeywordAnyGroup(("投放", "消耗"), negated=True),
+            ),),
+        )
+        self.assertEqual(
+            rule.source,
+            '"魔方" and not any("投放", "消耗")',
+        )
+
+    def test_single_item_any_is_valid_and_remains_an_any_atom(self):
+        rule = parse_keyword_rules('ANY("A")')[0]
+        self.assertEqual(rule.or_groups, ((KeywordAnyGroup(("A",)),),))
+        self.assertEqual(rule.source, 'any("A")')
+
+    def test_any_allows_commas_and_connectors_inside_quoted_keywords(self):
+        rule = parse_keyword_rules('any("A,B","research and development")')[0]
+        self.assertEqual(
+            rule.or_groups,
+            ((KeywordAnyGroup(("A,B", "research and development")),),),
+        )
+
+    def test_pure_not_any_or_branches_are_rejected(self):
+        invalid_values = (
+            'not any("A","B")',
+            'not any("A","B") or "C"',
+            '"C" or not any("A","B")',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "正向关键词.*位置"):
+                    parse_keyword_rules(value)
+
+    def test_invalid_any_forms_report_a_position(self):
+        invalid_values = (
+            'any()',
+            'any( )',
+            'any("")',
+            'any("A",)',
+            'any(,"A")',
+            'any("A" "B")',
+            'any("A", not "B")',
+            'any("A" and "B")',
+            'any(any("A","B"))',
+            'any(A,B,C)',
+            "any('A','B')",
+            'any("A","B"',
+            'any "A"',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "位置"):
+                    parse_keyword_rules(value)
+
+    def test_any_rejects_semantically_duplicate_keywords(self):
+        invalid_values = (
+            'any("A","A")',
+            'any("Ａ","A")',
+            'any("A B","AB")',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "重复关键词.*位置"):
+                    parse_keyword_rules(value)
 
     def test_every_or_branch_requires_a_positive_keyword(self):
         invalid_values = (

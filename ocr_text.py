@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import re
 import unicodedata
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -39,11 +39,22 @@ class KeywordTerm:
 
 
 @dataclass(frozen=True)
+class KeywordAnyGroup:
+    """One atomic condition matching any of its quoted keywords."""
+
+    keywords: Tuple[str, ...]
+    negated: bool = False
+
+
+KeywordAtom = Union[KeywordTerm, KeywordAnyGroup]
+
+
+@dataclass(frozen=True)
 class KeywordRule:
     """One parsed keyword expression represented as OR-ed AND groups."""
 
     source: str
-    or_groups: Tuple[Tuple[KeywordTerm, ...], ...]
+    or_groups: Tuple[Tuple[KeywordAtom, ...], ...]
 
 
 class KeywordRuleSyntaxError(ValueError):
@@ -85,6 +96,78 @@ def parse_keyword_rules(value: str) -> List[KeywordRule]:
             end == length or text[end].isspace()
         )
 
+    def starts_any(position):
+        end = position + 3
+        return text[position:end].lower() == 'any' and (
+            end == length or text[end].isspace() or text[end] == '('
+        )
+
+    def parse_any_group(position, negated=False):
+        any_start = position
+        position = skip_whitespace(position + 3)
+        if position >= length or text[position] != '(':
+            raise _rule_error('any 后必须跟随括号参数', any_start)
+
+        position = skip_whitespace(position + 1)
+        if position < length and text[position] == ')':
+            raise _rule_error('any(...) 至少需要一个关键词', position)
+        if position >= length:
+            raise _rule_error('any(...) 缺少右括号', position)
+
+        keywords = []
+        normalized_keywords = set()
+        while True:
+            if text[position] != '"':
+                if starts_any(position):
+                    raise _rule_error('any(...) 不支持嵌套', position)
+                raise _rule_error(
+                    'any(...) 参数必须使用英文双引号包裹',
+                    position,
+                )
+
+            keyword_start = position
+            keyword, position = parse_quoted_keyword(position)
+            normalized_keyword = normalize_text(keyword)
+            if normalized_keyword in normalized_keywords:
+                raise _rule_error(
+                    f'any(...) 中存在重复关键词 "{keyword}"',
+                    keyword_start,
+                )
+            normalized_keywords.add(normalized_keyword)
+            keywords.append(keyword)
+
+            position = skip_whitespace(position)
+            if position >= length:
+                raise _rule_error('any(...) 缺少右括号', position)
+            if text[position] == ')':
+                return KeywordAnyGroup(tuple(keywords), negated), position + 1
+            if text[position] == ',':
+                comma_position = position
+                position = skip_whitespace(position + 1)
+                if position >= length or text[position] == ')':
+                    raise _rule_error(
+                        'any(...) 逗号后缺少英文双引号关键词',
+                        comma_position,
+                    )
+                continue
+            if text[position] == '"':
+                raise _rule_error(
+                    'any(...) 参数之间必须使用英文逗号分隔',
+                    position,
+                )
+            raise _rule_error(
+                'any(...) 内只支持英文双引号关键词，不支持组合表达式',
+                position,
+            )
+
+    def parse_atom(position, negated=False):
+        if position < length and text[position] == '"':
+            keyword, position = parse_quoted_keyword(position)
+            return KeywordTerm(keyword=keyword, negated=negated), position
+        if starts_any(position):
+            return parse_any_group(position, negated=negated)
+        raise _rule_error('关键词必须使用英文双引号包裹或 any(...)', position)
+
     def parse_term(position):
         if text[position:position + 3].lower() == 'not':
             not_start = position
@@ -95,28 +178,34 @@ def parse_keyword_rules(value: str) -> List[KeywordRule]:
             if position >= length:
                 raise _rule_error('not 后缺少带英文双引号的关键词', position)
             if starts_token(position, 'not'):
-                raise _rule_error('not 只能修饰一个带英文双引号的关键词', position)
-            if text[position] != '"':
+                raise _rule_error('not 只能修饰一个关键词或 any(...)', position)
+            if text[position] == '(':
                 raise _rule_error(
-                    'not 后必须是带英文双引号的关键词，不支持修饰组合表达式',
+                    'not 后必须是关键词或 any(...)，不支持修饰组合表达式',
                     position,
                 )
-            keyword, position = parse_quoted_keyword(position)
-            return KeywordTerm(keyword=keyword, negated=True), position
+            return parse_atom(position, negated=True)
 
-        keyword, position = parse_quoted_keyword(position)
-        return KeywordTerm(keyword=keyword), position
+        return parse_atom(position)
 
     def finish_group(group, position):
         if not any(not term.negated for term in group):
-            raise _rule_error('每个 OR 分支至少需要一个正向关键词', position)
+            raise _rule_error('每个 OR 分支至少需要一个正向关键词或 any 条件', position)
         return tuple(group)
 
     def build_rule(groups):
+        def atom_source(atom):
+            if isinstance(atom, KeywordAnyGroup):
+                value = 'any(' + ', '.join(
+                    f'"{keyword}"' for keyword in atom.keywords
+                ) + ')'
+            else:
+                value = f'"{atom.keyword}"'
+            return f'not {value}' if atom.negated else value
+
         source = ' or '.join(
             ' and '.join(
-                f'not "{term.keyword}"' if term.negated else f'"{term.keyword}"'
-                for term in group
+                atom_source(atom) for atom in group
             )
             for group in groups
         )
