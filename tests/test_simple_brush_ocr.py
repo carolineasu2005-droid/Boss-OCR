@@ -15,6 +15,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "forward_consecutive",
                 "backup_email",
                 "no_forward_mode",
+                "forward_click_regions",
                 "focus_restore_region",
                 "focus_restore_calibration_requested",
                 "focus_restore_calibration_attempted",
@@ -35,6 +36,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.forward_consecutive = 0
         simple_brush.backup_email = ""
         simple_brush.no_forward_mode = False
+        simple_brush.reset_forward_click_calibration()
         simple_brush.reset_focus_restore_calibration()
         simple_brush.stop_event = False
         simple_brush.paused = False
@@ -219,6 +221,61 @@ class SimpleBrushOCRTests(unittest.TestCase):
             simple_brush.ScreenRegion(left=400, top=350, width=101, height=51),
         )
 
+    def test_default_forward_click_regions_preserve_existing_click_ranges(self):
+        regions = simple_brush.DEFAULT_FORWARD_CLICK_REGIONS
+        self.assertEqual(
+            regions.forward_icon,
+            simple_brush.ScreenRegion(left=1665, top=255, width=11, height=11),
+        )
+        self.assertEqual(
+            regions.email_tab,
+            simple_brush.ScreenRegion(left=695, top=595, width=11, height=11),
+        )
+        self.assertEqual(
+            regions.input_box,
+            simple_brush.ScreenRegion(left=897, top=387, width=7, height=7),
+        )
+        self.assertEqual(
+            regions.recent_email,
+            simple_brush.ScreenRegion(left=995, top=435, width=11, height=11),
+        )
+        self.assertEqual(
+            regions.forward_button,
+            simple_brush.ScreenRegion(left=1205, top=735, width=11, height=11),
+        )
+
+    def test_region_around_rejects_negative_radius(self):
+        with self.assertRaisesRegex(ValueError, "半径不能为负数"):
+            simple_brush.region_around(10, 20, -1)
+
+    def test_click_in_region_chooses_once_and_disables_second_offset(self):
+        region = simple_brush.ScreenRegion(left=10, top=20, width=5, height=6)
+        with (
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(12, 24),
+            ) as choose_point,
+            patch.object(simple_brush, "human_click") as click,
+        ):
+            simple_brush.click_in_region(region)
+        choose_point.assert_called_once_with(region)
+        click.assert_called_once_with(12, 24, offset=0)
+
+    def test_reset_forward_click_calibration_restores_defaults(self):
+        simple_brush.forward_click_regions = simple_brush.ForwardClickRegions(
+            forward_icon=simple_brush.ScreenRegion(1, 2, 3, 4),
+            email_tab=simple_brush.ScreenRegion(5, 6, 7, 8),
+            input_box=simple_brush.ScreenRegion(9, 10, 11, 12),
+            recent_email=simple_brush.ScreenRegion(13, 14, 15, 16),
+            forward_button=simple_brush.ScreenRegion(17, 18, 19, 20),
+        )
+        simple_brush.reset_forward_click_calibration()
+        self.assertEqual(
+            simple_brush.forward_click_regions,
+            simple_brush.DEFAULT_FORWARD_CLICK_REGIONS,
+        )
+
     def test_random_focus_restore_point_uses_half_open_region_bounds(self):
         region = simple_brush.ScreenRegion(left=400, top=350, width=101, height=51)
         with patch.object(
@@ -303,6 +360,13 @@ class SimpleBrushOCRTests(unittest.TestCase):
         log_exception.assert_called_once()
 
     def test_run_resets_focus_restore_calibration_state(self):
+        simple_brush.forward_click_regions = simple_brush.ForwardClickRegions(
+            forward_icon=simple_brush.ScreenRegion(1, 2, 3, 4),
+            email_tab=simple_brush.ScreenRegion(5, 6, 7, 8),
+            input_box=simple_brush.ScreenRegion(9, 10, 11, 12),
+            recent_email=simple_brush.ScreenRegion(13, 14, 15, 16),
+            forward_button=simple_brush.ScreenRegion(17, 18, 19, 20),
+        )
         simple_brush.focus_restore_region = simple_brush.ScreenRegion(1, 2, 3, 4)
         simple_brush.focus_restore_calibration_requested = True
         simple_brush.focus_restore_calibration_attempted = True
@@ -320,6 +384,10 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
         self.assertFalse(simple_brush.focus_restore_calibration_attempted)
         self.assertFalse(simple_brush.focus_restore_calibration_in_progress)
+        self.assertEqual(
+            simple_brush.forward_click_regions,
+            simple_brush.DEFAULT_FORWARD_CLICK_REGIONS,
+        )
 
     def test_focus_restore_calibration_escape_does_not_stop_browsing(self):
         simple_brush.focus_restore_calibration_in_progress = True

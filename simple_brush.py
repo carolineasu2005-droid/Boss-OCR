@@ -21,6 +21,7 @@ import time
 import random
 import logging
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 import win32gui
 import win32con
@@ -103,6 +104,29 @@ SCROLL_MAX_STEPS = 40
 SCROLL_MAX_TIMES = 3
 
 # ─── 转发功能配置 ────────────────────────────────────
+@dataclass(frozen=True)
+class ForwardClickRegions:
+    """Runtime click regions for the mail-forwarding workflow."""
+
+    forward_icon: ScreenRegion
+    email_tab: ScreenRegion
+    input_box: ScreenRegion
+    recent_email: ScreenRegion
+    forward_button: ScreenRegion
+
+
+def region_around(x, y, radius):
+    """Return the inclusive +/- radius around a point as a ScreenRegion."""
+    if radius < 0:
+        raise ValueError('点击区域半径不能为负数')
+    return ScreenRegion(
+        left=x - radius,
+        top=y - radius,
+        width=radius * 2 + 1,
+        height=radius * 2 + 1,
+    )
+
+
 # 坐标由用户手动从 1920×1080 截图读出（2026-06-30 校准）
 # 转发牛人图标（候选人详情页右上角最右边的第3个图标）
 FORWARD_ICON_X   = 1670
@@ -136,6 +160,14 @@ FORWARD_MIN_DELAY   = 0.5   # 步骤间最短延迟（秒）
 FORWARD_MAX_DELAY   = 1.5   # 步骤间最长延迟（秒）
 FORWARD_MAX_CONSEC  = 5     # 连续转发上限（超出跳过）
 
+DEFAULT_FORWARD_CLICK_REGIONS = ForwardClickRegions(
+    forward_icon=region_around(FORWARD_ICON_X, FORWARD_ICON_Y, 5),
+    email_tab=region_around(EMAIL_TAB_X, EMAIL_TAB_Y, 5),
+    input_box=region_around(INPUT_BOX_X, INPUT_BOX_Y, 3),
+    recent_email=region_around(RECENT_EMAIL_X, RECENT_EMAIL_Y, 5),
+    forward_button=region_around(FORWARD_BTN_X, FORWARD_BTN_Y, 5),
+)
+
 # 日志
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
@@ -162,6 +194,9 @@ backup_email = ""           # 备选邮箱
 forward_enabled = False     # 是否启用转发
 forward_consecutive = 0     # 连续转发计数
 no_forward_mode = False     # 只检测，不执行真实邮件转发
+
+# 转发关键点击区域（仅在当前运行期间有效）
+forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
 
 # 焦点恢复区域状态（仅在当前运行期间有效）
 focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
@@ -425,6 +460,12 @@ def random_point_in_region(region):
     )
 
 
+def click_in_region(region):
+    """Click one random point inside a region without adding a second offset."""
+    x, y = random_point_in_region(region)
+    human_click(x, y, offset=0)
+
+
 def get_clipboard_text():
     """读取剪贴板文本（CF_UNICODETEXT）。失败返回空字符串。"""
     try:
@@ -567,6 +608,13 @@ def reset_focus_restore_calibration():
     focus_restore_calibration_requested = False
     focus_restore_calibration_attempted = False
     focus_restore_calibration_in_progress = False
+
+
+def reset_forward_click_calibration():
+    """Reset forwarding click regions to their per-run defaults."""
+    global forward_click_regions
+
+    forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
 
 
 def ensure_focus_restore_region_calibrated():
@@ -863,6 +911,7 @@ def run():
     global stop_event, forward_consecutive, no_forward_mode
     stop_event = False
     reset_focus_restore_calibration()
+    reset_forward_click_calibration()
 
     # ── 交互/参数输入 ──
     try:
