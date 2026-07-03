@@ -10,6 +10,13 @@ def midpoint(low, high):
 
 
 class HumanMouseMotionTests(unittest.TestCase):
+    def setUp(self):
+        self.saved_simple_mouse_enabled = simple_brush.simple_mouse_enabled
+        simple_brush.simple_mouse_enabled = False
+
+    def tearDown(self):
+        simple_brush.simple_mouse_enabled = self.saved_simple_mouse_enabled
+
     def move_patches(self, *, start=(0, 0), uniform=midpoint):
         return (
             patch.object(simple_brush.pyautogui, "position", return_value=start),
@@ -167,6 +174,100 @@ class HumanMouseMotionTests(unittest.TestCase):
         position.assert_not_called()
         sleep.assert_not_called()
         choice.assert_not_called()
+
+    def test_default_mode_reads_simple_mouse_runtime_state(self):
+        simple_brush.simple_mouse_enabled = True
+        with (
+            patch.object(simple_brush.pyautogui, "position") as position,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.time, "sleep") as sleep,
+            patch.object(simple_brush.random, "uniform", return_value=0.20),
+            patch.object(simple_brush.random, "choice") as choice,
+        ):
+            simple_brush.human_move_to(80, 90)
+
+        move.assert_called_once_with(80, 90, duration=0.20)
+        position.assert_not_called()
+        sleep.assert_not_called()
+        choice.assert_not_called()
+
+    def test_human_click_reuses_move_target_for_press_and_release(self):
+        with (
+            patch.object(simple_brush.random, "randint", side_effect=[3, -2]),
+            patch.object(simple_brush.random, "uniform", return_value=0.05),
+            patch.object(simple_brush, "human_move_to") as move,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.time, "sleep") as sleep,
+        ):
+            simple_brush.human_click(100, 200, offset=5)
+
+        move.assert_called_once_with(103, 198)
+        mouse_down.assert_called_once_with(103, 198)
+        mouse_up.assert_called_once_with(103, 198)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_human_click_with_zero_offset_keeps_exact_target(self):
+        with (
+            patch.object(simple_brush.random, "randint", return_value=0) as randint,
+            patch.object(simple_brush.random, "uniform", return_value=0.05),
+            patch.object(simple_brush, "human_move_to") as move,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.time, "sleep"),
+        ):
+            simple_brush.human_click(12, 24, offset=0)
+
+        self.assertEqual(randint.call_args_list, [call(0, 0), call(0, 0)])
+        move.assert_called_once_with(12, 24)
+        mouse_down.assert_called_once_with(12, 24)
+        mouse_up.assert_called_once_with(12, 24)
+
+    def test_human_click_does_not_press_when_movement_fails(self):
+        with (
+            patch.object(simple_brush.random, "randint", return_value=0),
+            patch.object(
+                simple_brush,
+                "human_move_to",
+                side_effect=RuntimeError("move failed"),
+            ),
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "move failed"):
+                simple_brush.human_click(12, 24, offset=0)
+
+        mouse_down.assert_not_called()
+        mouse_up.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_simple_mouse_argument_is_parsed_and_defaults_off(self):
+        with patch.object(simple_brush.sys, "argv", ["simple_brush.py"]):
+            default_args = simple_brush.parse_args()
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--simple-mouse", "--no-forward"],
+        ):
+            simple_args = simple_brush.parse_args()
+
+        self.assertFalse(default_args["simple_mouse"])
+        self.assertTrue(simple_args["simple_mouse"])
+        self.assertTrue(simple_args["no_forward"])
+
+    def test_run_resets_simple_mouse_state_before_input_failure(self):
+        simple_brush.simple_mouse_enabled = True
+        with (
+            patch.object(simple_brush, "parse_args", side_effect=ValueError("bad args")),
+            patch.object(simple_brush, "reset_focus_restore_calibration"),
+            patch.object(simple_brush, "reset_forward_click_calibration"),
+            patch.object(simple_brush, "reset_batch_filter_calibration"),
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 2)
+        self.assertFalse(simple_brush.simple_mouse_enabled)
 
 
 if __name__ == "__main__":

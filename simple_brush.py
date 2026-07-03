@@ -50,6 +50,7 @@ def parse_args():
         'duration_seconds': '',
         'no_forward': False,
         'no_batch_filter': False,
+        'simple_mouse': False,
         'auto': False,
     }
     i = 1
@@ -70,6 +71,9 @@ def parse_args():
             i += 1
         elif sys.argv[i] == '--no-batch-filter':
             args['no_batch_filter'] = True
+            i += 1
+        elif sys.argv[i] == '--simple-mouse':
+            args['simple_mouse'] = True
             i += 1
         elif sys.argv[i] == '--auto':
             args['auto'] = True  # 跳过所有交互
@@ -225,6 +229,7 @@ logger.addHandler(console)
 stop_event = False
 paused = False
 run_duration_seconds = 0
+simple_mouse_enabled = False
 
 # 转发状态（全局）
 forward_keywords = []       # 启动时解析完成的关键词规则列表
@@ -514,6 +519,8 @@ def human_move_to(x, y, *, simple=None):
     target_x = int(round(x))
     target_y = int(round(y))
 
+    if simple is None:
+        simple = simple_mouse_enabled
     if simple:
         pyautogui.moveTo(
             target_x,
@@ -629,7 +636,7 @@ def human_click(x, y, offset=FORWARD_CLICK_OFFSET):
     """
     tx = x + random.randint(-offset, offset)
     ty = y + random.randint(-offset, offset)
-    pyautogui.moveTo(tx, ty, duration=random.uniform(0.15, 0.35))
+    human_move_to(tx, ty)
     time.sleep(random.uniform(0.03, 0.08))
     pyautogui.mouseDown(tx, ty)
     time.sleep(random.uniform(0.05, 0.15))
@@ -1336,8 +1343,9 @@ def refresh_page():
 # ─── 主循环 ─────────────────────────────────────────
 
 def run():
-    global stop_event, forward_consecutive, no_forward_mode
+    global stop_event, forward_consecutive, no_forward_mode, simple_mouse_enabled
     stop_event = False
+    simple_mouse_enabled = False
     reset_focus_restore_calibration()
     reset_forward_click_calibration()
     reset_batch_filter_calibration()
@@ -1346,6 +1354,7 @@ def run():
     try:
         cli_args = parse_args()
         no_forward_mode = cli_args['no_forward']
+        simple_mouse_enabled = bool(cli_args.get('simple_mouse', False))
         get_user_input(
             keywords_str=cli_args['keywords'],
             email_str=cli_args['email'],
