@@ -269,6 +269,109 @@ class HumanMouseMotionTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertFalse(simple_brush.simple_mouse_enabled)
 
+    def test_region_click_routes_one_exact_point_through_human_click(self):
+        region = simple_brush.ScreenRegion(left=10, top=20, width=30, height=40)
+        with (
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(22, 35),
+            ) as choose_point,
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush.pyautogui, "click") as direct_click,
+        ):
+            simple_brush.click_in_region(region)
+
+        choose_point.assert_called_once_with(region)
+        click.assert_called_once_with(22, 35, offset=0)
+        direct_click.assert_not_called()
+
+    def test_batch_filter_region_path_reaches_human_click_in_order(self):
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 10, 10, 10),
+            open_filter=simple_brush.ScreenRegion(20, 20, 10, 10),
+            unseen_filter=simple_brush.ScreenRegion(30, 30, 10, 10),
+            confirm_filter=simple_brush.ScreenRegion(40, 40, 10, 10),
+        )
+        selected_points = [(21, 21), (31, 31), (41, 41), (11, 11)]
+        with (
+            patch.object(simple_brush, "stop_event", False),
+            patch.object(simple_brush, "batch_filter_enabled", True),
+            patch.object(simple_brush, "batch_filter_regions", regions),
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                side_effect=selected_points,
+            ) as choose_point,
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "click") as direct_click,
+        ):
+            result = simple_brush.apply_batch_filter_and_open_first_candidate()
+
+        self.assertTrue(result)
+        self.assertEqual(
+            choose_point.call_args_list,
+            [
+                call(regions.open_filter),
+                call(regions.unseen_filter),
+                call(regions.confirm_filter),
+                call(regions.first_candidate),
+            ],
+        )
+        self.assertEqual(
+            click.call_args_list,
+            [
+                call(21, 21, offset=0),
+                call(31, 31, offset=0),
+                call(41, 41, offset=0),
+                call(11, 11, offset=0),
+            ],
+        )
+        direct_click.assert_not_called()
+
+    def test_legacy_first_candidate_keeps_direct_click_boundary(self):
+        with (
+            patch.object(simple_brush, "stop_event", False),
+            patch.object(simple_brush.pyautogui, "click") as direct_click,
+            patch.object(simple_brush, "human_click") as human_click,
+            patch.object(simple_brush, "human_move_to") as human_move,
+            patch.object(simple_brush, "safe_wait", return_value=True) as wait,
+        ):
+            result = simple_brush.click_first_candidate(100, 200)
+
+        self.assertTrue(result)
+        direct_click.assert_called_once_with(100, 200, duration=0)
+        human_click.assert_not_called()
+        human_move.assert_not_called()
+        wait.assert_called_once_with(simple_brush.CLICK_WAIT_SECONDS)
+
+    def test_simple_mouse_is_compatible_with_existing_cli_flags(self):
+        argv = [
+            "simple_brush.py",
+            "--keywords",
+            '"Python"',
+            "--email",
+            "backup@example.com",
+            "--duration-seconds",
+            "60",
+            "--no-forward",
+            "--no-batch-filter",
+            "--simple-mouse",
+            "--auto",
+        ]
+        with patch.object(simple_brush.sys, "argv", argv):
+            args = simple_brush.parse_args()
+
+        self.assertEqual(args["keywords"], '"Python"')
+        self.assertEqual(args["email"], "backup@example.com")
+        self.assertEqual(args["duration_seconds"], "60")
+        self.assertTrue(args["no_forward"])
+        self.assertTrue(args["no_batch_filter"])
+        self.assertTrue(args["simple_mouse"])
+        self.assertTrue(args["auto"])
+
 
 if __name__ == "__main__":
     unittest.main()
