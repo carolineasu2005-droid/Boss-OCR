@@ -21,12 +21,17 @@ import time
 import random
 import math
 import logging
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 IS_WINDOWS = sys.platform == 'win32'
 IS_MACOS = sys.platform == 'darwin'
+MACOS_CHROME_EXECUTABLE = Path(
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+)
+CHROME_SAFE_TARGET = 'about:blank'
 
 if IS_WINDOWS:
     import win32clipboard
@@ -529,13 +534,10 @@ def prepare_browser(platform_name=None):
         )
 
     if current_platform == 'darwin':
-        return BrowserPrepareResult(
-            ready=False,
-            platform='macos',
-            browser='chrome',
-            message='macOS Chrome 准备功能尚未实现',
-            error_code='MACOS_BROWSER_NOT_IMPLEMENTED',
-        )
+        resolved = resolve_chrome_executable()
+        if resolved.error_code:
+            return resolved
+        return launch_chrome_safe_target(Path(resolved.executable_path))
 
     return BrowserPrepareResult(
         ready=False,
@@ -543,6 +545,64 @@ def prepare_browser(platform_name=None):
         browser='',
         message=f'不支持的运行平台: {current_platform}',
         error_code='UNSUPPORTED_PLATFORM',
+    )
+
+
+def resolve_chrome_executable(chrome_path=MACOS_CHROME_EXECUTABLE):
+    """Resolve the fixed macOS Chrome executable without launching it."""
+    path = Path(chrome_path)
+    result_fields = {
+        'ready': False,
+        'platform': 'macos',
+        'browser': 'chrome',
+        'executable_path': str(path),
+    }
+
+    if not path.exists():
+        return BrowserPrepareResult(
+            **result_fields,
+            message=f'未找到 macOS Chrome: {path}',
+            error_code='CHROME_NOT_FOUND',
+        )
+    if not path.is_file():
+        return BrowserPrepareResult(
+            **result_fields,
+            message=f'macOS Chrome 路径不是文件: {path}',
+            error_code='CHROME_NOT_EXECUTABLE',
+        )
+    if not os.access(path, os.X_OK):
+        return BrowserPrepareResult(
+            **result_fields,
+            message=f'macOS Chrome 文件不可执行: {path}',
+            error_code='CHROME_NOT_EXECUTABLE',
+        )
+
+    return BrowserPrepareResult(**result_fields)
+
+
+def launch_chrome_safe_target(chrome_path):
+    """Launch only about:blank; a successful process start is not browser readiness."""
+    path = Path(chrome_path)
+    try:
+        subprocess.Popen([str(path), CHROME_SAFE_TARGET])
+    except Exception as exc:
+        return BrowserPrepareResult(
+            ready=False,
+            platform='macos',
+            browser='chrome',
+            executable_path=str(path),
+            message=f'macOS Chrome 启动失败: {exc}',
+            error_code='CHROME_LAUNCH_FAILED',
+        )
+
+    return BrowserPrepareResult(
+        ready=False,
+        platform='macos',
+        browser='chrome',
+        launched=True,
+        executable_path=str(path),
+        message='macOS Chrome 已启动 about:blank，但窗口尚未验证为可操作',
+        error_code='MACOS_BROWSER_STARTED_NOT_READY',
     )
 
 

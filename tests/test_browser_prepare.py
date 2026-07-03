@@ -5,6 +5,12 @@ import simple_brush
 
 
 class BrowserPrepareTests(unittest.TestCase):
+    def test_macos_default_chrome_path_is_exact(self):
+        self.assertEqual(
+            str(simple_brush.MACOS_CHROME_EXECUTABLE),
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        )
+
     def test_windows_success_reuses_edge_foreground(self):
         with patch.object(
             simple_brush, "bring_edge_foreground", return_value=True
@@ -36,18 +42,141 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertEqual(result.error_code, "EDGE_PREPARE_FAILED")
         self.assertTrue(result.message)
 
-    def test_macos_is_fail_closed_without_calling_windows_path(self):
-        with patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
+    def test_macos_missing_chrome_is_fail_closed(self):
+        missing = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+            message="missing",
+            error_code="CHROME_NOT_FOUND",
+        )
+        with (
+            patch.object(simple_brush, "bring_edge_foreground") as bring_edge,
+            patch.object(
+                simple_brush, "resolve_chrome_executable", return_value=missing
+            ) as resolve,
+            patch.object(simple_brush, "launch_chrome_safe_target") as launch,
+        ):
             result = simple_brush.prepare_browser("darwin")
 
         bring_edge.assert_not_called()
+        resolve.assert_called_once_with()
+        launch.assert_not_called()
         self.assertFalse(result.ready)
         self.assertEqual(result.platform, "macos")
         self.assertEqual(result.browser, "chrome")
         self.assertFalse(result.launched)
-        self.assertEqual(result.executable_path, "")
-        self.assertEqual(result.error_code, "MACOS_BROWSER_NOT_IMPLEMENTED")
+        self.assertEqual(result.error_code, "CHROME_NOT_FOUND")
         self.assertTrue(result.message)
+
+    def test_resolve_missing_path_does_not_launch(self):
+        path = simple_brush.Path("/missing/Google Chrome")
+        with (
+            patch.object(simple_brush.Path, "exists", return_value=False),
+            patch.object(simple_brush.subprocess, "Popen") as popen,
+        ):
+            result = simple_brush.resolve_chrome_executable(path)
+
+        popen.assert_not_called()
+        self.assertFalse(result.ready)
+        self.assertEqual(result.error_code, "CHROME_NOT_FOUND")
+
+    def test_resolve_directory_is_fail_closed(self):
+        path = simple_brush.Path("/Applications/Fake Chrome")
+        with (
+            patch.object(simple_brush.Path, "exists", return_value=True),
+            patch.object(simple_brush.Path, "is_file", return_value=False),
+            patch.object(simple_brush.os, "access") as access,
+            patch.object(simple_brush.subprocess, "Popen") as popen,
+        ):
+            result = simple_brush.resolve_chrome_executable(path)
+
+        access.assert_not_called()
+        popen.assert_not_called()
+        self.assertFalse(result.ready)
+        self.assertEqual(result.error_code, "CHROME_NOT_EXECUTABLE")
+
+    def test_resolve_non_executable_file_is_fail_closed(self):
+        path = simple_brush.Path("/Applications/Fake Chrome")
+        with (
+            patch.object(simple_brush.Path, "exists", return_value=True),
+            patch.object(simple_brush.Path, "is_file", return_value=True),
+            patch.object(simple_brush.os, "access", return_value=False) as access,
+            patch.object(simple_brush.subprocess, "Popen") as popen,
+        ):
+            result = simple_brush.resolve_chrome_executable(path)
+
+        access.assert_called_once_with(path, simple_brush.os.X_OK)
+        popen.assert_not_called()
+        self.assertFalse(result.ready)
+        self.assertEqual(result.error_code, "CHROME_NOT_EXECUTABLE")
+
+    def test_launch_uses_argument_list_with_only_about_blank(self):
+        path = simple_brush.Path(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        )
+        with patch.object(simple_brush.subprocess, "Popen") as popen:
+            result = simple_brush.launch_chrome_safe_target(path)
+
+        popen.assert_called_once_with([str(path), "about:blank"])
+        args, kwargs = popen.call_args
+        self.assertEqual(kwargs, {})
+        command = " ".join(args[0]).lower()
+        self.assertNotIn("boss", command)
+        self.assertNotIn("zhipin", command)
+        self.assertFalse(result.ready)
+        self.assertTrue(result.launched)
+        self.assertEqual(result.browser, "chrome")
+        self.assertEqual(result.error_code, "MACOS_BROWSER_STARTED_NOT_READY")
+
+    def test_launch_exception_is_fail_closed(self):
+        path = simple_brush.Path("/Applications/Fake Chrome")
+        with patch.object(
+            simple_brush.subprocess,
+            "Popen",
+            side_effect=OSError("launch denied"),
+        ) as popen:
+            result = simple_brush.launch_chrome_safe_target(path)
+
+        popen.assert_called_once_with([str(path), "about:blank"])
+        self.assertFalse(result.ready)
+        self.assertFalse(result.launched)
+        self.assertEqual(result.error_code, "CHROME_LAUNCH_FAILED")
+        self.assertIn("launch denied", result.message)
+
+    def test_macos_successful_launch_is_started_but_not_ready(self):
+        resolved = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+        )
+        launched = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            launched=True,
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+            message="started but not ready",
+            error_code="MACOS_BROWSER_STARTED_NOT_READY",
+        )
+        with (
+            patch.object(
+                simple_brush, "resolve_chrome_executable", return_value=resolved
+            ) as resolve,
+            patch.object(
+                simple_brush, "launch_chrome_safe_target", return_value=launched
+            ) as launch,
+        ):
+            result = simple_brush.prepare_browser("darwin")
+
+        resolve.assert_called_once_with()
+        launch.assert_called_once_with(simple_brush.MACOS_CHROME_EXECUTABLE)
+        self.assertFalse(result.ready)
+        self.assertTrue(result.launched)
+        self.assertEqual(result.browser, "chrome")
+        self.assertEqual(result.error_code, "MACOS_BROWSER_STARTED_NOT_READY")
 
     def test_unknown_platform_is_fail_closed(self):
         with patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
@@ -72,6 +201,21 @@ class BrowserPrepareTests(unittest.TestCase):
         bring_edge.assert_called_once_with()
         self.assertTrue(result.ready)
         self.assertEqual(result.platform, "windows")
+
+    def test_windows_does_not_call_chrome_resolution_or_popen(self):
+        with (
+            patch.object(
+                simple_brush, "bring_edge_foreground", return_value=True
+            ) as bring_edge,
+            patch.object(simple_brush, "resolve_chrome_executable") as resolve,
+            patch.object(simple_brush.subprocess, "Popen") as popen,
+        ):
+            result = simple_brush.prepare_browser("win32")
+
+        bring_edge.assert_called_once_with()
+        resolve.assert_not_called()
+        popen.assert_not_called()
+        self.assertTrue(result.ready)
 
     def test_windows_ready_preserves_run_preparation_order(self):
         events = []
@@ -144,8 +288,10 @@ class BrowserPrepareTests(unittest.TestCase):
             ready=False,
             platform="macos",
             browser="chrome",
-            message="not implemented",
-            error_code="MACOS_BROWSER_NOT_IMPLEMENTED",
+            launched=True,
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+            message="started but not ready",
+            error_code="MACOS_BROWSER_STARTED_NOT_READY",
         )
         with (
             patch.object(
