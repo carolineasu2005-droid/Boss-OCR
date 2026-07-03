@@ -176,13 +176,160 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertFalse(result.ready)
         self.assertTrue(result.launched)
         self.assertEqual(result.browser, "chrome")
+        self.assertEqual(result.error_code, "MACOS_PERMISSIONS_NOT_READY")
+        self.assertIn("accessibility=unknown", result.message)
+
+    def test_permission_diagnostics_default_to_unknown(self):
+        status = simple_brush.check_macos_permissions()
+
+        self.assertEqual(status.accessibility, "unknown")
+        self.assertEqual(status.screen_recording, "unknown")
+        self.assertEqual(status.keyboard_listener, "unknown")
+        self.assertFalse(status.ready)
+        self.assertIn("Terminal / iTerm / VS Code / Python", status.message)
+        self.assertIn("系统设置 → 隐私与安全性 → 辅助功能", status.message)
+        self.assertIn("系统设置 → 隐私与安全性 → 屏幕录制", status.message)
+        self.assertIn("输入监控或辅助功能", status.message)
+
+    def test_each_failed_permission_is_fail_closed(self):
+        checks = {
+            "accessibility": "check_macos_accessibility_capability",
+            "screen_recording": "check_macos_screen_recording_capability",
+            "keyboard_listener": "check_macos_keyboard_listener_capability",
+        }
+        for field, function_name in checks.items():
+            with (
+                self.subTest(field=field),
+                patch.object(
+                    simple_brush,
+                    "check_macos_accessibility_capability",
+                    return_value="ok",
+                ),
+                patch.object(
+                    simple_brush,
+                    "check_macos_screen_recording_capability",
+                    return_value="ok",
+                ),
+                patch.object(
+                    simple_brush,
+                    "check_macos_keyboard_listener_capability",
+                    return_value="ok",
+                ),
+                patch.object(simple_brush, function_name, return_value="failed"),
+            ):
+                status = simple_brush.check_macos_permissions()
+
+            self.assertFalse(status.ready)
+            self.assertEqual(getattr(status, field), "failed")
+
+    def test_permission_check_exception_after_launch_is_fail_closed(self):
+        resolved = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+        )
+        launched = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            launched=True,
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+        )
+        with (
+            patch.object(
+                simple_brush, "resolve_chrome_executable", return_value=resolved
+            ),
+            patch.object(
+                simple_brush, "launch_chrome_safe_target", return_value=launched
+            ),
+            patch.object(
+                simple_brush,
+                "check_macos_permissions",
+                side_effect=RuntimeError("diagnostic failed"),
+            ),
+        ):
+            result = simple_brush.prepare_browser("darwin")
+
+        self.assertFalse(result.ready)
+        self.assertTrue(result.launched)
+        self.assertEqual(result.error_code, "MACOS_PERMISSION_CHECK_FAILED")
+        self.assertIn("diagnostic failed", result.message)
+        self.assertIn("完全退出并重启宿主进程", result.message)
+
+    def test_all_ok_permissions_still_do_not_make_browser_ready(self):
+        resolved = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+        )
+        launched = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            launched=True,
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+        )
+        permissions = simple_brush.MacOSPermissionStatus(
+            accessibility="ok",
+            screen_recording="ok",
+            keyboard_listener="ok",
+            ready=True,
+            message="permissions ok.",
+        )
+        with (
+            patch.object(
+                simple_brush, "resolve_chrome_executable", return_value=resolved
+            ),
+            patch.object(
+                simple_brush, "launch_chrome_safe_target", return_value=launched
+            ),
+            patch.object(
+                simple_brush, "check_macos_permissions", return_value=permissions
+            ),
+        ):
+            result = simple_brush.prepare_browser("darwin")
+
+        self.assertFalse(result.ready)
+        self.assertTrue(result.launched)
         self.assertEqual(result.error_code, "MACOS_BROWSER_STARTED_NOT_READY")
+        self.assertIn("窗口和页面尚未验证", result.message)
+
+    def test_permission_diagnostics_have_no_gui_capture_or_ocr_side_effects(self):
+        with (
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush, "save_region_preview") as save_preview,
+            patch.object(simple_brush, "MSSScreenCapture") as screen_capture,
+            patch.object(simple_brush, "OCRKeywordDetector") as detector,
+            patch.object(simple_brush.listener, "start") as listener_start,
+        ):
+            status = simple_brush.check_macos_permissions()
+
+        self.assertFalse(status.ready)
+        click.assert_not_called()
+        move.assert_not_called()
+        press.assert_not_called()
+        hotkey.assert_not_called()
+        scroll.assert_not_called()
+        save_preview.assert_not_called()
+        screen_capture.assert_not_called()
+        detector.assert_not_called()
+        listener_start.assert_not_called()
 
     def test_unknown_platform_is_fail_closed(self):
-        with patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
+        with (
+            patch.object(simple_brush, "bring_edge_foreground") as bring_edge,
+            patch.object(simple_brush, "check_macos_permissions") as permissions,
+        ):
             result = simple_brush.prepare_browser("linux")
 
         bring_edge.assert_not_called()
+        permissions.assert_not_called()
         self.assertFalse(result.ready)
         self.assertEqual(result.platform, "linux")
         self.assertEqual(result.browser, "")
@@ -209,12 +356,14 @@ class BrowserPrepareTests(unittest.TestCase):
             ) as bring_edge,
             patch.object(simple_brush, "resolve_chrome_executable") as resolve,
             patch.object(simple_brush.subprocess, "Popen") as popen,
+            patch.object(simple_brush, "check_macos_permissions") as permissions,
         ):
             result = simple_brush.prepare_browser("win32")
 
         bring_edge.assert_called_once_with()
         resolve.assert_not_called()
         popen.assert_not_called()
+        permissions.assert_not_called()
         self.assertTrue(result.ready)
 
     def test_windows_ready_preserves_run_preparation_order(self):

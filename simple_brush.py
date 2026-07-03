@@ -32,6 +32,13 @@ MACOS_CHROME_EXECUTABLE = Path(
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 )
 CHROME_SAFE_TARGET = 'about:blank'
+MACOS_PERMISSION_GUIDANCE = (
+    'macOS 权限绑定实际运行宿主：Terminal / iTerm / VS Code / Python / '
+    '打包 App 可能被视为不同授权主体。权限变更后可能需要完全退出并重启宿主进程。'
+    '辅助功能：系统设置 → 隐私与安全性 → 辅助功能；'
+    '屏幕录制：系统设置 → 隐私与安全性 → 屏幕录制；'
+    '键盘监听失败时请检查输入监控或辅助功能授权。'
+)
 
 if IS_WINDOWS:
     import win32clipboard
@@ -167,6 +174,17 @@ class BrowserPrepareResult:
     executable_path: str = ''
     message: str = ''
     error_code: str = ''
+
+
+@dataclass(frozen=True)
+class MacOSPermissionStatus:
+    """Side-effect-free macOS capability diagnostic state."""
+
+    accessibility: str
+    screen_recording: str
+    keyboard_listener: str
+    ready: bool
+    message: str = ''
 
 
 def region_around(x, y, radius):
@@ -537,7 +555,42 @@ def prepare_browser(platform_name=None):
         resolved = resolve_chrome_executable()
         if resolved.error_code:
             return resolved
-        return launch_chrome_safe_target(Path(resolved.executable_path))
+        launched = launch_chrome_safe_target(Path(resolved.executable_path))
+        if not launched.launched:
+            return launched
+        try:
+            permissions = check_macos_permissions()
+        except Exception as exc:
+            return BrowserPrepareResult(
+                ready=False,
+                platform='macos',
+                browser='chrome',
+                launched=True,
+                executable_path=launched.executable_path,
+                message=f'macOS 权限诊断失败: {exc}。{MACOS_PERMISSION_GUIDANCE}',
+                error_code='MACOS_PERMISSION_CHECK_FAILED',
+            )
+        if not permissions.ready:
+            return BrowserPrepareResult(
+                ready=False,
+                platform='macos',
+                browser='chrome',
+                launched=True,
+                executable_path=launched.executable_path,
+                message=permissions.message,
+                error_code='MACOS_PERMISSIONS_NOT_READY',
+            )
+        return BrowserPrepareResult(
+            ready=False,
+            platform='macos',
+            browser='chrome',
+            launched=True,
+            executable_path=launched.executable_path,
+            message=(
+                f'{permissions.message} Chrome 窗口和页面尚未验证为可操作。'
+            ),
+            error_code='MACOS_BROWSER_STARTED_NOT_READY',
+        )
 
     return BrowserPrepareResult(
         ready=False,
@@ -603,6 +656,46 @@ def launch_chrome_safe_target(chrome_path):
         executable_path=str(path),
         message='macOS Chrome 已启动 about:blank，但窗口尚未验证为可操作',
         error_code='MACOS_BROWSER_STARTED_NOT_READY',
+    )
+
+
+def check_macos_accessibility_capability():
+    """Return unknown without generating any system input event."""
+    return 'unknown'
+
+
+def check_macos_screen_recording_capability():
+    """Return unknown without capturing or saving any screen content."""
+    return 'unknown'
+
+
+def check_macos_keyboard_listener_capability():
+    """Return unknown without starting a listener or waiting for input."""
+    return 'unknown'
+
+
+def check_macos_permissions():
+    """Aggregate side-effect-free macOS capability diagnostics."""
+    accessibility = check_macos_accessibility_capability()
+    screen_recording = check_macos_screen_recording_capability()
+    keyboard_listener = check_macos_keyboard_listener_capability()
+    ready = all(
+        status == 'ok'
+        for status in (accessibility, screen_recording, keyboard_listener)
+    )
+    message = (
+        'macOS 权限诊断：'
+        f'accessibility={accessibility}, '
+        f'screen_recording={screen_recording}, '
+        f'keyboard_listener={keyboard_listener}。'
+        f'{MACOS_PERMISSION_GUIDANCE}'
+    )
+    return MacOSPermissionStatus(
+        accessibility=accessibility,
+        screen_recording=screen_recording,
+        keyboard_listener=keyboard_listener,
+        ready=ready,
+        message=message,
     )
 
 
