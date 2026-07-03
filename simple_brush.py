@@ -91,6 +91,12 @@ BATCH_SIZE = 100
 REFRESH_WAIT_SECONDS = 5
 CLICK_WAIT_SECONDS = 2
 COUNTDOWN_SECONDS = 3
+FILTER_OPEN_DELAY_MIN = 0.5
+FILTER_OPEN_DELAY_MAX = 1.0
+FILTER_OPTION_DELAY_MIN = 0.3
+FILTER_OPTION_DELAY_MAX = 0.7
+FILTER_RESULTS_DELAY_MIN = 2.0
+FILTER_RESULTS_DELAY_MAX = 3.0
 
 # OCR 关键词检测
 OCR_MAX_SCANS = 8
@@ -1055,6 +1061,44 @@ def click_first_candidate(x, y):
     return safe_wait(CLICK_WAIT_SECONDS)
 
 
+def apply_batch_filter_and_open_first_candidate():
+    """Apply the calibrated unseen filter and open the first candidate."""
+    if stop_event:
+        return False
+    if not batch_filter_enabled or batch_filter_regions is None:
+        logger.error('自动筛选归位区域未就绪，停止本轮运行')
+        return False
+
+    try:
+        logger.info('🔎 打开候选人筛选面板')
+        click_in_region(batch_filter_regions.open_filter)
+        if not human_delay(FILTER_OPEN_DELAY_MIN, FILTER_OPEN_DELAY_MAX):
+            return False
+
+        if stop_event:
+            return False
+        logger.info('🔎 选择“最近没看过”')
+        click_in_region(batch_filter_regions.unseen_filter)
+        if not human_delay(FILTER_OPTION_DELAY_MIN, FILTER_OPTION_DELAY_MAX):
+            return False
+
+        if stop_event:
+            return False
+        logger.info('🔎 应用候选人筛选')
+        click_in_region(batch_filter_regions.confirm_filter)
+        if not human_delay(FILTER_RESULTS_DELAY_MIN, FILTER_RESULTS_DELAY_MAX):
+            return False
+
+        if stop_event:
+            return False
+        logger.info('🖱️ 点击筛选后的首位候选人')
+        click_in_region(batch_filter_regions.first_candidate)
+        return safe_wait(CLICK_WAIT_SECONDS)
+    except Exception as exc:
+        logger.exception(f'自动筛选归位失败，停止本轮运行: {exc}')
+        return False
+
+
 def human_scroll_once():
     """严格鼠标不动，仅在当前位置触发小幅度滚轮。"""
     if stop_event:
@@ -1198,28 +1242,54 @@ def run():
     if not bring_edge_foreground():
         return 0
 
-    run_timer = start_run_timer(run_duration_seconds)
+    run_timer = None
     total_viewed = 0
     forward_consecutive = 0
 
     try:
-        logger.info(f'\n请将鼠标移到第一位候选人卡片上，{COUNTDOWN_SECONDS} 秒后开始...')
-        if not safe_wait(COUNTDOWN_SECONDS):
+        if batch_filter_calibration_requested:
+            ensure_batch_filter_regions_calibrated()
+
+        if batch_filter_enabled:
+            if not apply_batch_filter_and_open_first_candidate():
+                return 0
+            # Change 3 接入前，后续批次仍使用旧固定点打开首位候选人。
+            # 固定点取自已校准区域，不重新依赖人工鼠标位置。
+            click_x, click_y = random_point_in_region(
+                batch_filter_regions.first_candidate
+            )
+        else:
+            logger.info(
+                f'\n请将鼠标移到第一位候选人卡片上，'
+                f'{COUNTDOWN_SECONDS} 秒后开始...'
+            )
+            if not safe_wait(COUNTDOWN_SECONDS):
+                return 0
+
+            click_x, click_y = pyautogui.position()
+            logger.info(f'📍 固定点击位置: ({click_x}, {click_y})')
+            if not click_first_candidate(click_x, click_y):
+                return 0
+
+        # 首位详情稳定后完成既有运行期校准；这些启动准备不计入运行时间。
+        if focus_restore_calibration_requested:
+            ensure_focus_restore_region_calibrated()
+        if forward_click_calibration_requested:
+            ensure_forward_click_regions_calibrated()
+        if forward_enabled and forward_keywords:
+            ensure_ocr_region_calibrated()
+
+        if stop_event:
             return 0
 
-        click_x, click_y = pyautogui.position()
-        logger.info(f'📍 固定点击位置: ({click_x}, {click_y})')
+        run_timer = start_run_timer(run_duration_seconds)
+        first_candidate_opened = True
 
         while not stop_event:
-            # 打开第一位候选人
-            if not click_first_candidate(click_x, click_y):
-                break
-
-            # 仅普通交互模式可请求；详情页可见后再显示框选层。
-            if focus_restore_calibration_requested:
-                ensure_focus_restore_region_calibrated()
-            if forward_click_calibration_requested:
-                ensure_forward_click_regions_calibrated()
+            if not first_candidate_opened:
+                if not click_first_candidate(click_x, click_y):
+                    break
+            first_candidate_opened = False
 
             # 浏览本批次 100 位
             for i in range(BATCH_SIZE):

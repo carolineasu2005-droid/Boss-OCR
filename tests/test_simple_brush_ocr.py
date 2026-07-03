@@ -729,6 +729,106 @@ class SimpleBrushOCRTests(unittest.TestCase):
         press.assert_called_once_with("esc")
         self.assertFalse(simple_brush._programmatic_esc)
 
+    def test_apply_batch_filter_clicks_regions_in_order(self):
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+        simple_brush.batch_filter_regions = regions
+        simple_brush.batch_filter_enabled = True
+        with (
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "human_delay", return_value=True) as delay,
+            patch.object(simple_brush, "safe_wait", return_value=True) as wait,
+        ):
+            self.assertTrue(
+                simple_brush.apply_batch_filter_and_open_first_candidate()
+            )
+
+        self.assertEqual(
+            click.call_args_list,
+            [
+                call(regions.open_filter),
+                call(regions.unseen_filter),
+                call(regions.confirm_filter),
+                call(regions.first_candidate),
+            ],
+        )
+        self.assertEqual(
+            delay.call_args_list,
+            [
+                call(
+                    simple_brush.FILTER_OPEN_DELAY_MIN,
+                    simple_brush.FILTER_OPEN_DELAY_MAX,
+                ),
+                call(
+                    simple_brush.FILTER_OPTION_DELAY_MIN,
+                    simple_brush.FILTER_OPTION_DELAY_MAX,
+                ),
+                call(
+                    simple_brush.FILTER_RESULTS_DELAY_MIN,
+                    simple_brush.FILTER_RESULTS_DELAY_MAX,
+                ),
+            ],
+        )
+        wait.assert_called_once_with(simple_brush.CLICK_WAIT_SECONDS)
+
+    def test_apply_batch_filter_stops_after_interrupted_wait(self):
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+        simple_brush.batch_filter_regions = regions
+        simple_brush.batch_filter_enabled = True
+        with (
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(
+                simple_brush,
+                "human_delay",
+                side_effect=[True, False],
+            ),
+            patch.object(simple_brush, "safe_wait") as wait,
+        ):
+            self.assertFalse(
+                simple_brush.apply_batch_filter_and_open_first_candidate()
+            )
+
+        self.assertEqual(
+            click.call_args_list,
+            [call(regions.open_filter), call(regions.unseen_filter)],
+        )
+        wait.assert_not_called()
+
+    def test_apply_batch_filter_exception_fails_closed(self):
+        simple_brush.batch_filter_regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+        simple_brush.batch_filter_enabled = True
+        with (
+            patch.object(
+                simple_brush,
+                "click_in_region",
+                side_effect=RuntimeError("click failed"),
+            ) as click,
+            patch.object(simple_brush, "human_delay") as delay,
+            patch.object(simple_brush, "safe_wait") as wait,
+            patch.object(simple_brush.logger, "exception") as log_exception,
+        ):
+            self.assertFalse(
+                simple_brush.apply_batch_filter_and_open_first_candidate()
+            )
+        click.assert_called_once_with(simple_brush.batch_filter_regions.open_filter)
+        delay.assert_not_called()
+        wait.assert_not_called()
+        log_exception.assert_called_once()
+
     def test_random_focus_restore_point_uses_half_open_region_bounds(self):
         region = simple_brush.ScreenRegion(left=400, top=350, width=101, height=51)
         with patch.object(
@@ -1092,6 +1192,14 @@ class SimpleBrushOCRTests(unittest.TestCase):
             events.append("forward_calibrate")
             return simple_brush.DEFAULT_FORWARD_CLICK_REGIONS
 
+        def calibrate_ocr():
+            events.append("ocr_calibrate")
+            return True
+
+        def start_timer(_duration):
+            events.append("timer_start")
+            return None
+
         def view(_index):
             events.append("view")
             return False
@@ -1121,16 +1229,30 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "ensure_forward_click_regions_calibrated",
                 side_effect=calibrate_forward,
             ) as ensure_forward,
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+                side_effect=calibrate_ocr,
+            ) as ensure_ocr,
+            patch.object(simple_brush, "start_run_timer", side_effect=start_timer),
             patch.object(simple_brush, "view_candidate", side_effect=view),
             patch.object(simple_brush, "refresh_page", return_value=False),
         ):
             self.assertEqual(simple_brush.run(), 0)
         self.assertEqual(
             events,
-            ["detail", "focus_calibrate", "forward_calibrate", "view"],
+            [
+                "detail",
+                "focus_calibrate",
+                "forward_calibrate",
+                "ocr_calibrate",
+                "timer_start",
+                "view",
+            ],
         )
         ensure.assert_called_once_with()
         ensure_forward.assert_called_once_with()
+        ensure_ocr.assert_called_once_with()
 
     def test_run_does_not_calibrate_when_first_detail_fails_to_open(self):
         def configure_input(**_kwargs):
@@ -1160,10 +1282,280 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 simple_brush,
                 "ensure_forward_click_regions_calibrated",
             ) as ensure_forward,
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+            ) as ensure_ocr,
+            patch.object(simple_brush, "start_run_timer") as start_timer,
         ):
             self.assertEqual(simple_brush.run(), 0)
         ensure.assert_not_called()
         ensure_forward.assert_not_called()
+        ensure_ocr.assert_not_called()
+        start_timer.assert_not_called()
+
+    def test_run_batch_filter_success_prepares_before_timer_and_view(self):
+        events = []
+        timer = Mock()
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+
+        def configure_input(**_kwargs):
+            simple_brush.batch_filter_calibration_requested = True
+            simple_brush.focus_restore_calibration_requested = True
+            simple_brush.forward_click_calibration_requested = True
+            simple_brush.forward_enabled = True
+
+        def calibrate_batch():
+            events.append("batch_calibrate")
+            simple_brush.batch_filter_regions = regions
+            simple_brush.batch_filter_enabled = True
+            return regions
+
+        def record(name, result=True):
+            def action(*_args, **_kwargs):
+                events.append(name)
+                return result
+            return action
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "ensure_batch_filter_regions_calibrated",
+                side_effect=calibrate_batch,
+            ),
+            patch.object(
+                simple_brush,
+                "apply_batch_filter_and_open_first_candidate",
+                side_effect=record("apply_filter"),
+            ),
+            patch.object(
+                simple_brush,
+                "random_point_in_region",
+                return_value=(15, 25),
+            ),
+            patch.object(simple_brush.pyautogui, "position") as position,
+            patch.object(simple_brush, "click_first_candidate") as legacy_click,
+            patch.object(
+                simple_brush,
+                "ensure_focus_restore_region_calibrated",
+                side_effect=record("focus_calibrate"),
+            ),
+            patch.object(
+                simple_brush,
+                "ensure_forward_click_regions_calibrated",
+                side_effect=record("forward_calibrate"),
+            ),
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+                side_effect=record("ocr_calibrate"),
+            ),
+            patch.object(
+                simple_brush,
+                "start_run_timer",
+                side_effect=record("timer_start", timer),
+            ),
+            patch.object(
+                simple_brush,
+                "view_candidate",
+                side_effect=record("view", False),
+            ),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(
+            events,
+            [
+                "batch_calibrate",
+                "apply_filter",
+                "focus_calibrate",
+                "forward_calibrate",
+                "ocr_calibrate",
+                "timer_start",
+                "view",
+            ],
+        )
+        position.assert_not_called()
+        legacy_click.assert_not_called()
+        timer.cancel.assert_called_once_with()
+
+    def test_run_first_batch_filter_failure_stops_before_calibration_and_timer(self):
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+
+        def configure_input(**_kwargs):
+            simple_brush.batch_filter_calibration_requested = True
+            simple_brush.focus_restore_calibration_requested = True
+            simple_brush.forward_click_calibration_requested = True
+
+        def calibrate_batch():
+            simple_brush.batch_filter_regions = regions
+            simple_brush.batch_filter_enabled = True
+            return regions
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "ensure_batch_filter_regions_calibrated",
+                side_effect=calibrate_batch,
+            ),
+            patch.object(
+                simple_brush,
+                "apply_batch_filter_and_open_first_candidate",
+                return_value=False,
+            ),
+            patch.object(simple_brush.pyautogui, "position") as position,
+            patch.object(simple_brush, "click_first_candidate") as legacy_click,
+            patch.object(
+                simple_brush,
+                "ensure_focus_restore_region_calibrated",
+            ) as focus_calibrate,
+            patch.object(
+                simple_brush,
+                "ensure_forward_click_regions_calibrated",
+            ) as forward_calibrate,
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+            ) as ocr_calibrate,
+            patch.object(simple_brush, "start_run_timer") as start_timer,
+            patch.object(simple_brush, "view_candidate") as view,
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        position.assert_not_called()
+        legacy_click.assert_not_called()
+        focus_calibrate.assert_not_called()
+        forward_calibrate.assert_not_called()
+        ocr_calibrate.assert_not_called()
+        start_timer.assert_not_called()
+        view.assert_not_called()
+
+    def test_run_batch_filter_fallback_starts_timer_after_legacy_preparation(self):
+        events = []
+        timer = Mock()
+
+        def configure_input(**_kwargs):
+            simple_brush.batch_filter_calibration_requested = True
+            simple_brush.focus_restore_calibration_requested = True
+            simple_brush.forward_click_calibration_requested = True
+            simple_brush.forward_enabled = True
+
+        def calibrate_batch():
+            events.append("batch_calibrate")
+            simple_brush.batch_filter_regions = None
+            simple_brush.batch_filter_enabled = False
+
+        def record(name, result=True):
+            def action(*_args, **_kwargs):
+                events.append(name)
+                return result
+            return action
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "ensure_batch_filter_regions_calibrated",
+                side_effect=calibrate_batch,
+            ),
+            patch.object(simple_brush, "safe_wait", side_effect=record("countdown")),
+            patch.object(
+                simple_brush.pyautogui,
+                "position",
+                side_effect=record("position", (10, 20)),
+            ),
+            patch.object(
+                simple_brush,
+                "click_first_candidate",
+                side_effect=record("legacy_click"),
+            ),
+            patch.object(
+                simple_brush,
+                "ensure_focus_restore_region_calibrated",
+                side_effect=record("focus_calibrate"),
+            ),
+            patch.object(
+                simple_brush,
+                "ensure_forward_click_regions_calibrated",
+                side_effect=record("forward_calibrate"),
+            ),
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+                side_effect=record("ocr_calibrate"),
+            ),
+            patch.object(
+                simple_brush,
+                "start_run_timer",
+                side_effect=record("timer_start", timer),
+            ),
+            patch.object(
+                simple_brush,
+                "view_candidate",
+                side_effect=record("view", False),
+            ),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(
+            events,
+            [
+                "batch_calibrate",
+                "countdown",
+                "position",
+                "legacy_click",
+                "focus_calibrate",
+                "forward_calibrate",
+                "ocr_calibrate",
+                "timer_start",
+                "view",
+            ],
+        )
+        timer.cancel.assert_called_once_with()
 
     def test_zero_duration_does_not_create_timer(self):
         with patch.object(simple_brush.threading, "Timer") as timer_factory:
@@ -1182,8 +1574,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.request_timed_stop()
         self.assertTrue(simple_brush.stop_event)
 
-    def test_run_cancels_timer_when_countdown_is_interrupted(self):
-        timer = Mock()
+    def test_run_does_not_start_timer_when_countdown_is_interrupted(self):
         with (
             patch.object(
                 simple_brush.sys,
@@ -1191,12 +1582,12 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 ["simple_brush.py", "--duration-seconds", "5", "--auto"],
             ),
             patch.object(simple_brush, "bring_edge_foreground", return_value=True),
-            patch.object(simple_brush, "start_run_timer", return_value=timer),
+            patch.object(simple_brush, "start_run_timer") as start_timer,
             patch.object(simple_brush, "safe_wait", return_value=False),
             patch.object(simple_brush.listener, "start"),
         ):
             self.assertEqual(simple_brush.run(), 0)
-        timer.cancel.assert_called_once_with()
+        start_timer.assert_not_called()
 
     def test_stop_prevents_new_navigation_actions(self):
         simple_brush.stop_event = True
