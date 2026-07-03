@@ -19,6 +19,7 @@ import ctypes
 from ctypes import wintypes
 import time
 import random
+import math
 import logging
 import threading
 from dataclasses import dataclass
@@ -174,11 +175,28 @@ DEFAULT_FOCUS_RESTORE_REGION = ScreenRegion(
     height=51,
 )
 
-# 转发反检测
+# 鼠标点击与转发步骤配置
 FORWARD_CLICK_OFFSET = 5    # 点击位置随机偏移范围（像素）
 FORWARD_MIN_DELAY   = 0.5   # 步骤间最短延迟（秒）
 FORWARD_MAX_DELAY   = 1.5   # 步骤间最长延迟（秒）
 FORWARD_MAX_CONSEC  = 5     # 连续转发上限（超出跳过）
+
+# 单次鼠标移动参数
+MOUSE_MOVE_MIN_DURATION = 0.20
+MOUSE_MOVE_MAX_DURATION = 0.75
+MOUSE_MOVE_BASE_DURATION = 0.18
+MOUSE_MOVE_DISTANCE_DIVISOR = 1800.0
+MOUSE_MOVE_SAMPLE_RATE = 60
+MOUSE_MOVE_MIN_STEPS = 12
+MOUSE_MOVE_MAX_STEPS = 45
+MOUSE_MOVE_SHORT_DISTANCE = 8.0
+MOUSE_MOVE_CURVE_MIN_DISTANCE = 40.0
+MOUSE_MOVE_CURVE_RATIO_MIN = 0.04
+MOUSE_MOVE_CURVE_RATIO_MAX = 0.10
+MOUSE_MOVE_CURVE_OFFSET_MIN = 4.0
+MOUSE_MOVE_CURVE_OFFSET_MAX = 40.0
+MOUSE_MOVE_JITTER_MIN = 0.5
+MOUSE_MOVE_JITTER_MAX = 1.5
 
 DEFAULT_FORWARD_CLICK_REGIONS = ForwardClickRegions(
     forward_icon=region_around(FORWARD_ICON_X, FORWARD_ICON_Y, 5),
@@ -489,6 +507,118 @@ def human_delay(min_s=FORWARD_MIN_DELAY, max_s=FORWARD_MAX_DELAY):
     """随机延迟，模拟人类操作间隔"""
     delay = random.uniform(min_s, max_s)
     return safe_wait(delay)
+
+
+def human_move_to(x, y, *, simple=None):
+    """Move the pointer to an exact target along one observable path."""
+    target_x = int(round(x))
+    target_y = int(round(y))
+
+    if simple:
+        pyautogui.moveTo(
+            target_x,
+            target_y,
+            duration=random.uniform(0.15, 0.35),
+        )
+        return
+
+    start = pyautogui.position()
+    start_x = float(start[0])
+    start_y = float(start[1])
+    delta_x = target_x - start_x
+    delta_y = target_y - start_y
+    distance = math.hypot(delta_x, delta_y)
+
+    if distance == 0:
+        pyautogui.moveTo(target_x, target_y, duration=0)
+        return
+
+    duration = min(
+        MOUSE_MOVE_MAX_DURATION,
+        max(
+            MOUSE_MOVE_MIN_DURATION,
+            MOUSE_MOVE_BASE_DURATION + distance / MOUSE_MOVE_DISTANCE_DIVISOR,
+        ),
+    )
+    steps = min(
+        MOUSE_MOVE_MAX_STEPS,
+        max(MOUSE_MOVE_MIN_STEPS, round(duration * MOUSE_MOVE_SAMPLE_RATE)),
+    )
+
+    # Very short moves stay straight and stable. Moderate moves use a
+    # degenerate straight Bezier without intermediate jitter.
+    first_fraction = 1.0 / 3.0
+    second_fraction = 2.0 / 3.0
+    curve_offset = 0.0
+    jitter_amplitude = 0.0
+    if distance >= MOUSE_MOVE_CURVE_MIN_DISTANCE:
+        first_fraction = random.uniform(0.25, 0.40)
+        second_fraction = random.uniform(0.60, 0.75)
+        curve_ratio = random.uniform(
+            MOUSE_MOVE_CURVE_RATIO_MIN,
+            MOUSE_MOVE_CURVE_RATIO_MAX,
+        )
+        curve_offset = min(
+            MOUSE_MOVE_CURVE_OFFSET_MAX,
+            max(MOUSE_MOVE_CURVE_OFFSET_MIN, distance * curve_ratio),
+        )
+        curve_offset *= random.choice((-1.0, 1.0))
+        jitter_amplitude = random.uniform(
+            MOUSE_MOVE_JITTER_MIN,
+            MOUSE_MOVE_JITTER_MAX,
+        )
+
+    unit_x = delta_x / distance
+    unit_y = delta_y / distance
+    perpendicular_x = -unit_y
+    perpendicular_y = unit_x
+    control1_x = (
+        start_x + delta_x * first_fraction + perpendicular_x * curve_offset
+    )
+    control1_y = (
+        start_y + delta_y * first_fraction + perpendicular_y * curve_offset
+    )
+    control2_x = (
+        start_x + delta_x * second_fraction + perpendicular_x * curve_offset
+    )
+    control2_y = (
+        start_y + delta_y * second_fraction + perpendicular_y * curve_offset
+    )
+    step_interval = duration / steps
+
+    for index in range(1, steps):
+        progress = index / steps
+        eased = 3.0 * progress ** 2 - 2.0 * progress ** 3
+        inverse = 1.0 - eased
+        point_x = (
+            inverse ** 3 * start_x
+            + 3.0 * inverse ** 2 * eased * control1_x
+            + 3.0 * inverse * eased ** 2 * control2_x
+            + eased ** 3 * target_x
+        )
+        point_y = (
+            inverse ** 3 * start_y
+            + 3.0 * inverse ** 2 * eased * control1_y
+            + 3.0 * inverse * eased ** 2 * control2_y
+            + eased ** 3 * target_y
+        )
+
+        if jitter_amplitude and distance >= MOUSE_MOVE_SHORT_DISTANCE:
+            jitter_scale = math.sin(math.pi * progress)
+            point_x += random.uniform(
+                -jitter_amplitude,
+                jitter_amplitude,
+            ) * jitter_scale
+            point_y += random.uniform(
+                -jitter_amplitude,
+                jitter_amplitude,
+            ) * jitter_scale
+
+        pyautogui.moveTo(int(round(point_x)), int(round(point_y)), duration=0)
+        time.sleep(step_interval)
+
+    # Never let curve rounding or intermediate jitter alter the click target.
+    pyautogui.moveTo(target_x, target_y, duration=0)
 
 
 def human_click(x, y, offset=FORWARD_CLICK_OFFSET):
