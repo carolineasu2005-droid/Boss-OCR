@@ -1557,6 +1557,204 @@ class SimpleBrushOCRTests(unittest.TestCase):
         )
         timer.cancel.assert_called_once_with()
 
+    def test_run_reapplies_batch_filter_after_refresh_before_next_batch(self):
+        events = []
+        view_calls = 0
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+
+        def configure_input(**_kwargs):
+            simple_brush.forward_enabled = False
+            simple_brush.forward_keywords = []
+            simple_brush.batch_filter_regions = regions
+            simple_brush.batch_filter_enabled = True
+
+        def apply_filter():
+            events.append("apply_filter")
+            return True
+
+        def view(index):
+            nonlocal view_calls
+            view_calls += 1
+            events.append(f"view({index})")
+            if view_calls == 3:
+                simple_brush.stop_event = True
+                return False
+            return True
+
+        def next_candidate():
+            events.append("next")
+            return True
+
+        def refresh():
+            self.assertEqual(simple_brush.forward_consecutive, 0)
+            events.append("refresh")
+            return True
+
+        def start_timer(_duration):
+            events.append("timer_start")
+            return None
+
+        with (
+            patch.object(simple_brush, "BATCH_SIZE", 2),
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "apply_batch_filter_and_open_first_candidate",
+                side_effect=apply_filter,
+            ),
+            patch.object(simple_brush, "start_run_timer", side_effect=start_timer),
+            patch.object(simple_brush, "view_candidate", side_effect=view),
+            patch.object(simple_brush, "next_candidate", side_effect=next_candidate),
+            patch.object(simple_brush, "refresh_page", side_effect=refresh),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(
+            events,
+            [
+                "apply_filter",
+                "timer_start",
+                "view(0)",
+                "next",
+                "view(1)",
+                "refresh",
+                "apply_filter",
+                "view(0)",
+            ],
+        )
+
+    def test_run_does_not_filter_next_batch_when_refresh_fails(self):
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+
+        def configure_input(**_kwargs):
+            simple_brush.forward_enabled = False
+            simple_brush.forward_keywords = []
+            simple_brush.batch_filter_regions = regions
+            simple_brush.batch_filter_enabled = True
+
+        with (
+            patch.object(simple_brush, "BATCH_SIZE", 1),
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "apply_batch_filter_and_open_first_candidate",
+                return_value=True,
+            ) as apply_filter,
+            patch.object(simple_brush, "start_run_timer", return_value=None),
+            patch.object(simple_brush, "view_candidate", return_value=True) as view,
+            patch.object(simple_brush, "refresh_page", return_value=False) as refresh,
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        apply_filter.assert_called_once_with()
+        view.assert_called_once_with(0)
+        refresh.assert_called_once_with()
+
+    def test_run_stops_before_next_view_when_batch_filter_reapply_fails(self):
+        regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(10, 20, 30, 40),
+            open_filter=simple_brush.ScreenRegion(50, 60, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(70, 80, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(90, 100, 12, 12),
+        )
+
+        def configure_input(**_kwargs):
+            simple_brush.forward_enabled = False
+            simple_brush.forward_keywords = []
+            simple_brush.batch_filter_regions = regions
+            simple_brush.batch_filter_enabled = True
+
+        with (
+            patch.object(simple_brush, "BATCH_SIZE", 1),
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "apply_batch_filter_and_open_first_candidate",
+                side_effect=[True, False],
+            ) as apply_filter,
+            patch.object(simple_brush, "start_run_timer", return_value=None),
+            patch.object(simple_brush, "view_candidate", return_value=True) as view,
+            patch.object(simple_brush, "refresh_page", return_value=True) as refresh,
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(apply_filter.call_count, 2)
+        view.assert_called_once_with(0)
+        refresh.assert_called_once_with()
+
+    def test_run_legacy_path_reuses_same_point_after_refresh(self):
+        def configure_input(**_kwargs):
+            simple_brush.forward_enabled = False
+            simple_brush.forward_keywords = []
+            simple_brush.batch_filter_enabled = False
+
+        with (
+            patch.object(simple_brush, "BATCH_SIZE", 1),
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(
+                simple_brush,
+                "click_first_candidate",
+                side_effect=[True, False],
+            ) as legacy_click,
+            patch.object(simple_brush, "start_run_timer", return_value=None),
+            patch.object(simple_brush, "view_candidate", return_value=True),
+            patch.object(simple_brush, "refresh_page", return_value=True),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(
+            legacy_click.call_args_list,
+            [call(10, 20), call(10, 20)],
+        )
+
     def test_zero_duration_does_not_create_timer(self):
         with patch.object(simple_brush.threading, "Timer") as timer_factory:
             self.assertIsNone(simple_brush.start_run_timer(0))

@@ -1099,6 +1099,16 @@ def apply_batch_filter_and_open_first_candidate():
         return False
 
 
+def open_first_candidate_for_batch(legacy_point=None):
+    """Open the first candidate through the calibrated or legacy path."""
+    if batch_filter_enabled:
+        return apply_batch_filter_and_open_first_candidate()
+    if legacy_point is None:
+        logger.error('旧首位候选人坐标未就绪，停止本轮运行')
+        return False
+    return click_first_candidate(*legacy_point)
+
+
 def human_scroll_once():
     """严格鼠标不动，仅在当前位置触发小幅度滚轮。"""
     if stop_event:
@@ -1251,13 +1261,9 @@ def run():
             ensure_batch_filter_regions_calibrated()
 
         if batch_filter_enabled:
-            if not apply_batch_filter_and_open_first_candidate():
+            legacy_point = None
+            if not open_first_candidate_for_batch():
                 return 0
-            # Change 3 接入前，后续批次仍使用旧固定点打开首位候选人。
-            # 固定点取自已校准区域，不重新依赖人工鼠标位置。
-            click_x, click_y = random_point_in_region(
-                batch_filter_regions.first_candidate
-            )
         else:
             logger.info(
                 f'\n请将鼠标移到第一位候选人卡片上，'
@@ -1268,7 +1274,8 @@ def run():
 
             click_x, click_y = pyautogui.position()
             logger.info(f'📍 固定点击位置: ({click_x}, {click_y})')
-            if not click_first_candidate(click_x, click_y):
+            legacy_point = (click_x, click_y)
+            if not open_first_candidate_for_batch(legacy_point):
                 return 0
 
         # 首位详情稳定后完成既有运行期校准；这些启动准备不计入运行时间。
@@ -1287,7 +1294,7 @@ def run():
 
         while not stop_event:
             if not first_candidate_opened:
-                if not click_first_candidate(click_x, click_y):
+                if not open_first_candidate_for_batch(legacy_point):
                     break
             first_candidate_opened = False
 
