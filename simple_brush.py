@@ -48,6 +48,7 @@ def parse_args():
         'email': '',
         'duration_seconds': '',
         'no_forward': False,
+        'no_batch_filter': False,
         'auto': False,
     }
     i = 1
@@ -65,6 +66,9 @@ def parse_args():
             i += 2
         elif sys.argv[i] == '--no-forward':
             args['no_forward'] = True
+            i += 1
+        elif sys.argv[i] == '--no-batch-filter':
+            args['no_batch_filter'] = True
             i += 1
         elif sys.argv[i] == '--auto':
             args['auto'] = True  # 跳过所有交互
@@ -113,6 +117,16 @@ class ForwardClickRegions:
     input_box: ScreenRegion
     recent_email: ScreenRegion
     forward_button: ScreenRegion
+
+
+@dataclass(frozen=True)
+class BatchFilterRegions:
+    """Runtime click regions for filtering and opening the first candidate."""
+
+    first_candidate: ScreenRegion
+    open_filter: ScreenRegion
+    unseen_filter: ScreenRegion
+    confirm_filter: ScreenRegion
 
 
 def region_around(x, y, radius):
@@ -201,6 +215,13 @@ forward_click_calibration_requested = False
 forward_click_calibration_attempted = False
 forward_click_calibration_in_progress = False
 
+# 候选人列表筛选与首位归位区域（仅在当前运行期间有效）
+batch_filter_regions = None
+batch_filter_calibration_requested = False
+batch_filter_calibration_attempted = False
+batch_filter_calibration_in_progress = False
+batch_filter_enabled = False
+
 # 焦点恢复区域状态（仅在当前运行期间有效）
 focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
 focus_restore_calibration_requested = False
@@ -228,6 +249,7 @@ def on_press(key):
             ocr_calibration_in_progress
             or focus_restore_calibration_in_progress
             or forward_click_calibration_in_progress
+            or batch_filter_calibration_in_progress
         ):
             return True  # 交给 Tk 校准窗口处理，只取消校准，不停止浏览
         stop_event = True
@@ -264,6 +286,7 @@ def get_user_input(
     duration_str='',
     auto=False,
     no_forward=False,
+    no_batch_filter=False,
 ):
     """
     获取关键词、备选邮箱和本次运行时间。
@@ -272,11 +295,13 @@ def get_user_input(
     global forward_keywords, backup_email, forward_enabled, run_duration_seconds
     global focus_restore_calibration_requested
     global forward_click_calibration_requested
+    global batch_filter_calibration_requested
 
     # ── 非交互模式（命令行传参或 --auto） ──
     if auto or keywords_str:
         focus_restore_calibration_requested = False
         forward_click_calibration_requested = False
+        batch_filter_calibration_requested = False
         run_duration_seconds = parse_duration_seconds(duration_str)
         if keywords_str:
             forward_keywords = parse_keyword_rules(keywords_str)
@@ -333,6 +358,19 @@ def get_user_input(
     else:
         focus_restore_calibration_requested = False
         forward_click_calibration_requested = False
+
+    if no_batch_filter:
+        batch_filter_calibration_requested = False
+        print('  自动筛选归位已禁用，本次运行使用旧首位候选人流程')
+    else:
+        calibrate_batch_filter = input(
+            '\n是否校准“最近没看过”筛选和首位候选人区域？[y/N]\n> '
+        ).strip().lower()
+        batch_filter_calibration_requested = calibrate_batch_filter in ('y', 'yes')
+        if batch_filter_calibration_requested:
+            print('  将在候选人列表页依次校准四个自动筛选归位区域')
+        else:
+            print('  本次运行使用旧首位候选人流程')
 
     while True:
         duration_raw = input('\n请输入本次运行时间（秒，留空或 0 表示持续运行）:\n> ')
@@ -633,6 +671,110 @@ def reset_forward_click_calibration():
     forward_click_calibration_requested = False
     forward_click_calibration_attempted = False
     forward_click_calibration_in_progress = False
+
+
+def reset_batch_filter_calibration():
+    """Reset batch filter calibration to its per-run disabled state."""
+    global batch_filter_regions
+    global batch_filter_calibration_requested
+    global batch_filter_calibration_attempted
+    global batch_filter_calibration_in_progress
+    global batch_filter_enabled
+
+    batch_filter_regions = None
+    batch_filter_calibration_requested = False
+    batch_filter_calibration_attempted = False
+    batch_filter_calibration_in_progress = False
+    batch_filter_enabled = False
+
+
+def close_batch_filter_panel_after_calibration():
+    """Best-effort close of the filter panel without stopping the run."""
+    global _programmatic_esc
+
+    _programmatic_esc = True
+    try:
+        pyautogui.press('esc')
+    finally:
+        _programmatic_esc = False
+
+
+def ensure_batch_filter_regions_calibrated():
+    """Calibrate all batch-filter navigation regions atomically once per run."""
+    global batch_filter_regions
+    global batch_filter_calibration_attempted
+    global batch_filter_calibration_in_progress
+    global batch_filter_enabled
+
+    if not batch_filter_calibration_requested:
+        return batch_filter_regions
+    if batch_filter_calibration_attempted:
+        return batch_filter_regions
+
+    batch_filter_calibration_attempted = True
+    batch_filter_calibration_in_progress = True
+    panel_may_be_open = False
+    panel_close_attempted = False
+
+    try:
+        first_candidate = select_screen_region(
+            min_size=20,
+            instruction='框选首位候选人卡片内部安全区域 · Esc 使用旧流程',
+            subtitle='校准 1/4 · 只框选，不会打开候选人详情',
+        )
+        open_filter = select_screen_region(
+            min_size=12,
+            instruction='框选“打开筛选”按钮内部安全区域 · Esc 使用旧流程',
+            subtitle='校准 2/4 · 程序将用该区域打开筛选面板',
+        )
+
+        # 点击可能已经改变页面，即使调用抛错也需要最佳努力关闭面板。
+        panel_may_be_open = True
+        click_in_region(open_filter)
+        if not human_delay(0.5, 1.0):
+            raise RuntimeError('打开筛选面板的等待被中断')
+
+        unseen_filter = select_screen_region(
+            min_size=12,
+            instruction='框选“最近没看过”选项内部安全区域 · Esc 使用旧流程',
+            subtitle='校准 3/4 · 只框选，不会选择该筛选项',
+        )
+        confirm_filter = select_screen_region(
+            min_size=12,
+            instruction='框选“筛选确定”按钮内部安全区域 · Esc 使用旧流程',
+            subtitle='校准 4/4 · 只框选，不会应用筛选',
+        )
+
+        panel_close_attempted = True
+        close_batch_filter_panel_after_calibration()
+        panel_may_be_open = False
+
+        calibrated_regions = BatchFilterRegions(
+            first_candidate=first_candidate,
+            open_filter=open_filter,
+            unseen_filter=unseen_filter,
+            confirm_filter=confirm_filter,
+        )
+        batch_filter_regions = calibrated_regions
+        batch_filter_enabled = True
+        logger.info('✅ 自动筛选归位区域校准完成')
+    except CalibrationCancelled:
+        batch_filter_regions = None
+        batch_filter_enabled = False
+        logger.warning('自动筛选归位区域校准已取消，本次运行使用旧流程')
+    except Exception as exc:
+        batch_filter_regions = None
+        batch_filter_enabled = False
+        logger.exception(f'自动筛选归位区域校准失败，本次运行使用旧流程: {exc}')
+    finally:
+        if panel_may_be_open and not panel_close_attempted:
+            try:
+                close_batch_filter_panel_after_calibration()
+            except Exception as exc:
+                logger.warning(f'校准后关闭筛选面板失败，本次运行使用旧流程: {exc}')
+        batch_filter_calibration_in_progress = False
+
+    return batch_filter_regions
 
 
 def close_forward_dialog_after_calibration():
@@ -1014,6 +1156,7 @@ def run():
     stop_event = False
     reset_focus_restore_calibration()
     reset_forward_click_calibration()
+    reset_batch_filter_calibration()
 
     # ── 交互/参数输入 ──
     try:
@@ -1025,6 +1168,7 @@ def run():
             duration_str=cli_args['duration_seconds'],
             auto=cli_args['auto'],
             no_forward=no_forward_mode,
+            no_batch_filter=cli_args.get('no_batch_filter', False),
         )
     except ValueError as exc:
         print(f'[错误] {exc}')

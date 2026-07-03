@@ -19,6 +19,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "forward_click_calibration_requested",
                 "forward_click_calibration_attempted",
                 "forward_click_calibration_in_progress",
+                "batch_filter_regions",
+                "batch_filter_calibration_requested",
+                "batch_filter_calibration_attempted",
+                "batch_filter_calibration_in_progress",
+                "batch_filter_enabled",
                 "focus_restore_region",
                 "focus_restore_calibration_requested",
                 "focus_restore_calibration_attempted",
@@ -41,6 +46,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.backup_email = ""
         simple_brush.no_forward_mode = False
         simple_brush.reset_forward_click_calibration()
+        simple_brush.reset_batch_filter_calibration()
         simple_brush.reset_focus_restore_calibration()
         simple_brush.stop_event = False
         simple_brush.paused = False
@@ -525,6 +531,204 @@ class SimpleBrushOCRTests(unittest.TestCase):
         press.assert_called_once_with("esc")
         self.assertFalse(simple_brush._programmatic_esc)
 
+    def test_reset_batch_filter_calibration_clears_runtime_state(self):
+        simple_brush.batch_filter_regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(1, 2, 20, 20),
+            open_filter=simple_brush.ScreenRegion(3, 4, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(5, 6, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(7, 8, 12, 12),
+        )
+        simple_brush.batch_filter_calibration_requested = True
+        simple_brush.batch_filter_calibration_attempted = True
+        simple_brush.batch_filter_calibration_in_progress = True
+        simple_brush.batch_filter_enabled = True
+
+        simple_brush.reset_batch_filter_calibration()
+
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+        self.assertFalse(simple_brush.batch_filter_calibration_attempted)
+        self.assertFalse(simple_brush.batch_filter_calibration_in_progress)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+
+    def test_batch_filter_calibration_selects_in_order_and_publishes_atomically(self):
+        regions = [
+            simple_brush.ScreenRegion(index * 10, index * 20, 24, 24)
+            for index in range(1, 5)
+        ]
+        simple_brush.batch_filter_calibration_requested = True
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=regions,
+            ) as select,
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "human_delay", return_value=True) as delay,
+            patch.object(
+                simple_brush,
+                "close_batch_filter_panel_after_calibration",
+            ) as close_panel,
+        ):
+            result = simple_brush.ensure_batch_filter_regions_calibrated()
+
+        expected = simple_brush.BatchFilterRegions(
+            first_candidate=regions[0],
+            open_filter=regions[1],
+            unseen_filter=regions[2],
+            confirm_filter=regions[3],
+        )
+        self.assertEqual(result, expected)
+        self.assertEqual(simple_brush.batch_filter_regions, expected)
+        self.assertTrue(simple_brush.batch_filter_enabled)
+        self.assertTrue(simple_brush.batch_filter_calibration_attempted)
+        self.assertFalse(simple_brush.batch_filter_calibration_in_progress)
+        self.assertEqual(
+            [item.kwargs["subtitle"].split(" · ")[0] for item in select.call_args_list],
+            ["校准 1/4", "校准 2/4", "校准 3/4", "校准 4/4"],
+        )
+        click.assert_called_once_with(regions[1])
+        self.assertNotIn(call(regions[0]), click.call_args_list)
+        self.assertNotIn(call(regions[2]), click.call_args_list)
+        self.assertNotIn(call(regions[3]), click.call_args_list)
+        delay.assert_called_once_with(0.5, 1.0)
+        close_panel.assert_called_once_with()
+
+    def test_batch_filter_calibration_cancellation_is_atomic_at_every_region(self):
+        regions = [
+            simple_brush.ScreenRegion(index * 10, index * 20, 24, 24)
+            for index in range(1, 5)
+        ]
+        for cancelled_index in range(4):
+            with self.subTest(cancelled_index=cancelled_index):
+                simple_brush.reset_batch_filter_calibration()
+                simple_brush.batch_filter_calibration_requested = True
+                side_effect = regions[:cancelled_index] + [
+                    simple_brush.CalibrationCancelled()
+                ]
+                with (
+                    patch.object(
+                        simple_brush,
+                        "select_screen_region",
+                        side_effect=side_effect,
+                    ),
+                    patch.object(simple_brush, "click_in_region") as click,
+                    patch.object(simple_brush, "human_delay", return_value=True),
+                    patch.object(
+                        simple_brush,
+                        "close_batch_filter_panel_after_calibration",
+                    ) as close_panel,
+                ):
+                    result = simple_brush.ensure_batch_filter_regions_calibrated()
+
+                self.assertIsNone(result)
+                self.assertIsNone(simple_brush.batch_filter_regions)
+                self.assertFalse(simple_brush.batch_filter_enabled)
+                self.assertTrue(simple_brush.batch_filter_calibration_attempted)
+                self.assertFalse(simple_brush.batch_filter_calibration_in_progress)
+                self.assertFalse(simple_brush.stop_event)
+                if cancelled_index < 2:
+                    click.assert_not_called()
+                    close_panel.assert_not_called()
+                else:
+                    click.assert_called_once_with(regions[1])
+                    close_panel.assert_called_once_with()
+
+    def test_batch_filter_calibration_exception_before_open_does_not_press_escape(self):
+        simple_brush.batch_filter_calibration_requested = True
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=RuntimeError("overlay failed"),
+            ),
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(
+                simple_brush,
+                "close_batch_filter_panel_after_calibration",
+            ) as close_panel,
+            patch.object(simple_brush.logger, "exception") as log_exception,
+        ):
+            result = simple_brush.ensure_batch_filter_regions_calibrated()
+
+        self.assertIsNone(result)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+        click.assert_not_called()
+        close_panel.assert_not_called()
+        log_exception.assert_called_once()
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_batch_filter_calibration_wait_interruption_closes_and_falls_back(self):
+        first = simple_brush.ScreenRegion(10, 20, 24, 24)
+        open_filter = simple_brush.ScreenRegion(30, 40, 12, 12)
+        simple_brush.batch_filter_calibration_requested = True
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=[first, open_filter],
+            ),
+            patch.object(simple_brush, "click_in_region") as click,
+            patch.object(simple_brush, "human_delay", return_value=False),
+            patch.object(
+                simple_brush,
+                "close_batch_filter_panel_after_calibration",
+            ) as close_panel,
+        ):
+            result = simple_brush.ensure_batch_filter_regions_calibrated()
+
+        self.assertIsNone(result)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+        click.assert_called_once_with(open_filter)
+        close_panel.assert_called_once_with()
+
+    def test_batch_filter_calibration_close_failure_prevents_publish(self):
+        regions = [
+            simple_brush.ScreenRegion(index * 10, index * 20, 24, 24)
+            for index in range(1, 5)
+        ]
+        simple_brush.batch_filter_calibration_requested = True
+        with (
+            patch.object(simple_brush, "select_screen_region", side_effect=regions),
+            patch.object(simple_brush, "click_in_region"),
+            patch.object(simple_brush, "human_delay", return_value=True),
+            patch.object(
+                simple_brush,
+                "close_batch_filter_panel_after_calibration",
+                side_effect=RuntimeError("escape failed"),
+            ) as close_panel,
+        ):
+            result = simple_brush.ensure_batch_filter_regions_calibrated()
+
+        self.assertIsNone(result)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+        close_panel.assert_called_once_with()
+
+    def test_batch_filter_calibration_is_only_attempted_once(self):
+        simple_brush.batch_filter_calibration_requested = True
+        with patch.object(
+            simple_brush,
+            "select_screen_region",
+            side_effect=simple_brush.CalibrationCancelled(),
+        ) as select:
+            self.assertIsNone(simple_brush.ensure_batch_filter_regions_calibrated())
+            self.assertIsNone(simple_brush.ensure_batch_filter_regions_calibrated())
+        select.assert_called_once()
+        self.assertTrue(simple_brush.batch_filter_calibration_attempted)
+
+    def test_batch_filter_calibration_escape_does_not_stop_browsing(self):
+        simple_brush.batch_filter_calibration_in_progress = True
+        result = simple_brush.on_press(simple_brush.keyboard.Key.esc)
+        self.assertTrue(result)
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_batch_filter_panel_close_uses_programmatic_escape(self):
+        with patch.object(simple_brush.pyautogui, "press") as press:
+            simple_brush.close_batch_filter_panel_after_calibration()
+        press.assert_called_once_with("esc")
+        self.assertFalse(simple_brush._programmatic_esc)
+
     def test_random_focus_restore_point_uses_half_open_region_bounds(self):
         region = simple_brush.ScreenRegion(left=400, top=350, width=101, height=51)
         with patch.object(
@@ -623,6 +827,16 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.focus_restore_calibration_requested = True
         simple_brush.focus_restore_calibration_attempted = True
         simple_brush.focus_restore_calibration_in_progress = True
+        simple_brush.batch_filter_regions = simple_brush.BatchFilterRegions(
+            first_candidate=simple_brush.ScreenRegion(1, 2, 20, 20),
+            open_filter=simple_brush.ScreenRegion(3, 4, 12, 12),
+            unseen_filter=simple_brush.ScreenRegion(5, 6, 12, 12),
+            confirm_filter=simple_brush.ScreenRegion(7, 8, 12, 12),
+        )
+        simple_brush.batch_filter_calibration_requested = True
+        simple_brush.batch_filter_calibration_attempted = True
+        simple_brush.batch_filter_calibration_in_progress = True
+        simple_brush.batch_filter_enabled = True
         with patch.object(
             simple_brush.sys,
             "argv",
@@ -643,6 +857,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertFalse(simple_brush.forward_click_calibration_requested)
         self.assertFalse(simple_brush.forward_click_calibration_attempted)
         self.assertFalse(simple_brush.forward_click_calibration_in_progress)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+        self.assertFalse(simple_brush.batch_filter_calibration_attempted)
+        self.assertFalse(simple_brush.batch_filter_calibration_in_progress)
+        self.assertFalse(simple_brush.batch_filter_enabled)
 
     def test_focus_restore_calibration_escape_does_not_stop_browsing(self):
         simple_brush.focus_restore_calibration_in_progress = True
@@ -677,6 +896,15 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertTrue(args["no_forward"])
         self.assertEqual(args["keywords"], "Python")
 
+    def test_no_batch_filter_argument_is_parsed(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--no-batch-filter"],
+        ):
+            args = simple_brush.parse_args()
+        self.assertTrue(args["no_batch_filter"])
+
     def test_duration_argument_is_parsed(self):
         with patch.object(
             simple_brush.sys,
@@ -707,7 +935,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                     simple_brush.parse_duration_seconds(value)
 
     def test_interactive_duration_retries_invalid_input(self):
-        with patch("builtins.input", side_effect=["", "invalid", "3"]):
+        with patch("builtins.input", side_effect=["", "n", "invalid", "3"]):
             simple_brush.get_user_input()
         self.assertEqual(simple_brush.run_duration_seconds, 3)
 
@@ -763,7 +991,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_keyword_rules_retry_invalid_input(self):
         with patch(
             "builtins.input",
-            side_effect=["Python", '"Python" or "短剧"', "n", ""],
+            side_effect=["Python", '"Python" or "短剧"', "n", "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertEqual(
@@ -778,6 +1006,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 'not "销售"',
                 '"短剧" and not "销售"',
                 "n",
+                "n",
                 "",
             ],
         ):
@@ -790,7 +1019,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_mode_can_request_focus_restore_calibration(self):
         with patch(
             "builtins.input",
-            side_effect=['"Python"', "y", ""],
+            side_effect=['"Python"', "y", "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertTrue(simple_brush.focus_restore_calibration_requested)
@@ -799,7 +1028,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_mode_defaults_to_focus_restore_region_fallback(self):
         with patch(
             "builtins.input",
-            side_effect=['"Python"', "", ""],
+            side_effect=['"Python"', "", "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
@@ -808,18 +1037,41 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_auto_mode_never_prompts_for_focus_restore_calibration(self):
         simple_brush.focus_restore_calibration_requested = True
         simple_brush.forward_click_calibration_requested = True
+        simple_brush.batch_filter_calibration_requested = True
         with patch("builtins.input") as user_input:
             simple_brush.get_user_input(keywords_str='"Python"', auto=True)
         user_input.assert_not_called()
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
         self.assertFalse(simple_brush.forward_click_calibration_requested)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
 
     def test_interactive_mode_without_keywords_does_not_offer_forward_calibration(self):
-        with patch("builtins.input", side_effect=["", ""]) as user_input:
+        with patch("builtins.input", side_effect=["", "n", ""]) as user_input:
             simple_brush.get_user_input(no_forward=True)
-        self.assertEqual(user_input.call_count, 2)
+        self.assertEqual(user_input.call_count, 3)
         self.assertFalse(simple_brush.forward_click_calibration_requested)
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
+
+    def test_no_keywords_and_no_forward_can_request_batch_filter_calibration(self):
+        with patch("builtins.input", side_effect=["", "y", ""]):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertTrue(simple_brush.batch_filter_calibration_requested)
+
+    def test_no_batch_filter_skips_prompt_in_interactive_mode(self):
+        with patch("builtins.input", side_effect=["", ""]) as user_input:
+            simple_brush.get_user_input(
+                no_forward=True,
+                no_batch_filter=True,
+            )
+        self.assertEqual(user_input.call_count, 2)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+
+    def test_cli_keywords_noninteractive_mode_never_prompts_for_batch_filter(self):
+        simple_brush.batch_filter_calibration_requested = True
+        with patch("builtins.input") as user_input:
+            simple_brush.get_user_input(keywords_str='"Python"')
+        user_input.assert_not_called()
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
 
     def test_run_calibrates_after_first_detail_opens_before_viewing(self):
         events = []
