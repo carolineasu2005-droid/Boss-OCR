@@ -24,10 +24,21 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-import win32gui
-import win32con
-import win32clipboard
-import win32process
+
+IS_WINDOWS = sys.platform == 'win32'
+IS_MACOS = sys.platform == 'darwin'
+
+if IS_WINDOWS:
+    import win32clipboard
+    import win32con
+    import win32gui
+    import win32process
+else:
+    win32clipboard = None
+    win32con = None
+    win32gui = None
+    win32process = None
+
 import pyautogui
 from pynput import keyboard
 
@@ -416,8 +427,14 @@ def get_user_input(
 
 # ─── 窗口操作 ───────────────────────────────────────
 
+def require_windows_window_api():
+    """Fail clearly when a Windows-only window API is used elsewhere."""
+    if not IS_WINDOWS:
+        raise RuntimeError('此功能依赖 Windows 窗口 API，当前平台尚未支持')
+
 def get_window_process_name(hwnd):
     """Return the executable name for a top-level Windows window."""
+    require_windows_window_api()
     handle = None
     try:
         _, process_id = win32process.GetWindowThreadProcessId(hwnd)
@@ -445,6 +462,10 @@ def is_boss_edge_window(title, process_name):
 
 def bring_edge_foreground():
     """将 BOSS 直聘 Edge 窗口置顶"""
+    if not IS_WINDOWS:
+        logger.error('❌ 当前平台不支持 Windows Edge 窗口置顶')
+        return False
+
     result = []
 
     def cb(hwnd, _):
@@ -661,6 +682,9 @@ def click_in_region(region):
 
 def get_clipboard_text():
     """读取剪贴板文本（CF_UNICODETEXT）。失败返回空字符串。"""
+    if not IS_WINDOWS:
+        return ""
+
     try:
         win32clipboard.OpenClipboard()
         if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
