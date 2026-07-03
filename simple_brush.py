@@ -151,6 +151,19 @@ class BatchFilterRegions:
     confirm_filter: ScreenRegion
 
 
+@dataclass(frozen=True)
+class BrowserPrepareResult:
+    """Structured result for the platform-specific browser preparation step."""
+
+    ready: bool
+    platform: str
+    browser: str
+    launched: bool = False
+    executable_path: str = ''
+    message: str = ''
+    error_code: str = ''
+
+
 def region_around(x, y, radius):
     """Return the inclusive +/- radius around a point as a ScreenRegion."""
     if radius < 0:
@@ -500,6 +513,38 @@ def bring_edge_foreground():
 
 
 # ─── 基础工具 ───────────────────────────────────────
+
+def prepare_browser(platform_name=None):
+    """Prepare the supported browser without leaking platform details to run()."""
+    current_platform = sys.platform if platform_name is None else platform_name
+
+    if current_platform == 'win32':
+        ready = bring_edge_foreground()
+        return BrowserPrepareResult(
+            ready=ready,
+            platform='windows',
+            browser='edge',
+            message='' if ready else '未能准备 Windows Edge 窗口',
+            error_code='' if ready else 'EDGE_PREPARE_FAILED',
+        )
+
+    if current_platform == 'darwin':
+        return BrowserPrepareResult(
+            ready=False,
+            platform='macos',
+            browser='chrome',
+            message='macOS Chrome 准备功能尚未实现',
+            error_code='MACOS_BROWSER_NOT_IMPLEMENTED',
+        )
+
+    return BrowserPrepareResult(
+        ready=False,
+        platform=current_platform,
+        browser='',
+        message=f'不支持的运行平台: {current_platform}',
+        error_code='UNSUPPORTED_PLATFORM',
+    )
+
 
 def safe_wait(seconds):
     """等待指定秒数，期间响应暂停/停止"""
@@ -1412,7 +1457,13 @@ def run():
         logger.info('转发: 已禁用')
     logger.info('=' * 50)
 
-    if not bring_edge_foreground():
+    browser_result = prepare_browser()
+    if not browser_result.ready:
+        logger.error(
+            '❌ 浏览器准备失败 [%s]: %s',
+            browser_result.error_code,
+            browser_result.message,
+        )
         return 0
 
     run_timer = None

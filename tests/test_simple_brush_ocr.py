@@ -5,6 +5,13 @@ import simple_brush
 from ocr_detector import DetectionResult, ScanObservation
 
 
+WINDOWS_BROWSER_READY = simple_brush.BrowserPrepareResult(
+    ready=True,
+    platform="windows",
+    browser="edge",
+)
+
+
 class SimpleBrushOCRTests(unittest.TestCase):
     def setUp(self):
         self.saved = {
@@ -1215,7 +1222,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush, "initialize_ocr"),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(simple_brush, "safe_wait", return_value=True),
             patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
             patch.object(simple_brush, "click_first_candidate", side_effect=open_detail),
@@ -1270,7 +1281,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush, "initialize_ocr"),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(simple_brush, "safe_wait", return_value=True),
             patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
             patch.object(simple_brush, "click_first_candidate", return_value=False),
@@ -1333,7 +1348,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush, "initialize_ocr"),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(
                 simple_brush,
                 "ensure_batch_filter_regions_calibrated",
@@ -1425,7 +1444,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush, "initialize_ocr"),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(
                 simple_brush,
                 "ensure_batch_filter_regions_calibrated",
@@ -1495,7 +1518,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush, "initialize_ocr"),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(
                 simple_brush,
                 "ensure_batch_filter_regions_calibrated",
@@ -1610,7 +1637,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             }),
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(
                 simple_brush,
                 "apply_batch_filter_and_open_first_candidate",
@@ -1662,7 +1693,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             }),
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(
                 simple_brush,
                 "apply_batch_filter_and_open_first_candidate",
@@ -1703,7 +1738,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             }),
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(
                 simple_brush,
                 "apply_batch_filter_and_open_first_candidate",
@@ -1736,7 +1775,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
             }),
             patch.object(simple_brush, "get_user_input", side_effect=configure_input),
             patch.object(simple_brush.listener, "start"),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(simple_brush, "safe_wait", return_value=True),
             patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
             patch.object(
@@ -1779,7 +1822,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "argv",
                 ["simple_brush.py", "--duration-seconds", "5", "--auto"],
             ),
-            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                return_value=WINDOWS_BROWSER_READY,
+            ),
             patch.object(simple_brush, "start_run_timer") as start_timer,
             patch.object(simple_brush, "safe_wait", return_value=False),
             patch.object(simple_brush.listener, "start"),
