@@ -25,6 +25,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 IS_WINDOWS = sys.platform == 'win32'
 IS_MACOS = sys.platform == 'darwin'
@@ -178,6 +179,11 @@ class BrowserPrepareResult:
     executable_path: str = ''
     message: str = ''
     error_code: str = ''
+    focus_frontmost: bool | None = None
+    page_url: str | None = None
+    page_title: str | None = None
+    page_allowed: bool | None = None
+    page_error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,6 +219,40 @@ class MacOSChromeTabIdentity:
     title: str = ''
     message: str = ''
     error_code: str = ''
+
+
+def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
+    """Return whether a URL passes the conservative BOSS page identity gate.
+
+    The title is intentionally not used for authorization: it may be empty, and
+    a BOSS-looking title cannot make an untrusted URL safe. Passing this gate is
+    only a read-only identity check and does not make business actions ready.
+    """
+    del title
+    if not isinstance(url, str) or not url or url != url.strip():
+        return False
+
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+
+    if parsed.scheme != 'https' or parsed.hostname != 'www.zhipin.com':
+        return False
+    # Require the exact authority too: reject credentials, explicit ports, and
+    # lookalike authorities even when ``hostname`` happens to parse safely.
+    if parsed.netloc != 'www.zhipin.com' or port is not None:
+        return False
+
+    allowed_prefixes = (
+        '/web/',
+        '/geek/',
+        '/job_detail/',
+        '/chat/',
+        '/boss/',
+    )
+    return parsed.path == '/' or parsed.path.startswith(allowed_prefixes)
 
 
 def region_around(x, y, radius):
@@ -598,16 +638,56 @@ def prepare_browser(platform_name=None):
                 message=f'macOS 权限诊断失败: {exc}。{MACOS_PERMISSION_GUIDANCE}',
                 error_code='MACOS_PERMISSION_CHECK_FAILED',
             )
-        if not permissions.ready:
+
+        focus = focus_chrome_window()
+        if not focus.frontmost:
             return BrowserPrepareResult(
                 ready=False,
                 platform='macos',
                 browser='chrome',
                 launched=True,
                 executable_path=launched.executable_path,
-                message=permissions.message,
-                error_code='MACOS_PERMISSIONS_NOT_READY',
+                message=f'{permissions.message} {focus.message}',
+                error_code=focus.error_code,
+                focus_frontmost=False,
             )
+
+        tab = get_chrome_active_tab_identity()
+        if tab.error_code:
+            return BrowserPrepareResult(
+                ready=False,
+                platform='macos',
+                browser='chrome',
+                launched=True,
+                executable_path=launched.executable_path,
+                message=f'{permissions.message} {focus.message}。{tab.message}',
+                error_code=tab.error_code,
+                focus_frontmost=True,
+                page_url=tab.url or None,
+                page_title=tab.title or None,
+                page_error_code=tab.error_code,
+            )
+
+        page_allowed = is_allowed_boss_page(tab.url, tab.title)
+        if not page_allowed:
+            return BrowserPrepareResult(
+                ready=False,
+                platform='macos',
+                browser='chrome',
+                launched=True,
+                executable_path=launched.executable_path,
+                message=(
+                    f'{permissions.message} {focus.message}。active tab 页面不在 '
+                    'BOSS 身份白名单中；不放行业务动作。'
+                ),
+                error_code='MACOS_PAGE_NOT_ALLOWED',
+                focus_frontmost=True,
+                page_url=tab.url,
+                page_title=tab.title,
+                page_allowed=False,
+                page_error_code='MACOS_PAGE_NOT_ALLOWED',
+            )
+
         return BrowserPrepareResult(
             ready=False,
             platform='macos',
@@ -615,9 +695,15 @@ def prepare_browser(platform_name=None):
             launched=True,
             executable_path=launched.executable_path,
             message=(
-                f'{permissions.message} Chrome 窗口和页面尚未验证为可操作。'
+                f'{permissions.message} {focus.message}。active tab 页面身份允许，'
+                '但 Retina 坐标、校准、OCR 与真实业务动作尚未完成；不放行业务动作。'
             ),
-            error_code='MACOS_BROWSER_STARTED_NOT_READY',
+            error_code='MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY',
+            focus_frontmost=True,
+            page_url=tab.url,
+            page_title=tab.title,
+            page_allowed=True,
+            page_error_code='MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY',
         )
 
     return BrowserPrepareResult(
@@ -929,11 +1015,17 @@ def run_preflight_only(_cli_args=None):
     print(f'  browser: {result.browser or "unsupported"}')
     print(f'  launched: {result.launched}')
     print(f'  ready: {result.ready}')
+    print(f'  focus_frontmost: {result.focus_frontmost}')
+    print(f'  page_url: {result.page_url or "none"}')
+    print(f'  page_title: {result.page_title or "none"}')
+    print(f'  page_allowed: {result.page_allowed}')
+    print(f'  page_error_code: {result.page_error_code or "none"}')
     print(f'  error_code: {result.error_code or "none"}')
     print(f'  message: {result.message or "none"}')
     print(
-        '  note: preflight does not validate window focus, page identity, '
-        'Retina coordinates, calibration, or real business safety.'
+        '  note: preflight diagnoses window focus and page identity, but does not '
+        'validate Retina coordinates, calibration, OCR, forwarding, or real '
+        'business safety.'
     )
     return 0
 
