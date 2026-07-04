@@ -4899,6 +4899,318 @@ class MacForwardActionTests(unittest.TestCase):
         click_fn.assert_not_called()
 
 
+class MacSingleCandidateForwardSmokeTests(unittest.TestCase):
+    def parse(self, *args):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", *args],
+        ):
+            return simple_brush.parse_args()
+
+    def valid_args(self, **overrides):
+        values = self.parse(
+            "--mac-single-candidate-forward-smoke",
+            "--allow-test-forward-submit",
+            "--forwarding-email",
+            "test@example.com",
+        )
+        values.update(overrides)
+        return values
+
+    def test_parse_args_recognizes_single_candidate_forward_smoke_flags(self):
+        defaults = self.parse()
+        parsed = self.parse(
+            "--mac-single-candidate-forward-smoke",
+            "--allow-test-forward-submit",
+            "--forwarding-email",
+            "test@example.com",
+        )
+
+        self.assertFalse(defaults["mac_single_candidate_forward_smoke"])
+        self.assertFalse(defaults["allow_test_forward_submit"])
+        self.assertEqual(defaults["forwarding_email"], "")
+        self.assertTrue(parsed["mac_single_candidate_forward_smoke"])
+        self.assertTrue(parsed["allow_test_forward_submit"])
+        self.assertEqual(parsed["forwarding_email"], "test@example.com")
+
+    def test_build_single_candidate_forward_smoke_config_rejects_invalid_inputs(self):
+        cases = (
+            (
+                "MAC_SINGLE_CANDIDATE_FORWARD_SMOKE_UNSUPPORTED_PLATFORM",
+                self.valid_args(),
+                "win32",
+            ),
+            (
+                "MAC_SINGLE_CANDIDATE_FORWARD_EMAIL_REQUIRED",
+                self.valid_args(forwarding_email=""),
+                "darwin",
+            ),
+            (
+                "MAC_SINGLE_CANDIDATE_FORWARD_SUBMIT_CONFIRMATION_FLAG_REQUIRED",
+                self.valid_args(allow_test_forward_submit=False),
+                "darwin",
+            ),
+            (
+                "MAC_SINGLE_CANDIDATE_FORWARD_EMAIL_INVALID",
+                self.valid_args(forwarding_email="invalid"),
+                "darwin",
+            ),
+            (
+                "MAC_SINGLE_CANDIDATE_FORWARD_LIMIT_INVALID",
+                self.valid_args(max_candidates=2),
+                "darwin",
+            ),
+            (
+                "MAC_SINGLE_CANDIDATE_FORWARD_NO_FORWARD_CONFLICT",
+                self.valid_args(no_forward=True),
+                "darwin",
+            ),
+        )
+        for expected_code, args, platform_name in cases:
+            with self.subTest(expected_code=expected_code):
+                with self.assertRaises(simple_brush.MacSafeBrowseArgumentError) as caught:
+                    simple_brush.build_mac_single_candidate_forward_smoke_config(
+                        args,
+                        platform_name=platform_name,
+                    )
+                self.assertEqual(caught.exception.error_code, expected_code)
+
+    def test_parse_args_rejects_single_candidate_forward_smoke_conflicts(self):
+        for conflicting_flag in (
+            "--auto",
+            "--preflight-only",
+            "--coordinate-diagnostics-only",
+            "--mac-safe-browse-only",
+            "--mac-forward-ui-smoke-only",
+            "--mac-safe-browse-calibrate-only",
+            "--mac-safe-browse-calibrate-and-dry-run",
+        ):
+            with self.subTest(conflicting_flag=conflicting_flag):
+                with self.assertRaises(simple_brush.MacSafeBrowseArgumentError) as caught:
+                    self.parse(
+                        "--mac-single-candidate-forward-smoke",
+                        "--allow-test-forward-submit",
+                        "--forwarding-email",
+                        "test@example.com",
+                        conflicting_flag,
+                    )
+                expected_code = (
+                    "MAC_FORWARD_UI_SMOKE_CONFLICTING_MODE"
+                    if conflicting_flag == "--mac-forward-ui-smoke-only"
+                    else "MAC_SINGLE_CANDIDATE_FORWARD_SMOKE_CONFLICTING_MODE"
+                )
+                self.assertEqual(caught.exception.error_code, expected_code)
+        with self.assertRaises(simple_brush.MacSafeBrowseArgumentError) as caught:
+            self.parse("--allow-test-forward-submit")
+        self.assertEqual(
+            caught.exception.error_code,
+            "MAC_SINGLE_CANDIDATE_FORWARD_SUBMIT_CONFLICTING_MODE",
+        )
+
+    def test_single_candidate_forward_smoke_submit_requires_phrase_and_stops(self):
+        click_fn = Mock()
+        typewrite_fn = Mock()
+        focus_fn = Mock(return_value=True)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_single_candidate_forward_smoke_only(
+                self.valid_args(),
+                focus_fn=focus_fn,
+                click_fn=click_fn,
+                typewrite_fn=typewrite_fn,
+                position_fn=Mock(side_effect=[(10, 20), (30, 40), (50, 60)]),
+                confirm_fn=Mock(side_effect=["YES", "YES", "YES"]),
+                submit_confirm_fn=Mock(return_value="NOPE"),
+                sleep_fn=Mock(),
+                now_fn=Mock(side_effect=[100.0, 101.0, 102.0, 103.0, 104.0]),
+            )
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("submit_test_forward_attempted: False", rendered)
+        self.assertIn(
+            "submit_test_forward_error_code: MAC_FORWARD_UI_SMOKE_CONFIRMATION_REQUIRED",
+            rendered,
+        )
+        self.assertIn("forwarding_submit_attempted: False", rendered)
+        self.assertNotIn("test@example.com", rendered)
+        click_fn.assert_has_calls(
+            [
+                unittest.mock.call(10, 20),
+                unittest.mock.call(30, 40),
+            ]
+        )
+        self.assertEqual(click_fn.call_count, 2)
+        typewrite_fn.assert_called_once_with("test@example.com", interval=0.03)
+
+    def test_single_candidate_forward_smoke_success_attempts_submit_once_without_loop(self):
+        blocked_names = (
+            "initialize_ocr",
+            "forward_one_candidate",
+            "run_mac_forward_ui_smoke_only",
+            "run_mac_safe_browse_only",
+            "run_mac_safe_browse_calibration_only",
+            "run_mac_safe_browse_calibrate_and_dry_run",
+            "prepare_browser",
+            "OCRKeywordDetector",
+            "next_candidate",
+            "refresh_page",
+            "human_scroll_once",
+        )
+        click_fn = Mock()
+        typewrite_fn = Mock()
+        focus_fn = Mock(
+            return_value=simple_brush.MacOSChromeFocusResult(
+                platform="macos",
+                browser="chrome",
+                activated=True,
+                frontmost=True,
+                message="frontmost",
+            )
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            result = simple_brush.run_mac_single_candidate_forward_smoke_only(
+                self.valid_args(),
+                focus_fn=focus_fn,
+                click_fn=click_fn,
+                typewrite_fn=typewrite_fn,
+                position_fn=Mock(
+                    side_effect=[(10, 20), (30, 40), (50, 60), (70, 80)]
+                ),
+                confirm_fn=Mock(side_effect=["YES", "YES", "YES", "YES"]),
+                submit_confirm_fn=Mock(return_value="SEND TEST EMAIL"),
+                sleep_fn=Mock(),
+                now_fn=Mock(side_effect=[100.0, 101.0, 102.0, 103.0, 104.0, 105.0]),
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("submit_test_forward_attempted: True", rendered)
+        self.assertIn("submit_test_forward_count: 1", rendered)
+        self.assertIn("close_forward_modal_attempted: True", rendered)
+        self.assertIn("stopped_after_single_candidate: True", rendered)
+        self.assertIn("forwarding_submit_attempted: True", rendered)
+        self.assertIn("forwarding_success_verified: False", rendered)
+        self.assertIn("t***t@example.com", rendered)
+        self.assertNotIn("test@example.com", rendered.replace("t***t@example.com", ""))
+        click_fn.assert_has_calls(
+            [
+                unittest.mock.call(10, 20),
+                unittest.mock.call(30, 40),
+                unittest.mock.call(50, 60),
+                unittest.mock.call(70, 80),
+            ]
+        )
+        self.assertEqual(click_fn.call_count, 4)
+        typewrite_fn.assert_called_once_with("test@example.com", interval=0.03)
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_single_candidate_forward_smoke_not_frontmost_or_position_failure_skips_submit(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_single_candidate_forward_smoke_only(
+                self.valid_args(),
+                focus_fn=Mock(
+                    return_value=simple_brush.MacOSChromeFocusResult(
+                        platform="macos",
+                        browser="chrome",
+                        activated=True,
+                        frontmost=False,
+                        message="not frontmost",
+                    )
+                ),
+                click_fn=Mock(),
+                typewrite_fn=Mock(),
+                position_fn=Mock(return_value=(10, 20)),
+                confirm_fn=Mock(side_effect=["YES"]),
+                submit_confirm_fn=Mock(return_value="SEND TEST EMAIL"),
+                sleep_fn=Mock(),
+                now_fn=Mock(side_effect=[100.0, 101.0]),
+            )
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn(
+            "MAC_SINGLE_CANDIDATE_FORWARD_CHROME_NOT_FRONTMOST",
+            rendered,
+        )
+
+        click_fn = Mock()
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_single_candidate_forward_smoke_only(
+                self.valid_args(),
+                focus_fn=Mock(return_value=True),
+                click_fn=click_fn,
+                typewrite_fn=Mock(),
+                position_fn=Mock(side_effect=RuntimeError("position failed")),
+                confirm_fn=Mock(side_effect=["YES"]),
+                submit_confirm_fn=Mock(return_value="SEND TEST EMAIL"),
+                sleep_fn=Mock(),
+                now_fn=Mock(side_effect=[100.0, 101.0]),
+            )
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("MAC_FORWARD_UI_SMOKE_POINT_UNAVAILABLE", rendered)
+        click_fn.assert_not_called()
+
+    def test_run_dispatches_single_candidate_forward_smoke_before_normal_flow(self):
+        argv = [
+            "simple_brush.py",
+            "--mac-single-candidate-forward-smoke",
+            "--allow-test-forward-submit",
+            "--forwarding-email",
+            "test@example.com",
+        ]
+        with (
+            patch.object(simple_brush.sys, "argv", argv),
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(
+                simple_brush,
+                "run_mac_single_candidate_forward_smoke_only",
+                return_value=2,
+            ) as smoke_run,
+            patch.object(simple_brush, "get_user_input") as get_user_input,
+            patch.object(simple_brush, "prepare_browser") as prepare_browser,
+            patch.object(simple_brush.listener, "start") as listener_start,
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 2)
+        smoke_run.assert_called_once()
+        get_user_input.assert_not_called()
+        prepare_browser.assert_not_called()
+        listener_start.assert_not_called()
+
+
 class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
     def make_metadata(self, **overrides):
         values = {
