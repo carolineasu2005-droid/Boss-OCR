@@ -2890,6 +2890,36 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
             "MAC_SAFE_BROWSE_OPEN_CANDIDATE_CONFLICTING_MODE",
         )
 
+    def test_candidate_open_point_requires_explicit_yes(self):
+        with self.assertRaises(simple_brush.MacSafeBrowseRuntimeError) as caught:
+            simple_brush.get_mac_safe_browse_candidate_open_point(
+                confirm_fn=Mock(return_value="NO"),
+                position_fn=Mock(return_value=(10, 20)),
+            )
+        self.assertEqual(
+            caught.exception.error_code,
+            "MAC_SAFE_BROWSE_CANDIDATE_OPEN_CONFIRMATION_REQUIRED",
+        )
+
+    def test_candidate_open_point_returns_current_mouse_coordinates(self):
+        point = simple_brush.get_mac_safe_browse_candidate_open_point(
+            confirm_fn=Mock(return_value="YES"),
+            position_fn=Mock(return_value=SimpleNamespace(x=123, y=456)),
+        )
+
+        self.assertEqual(point, (123, 456))
+
+    def test_candidate_open_point_position_failure_is_fail_closed(self):
+        with self.assertRaises(simple_brush.MacSafeBrowseRuntimeError) as caught:
+            simple_brush.get_mac_safe_browse_candidate_open_point(
+                confirm_fn=Mock(return_value="YES"),
+                position_fn=Mock(side_effect=RuntimeError("pos boom")),
+            )
+        self.assertEqual(
+            caught.exception.error_code,
+            "MAC_SAFE_BROWSE_CANDIDATE_OPEN_POINT_UNAVAILABLE",
+        )
+
     def test_config_rejects_platform_no_forward_email_and_missing_limits(self):
         self.assert_argument_error(
             "MAC_SAFE_BROWSE_UNSUPPORTED_PLATFORM",
@@ -3442,6 +3472,197 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         for name, mocked in blocked.items():
             with self.subTest(blocked_action=name):
                 mocked.assert_not_called()
+
+    def test_open_candidate_once_default_path_reads_point_and_clicks_once(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        captured = self.capture_image(width=600, height=400)
+        blocked_names = (
+            "prepare_browser",
+            "run_mac_safe_browse_only",
+            "initialize_ocr",
+            "ensure_ocr_region_calibrated",
+            "save_region_preview",
+            "view_candidate",
+            "apply_batch_filter_and_open_first_candidate",
+            "human_scroll_once",
+            "next_candidate",
+            "refresh_page",
+            "forward_one_candidate",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+        )
+        pyautogui_names = (
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        class CaptureStub:
+            def capture(self, selected_region):
+                self.selected_region = selected_region
+                return captured
+
+        capture_instance = CaptureStub()
+        capture_factory = Mock(return_value=capture_instance)
+        click_first_candidate = Mock(return_value=True)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            stack.enter_context(
+                patch.object(simple_brush, "ocr_calibrated_region", None)
+            )
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["OCRKeywordDetector"] = stack.enter_context(
+                patch.object(simple_brush, "OCRKeywordDetector")
+            )
+            blocked["OCRKeywordDetector.detect"] = stack.enter_context(
+                patch.object(simple_brush.OCRKeywordDetector, "detect")
+            )
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked["click_first_candidate"] = stack.enter_context(
+                patch.object(simple_brush, "click_first_candidate", click_first_candidate)
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                self.valid_args(
+                    mac_safe_browse_real_capture_once=True,
+                    mac_safe_browse_open_candidate_once=True,
+                ),
+                diagnostics_fn=Mock(return_value=self.diagnostics()),
+                select_region_fn=Mock(return_value=region),
+                capture_fn=Mock(return_value=captured),
+                save_crop_preview_fn=Mock(
+                    return_value=simple_brush.CropPreviewResult(
+                        saved=True,
+                        preview_path=(
+                            "logs/macos-coordinate-diagnostics/mock/"
+                            "crop_preview.png"
+                        ),
+                        crop_size=(600, 400),
+                        message="saved",
+                    )
+                ),
+                confirmation_fn=Mock(return_value="YES"),
+                preview_dir="logs/macos-coordinate-diagnostics/mock",
+                real_capture_focus_fn=Mock(return_value=True),
+                real_capture_factory=capture_factory,
+                candidate_open_confirm_fn=Mock(return_value="YES"),
+                candidate_open_position_fn=Mock(
+                    return_value=SimpleNamespace(x=321, y=654)
+                ),
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(capture_instance.selected_region, region)
+        self.assertIn("candidate_open_enabled: True", rendered)
+        self.assertIn("candidate_open_count: 1", rendered)
+        self.assertIn("candidate_opened: True", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_BROWSE_LOOP_NOT_IMPLEMENTED", rendered)
+        click_first_candidate.assert_called_once_with(321, 654)
+        for name, mocked in blocked.items():
+            if name == "click_first_candidate":
+                continue
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_open_candidate_once_default_path_confirmation_or_click_failure_fails_closed(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        base_kwargs = {
+            "diagnostics_fn": Mock(return_value=self.diagnostics()),
+            "select_region_fn": Mock(return_value=region),
+            "capture_fn": Mock(return_value=self.capture_image(width=600, height=400)),
+            "save_crop_preview_fn": Mock(
+                return_value=simple_brush.CropPreviewResult(
+                    saved=True,
+                    preview_path=(
+                        "logs/macos-coordinate-diagnostics/mock/crop_preview.png"
+                    ),
+                    crop_size=(600, 400),
+                    message="saved",
+                )
+            ),
+            "confirmation_fn": Mock(return_value="YES"),
+            "preview_dir": "logs/macos-coordinate-diagnostics/mock",
+            "real_capture_focus_fn": Mock(return_value=True),
+            "real_capture_factory": Mock(
+                return_value=type(
+                    "CaptureStub",
+                    (),
+                    {"capture": lambda self, _region: self.capture_image},
+                )()
+            ),
+            "candidate_open_position_fn": Mock(return_value=(50, 60)),
+        }
+        base_kwargs["real_capture_factory"].return_value.capture_image = self.capture_image(
+            width=600,
+            height=400,
+        )
+
+        cases = (
+            (
+                Mock(return_value="NO"),
+                Mock(return_value=True),
+                "MAC_SAFE_BROWSE_CANDIDATE_OPEN_CONFIRMATION_REQUIRED",
+                False,
+            ),
+            (
+                Mock(return_value="YES"),
+                Mock(side_effect=RuntimeError("click boom")),
+                "MAC_SAFE_BROWSE_CANDIDATE_OPEN_FAILED",
+                True,
+            ),
+        )
+        for confirm_fn, click_mock, expected_code, should_call_click in cases:
+            with self.subTest(expected_code=expected_code):
+                with (
+                    patch.object(simple_brush.sys, "platform", "darwin"),
+                    patch.object(simple_brush, "ocr_calibrated_region", None),
+                    patch.object(simple_brush, "click_first_candidate", click_mock),
+                    patch("builtins.print") as print_output,
+                ):
+                    result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                        self.valid_args(
+                            mac_safe_browse_real_capture_once=True,
+                            mac_safe_browse_open_candidate_once=True,
+                        ),
+                        candidate_open_confirm_fn=confirm_fn,
+                        **base_kwargs,
+                    )
+
+                rendered = "\n".join(
+                    " ".join(str(item) for item in entry.args)
+                    for entry in print_output.call_args_list
+                )
+                self.assertEqual(result, 2)
+                self.assertIn("dry_pipeline_completed: False", rendered)
+                self.assertIn(expected_code, rendered)
+                if should_call_click:
+                    click_mock.assert_called_once_with(50, 60)
+                else:
+                    click_mock.assert_not_called()
 
     def test_open_candidate_once_false_or_exception_fails_closed(self):
         region = simple_brush.ScreenRegion(10, 20, 300, 200)

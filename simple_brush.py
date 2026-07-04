@@ -76,6 +76,14 @@ class MacSafeBrowseArgumentError(ValueError):
         self.error_code = error_code
 
 
+class MacSafeBrowseRuntimeError(RuntimeError):
+    """Fail-closed runtime error for bounded macOS safe-browse helpers."""
+
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
 def _parse_mac_safe_browse_limit(raw_value, option_name):
     """Parse one bounded CLI limit without consulting runtime state."""
     value = str(raw_value).strip() if raw_value is not None else ''
@@ -1881,12 +1889,60 @@ def publish_mac_safe_browse_calibration(
     return result
 
 
+def get_mac_safe_browse_candidate_open_point(
+    confirm_fn=input,
+    position_fn=pyautogui.position,
+):
+    """Confirm one-shot browse intent and read the current candidate point."""
+    if not callable(confirm_fn):
+        raise TypeError('confirm_fn 必须可调用')
+    if not callable(position_fn):
+        raise TypeError('position_fn 必须可调用')
+
+    print('请把鼠标放到第一位候选人位置，确认只打开 1 位候选人；输入 YES 继续。')
+    response = str(confirm_fn()).strip()
+    if response != 'YES':
+        raise MacSafeBrowseRuntimeError(
+            'MAC_SAFE_BROWSE_CANDIDATE_OPEN_CONFIRMATION_REQUIRED',
+            'candidate_open 需要用户输入 YES 确认；未确认时 fail closed',
+        )
+
+    try:
+        point = position_fn()
+    except Exception as exc:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_SAFE_BROWSE_CANDIDATE_OPEN_POINT_UNAVAILABLE',
+            f'无法读取当前鼠标位置: {exc}',
+        ) from exc
+
+    x = getattr(point, 'x', None)
+    y = getattr(point, 'y', None)
+    if x is None or y is None:
+        try:
+            x, y = point
+        except Exception as exc:
+            raise MacSafeBrowseRuntimeError(
+                'MAC_SAFE_BROWSE_CANDIDATE_OPEN_POINT_UNAVAILABLE',
+                '当前鼠标位置缺少可用 x/y 坐标',
+            ) from exc
+
+    try:
+        return (int(x), int(y))
+    except Exception as exc:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_SAFE_BROWSE_CANDIDATE_OPEN_POINT_UNAVAILABLE',
+            f'当前鼠标位置无法转换为整数坐标: {exc}',
+        ) from exc
+
+
 def build_mac_safe_browse_real_action_fns(
     calibrated_region: CalibratedScreenRegion,
     *,
     focus_fn=None,
     capture_factory=None,
     candidate_open_fn=None,
+    candidate_open_confirm_fn=input,
+    candidate_open_position_fn=pyautogui.position,
     open_candidate_once=False,
 ):
     """Build bounded real actions without OCR, forwarding, or browse loops."""
@@ -1973,11 +2029,21 @@ def build_mac_safe_browse_real_action_fns(
         if not open_candidate_once:
             state['message'] = 'candidate_open 未启用'
             return True
-        opener = candidate_open_fn or click_first_candidate
         try:
-            succeeded = bool(opener())
+            if candidate_open_fn is None:
+                x, y = get_mac_safe_browse_candidate_open_point(
+                    confirm_fn=candidate_open_confirm_fn,
+                    position_fn=candidate_open_position_fn,
+                )
+                succeeded = bool(click_first_candidate(x, y))
+            else:
+                succeeded = bool(candidate_open_fn())
         except Exception as exc:
-            state['error_code'] = 'MAC_SAFE_BROWSE_CANDIDATE_OPEN_FAILED'
+            state['error_code'] = getattr(
+                exc,
+                'error_code',
+                'MAC_SAFE_BROWSE_CANDIDATE_OPEN_FAILED',
+            )
             state['message'] = f'candidate_open 执行异常: {exc}'
             return False
         if not succeeded:
@@ -3686,6 +3752,8 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     real_capture_focus_fn=None,
     real_capture_factory=None,
     candidate_open_fn=None,
+    candidate_open_confirm_fn=input,
+    candidate_open_position_fn=pyautogui.position,
 ) -> int:
     """Run same-process calibration, then the bounded browse-only trial plan."""
     try:
@@ -3749,6 +3817,8 @@ def run_mac_safe_browse_calibrate_and_dry_run(
                 focus_fn=real_capture_focus_fn,
                 capture_factory=real_capture_factory,
                 candidate_open_fn=candidate_open_fn,
+                candidate_open_confirm_fn=candidate_open_confirm_fn,
+                candidate_open_position_fn=candidate_open_position_fn,
                 open_candidate_once=open_candidate_enabled,
             )
         )
