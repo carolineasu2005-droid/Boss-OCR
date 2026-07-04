@@ -292,6 +292,17 @@ class TkToScreenshotMapping:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class CropPreviewResult:
+    """Structured result for local crop preview saving."""
+
+    saved: bool
+    preview_path: str | None
+    crop_size: tuple[int, int] | None
+    message: str
+    error_code: str | None = None
+
+
 def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
     """Return whether a URL passes the conservative BOSS page identity gate.
 
@@ -1198,6 +1209,106 @@ def map_tk_selection_to_screenshot_crop(
             'Tk selection 已映射为 screenshot pixel crop；'
             '仅表示纯坐标转换通过，不代表真实屏幕已验证'
         ),
+    )
+
+
+def crop_image_for_preview(image, crop):
+    """Return a detached crop preview from one provided NumPy image array."""
+    try:
+        import numpy as np
+    except ImportError:
+        return (False, None, 'CROP_PREVIEW_IMAGE_INVALID')
+
+    if not isinstance(image, np.ndarray):
+        return (False, None, 'CROP_PREVIEW_IMAGE_INVALID')
+    if image.ndim not in (2, 3):
+        return (False, None, 'CROP_PREVIEW_IMAGE_INVALID')
+    if image.ndim == 3 and image.shape[2] <= 0:
+        return (False, None, 'CROP_PREVIEW_IMAGE_INVALID')
+
+    if not isinstance(crop, ScreenshotCropRegion):
+        return (False, None, 'CROP_PREVIEW_REGION_INVALID')
+    if crop.width <= 0 or crop.height <= 0:
+        return (False, None, 'CROP_PREVIEW_REGION_INVALID')
+    if crop.left < 0 or crop.top < 0:
+        return (False, None, 'CROP_PREVIEW_REGION_INVALID')
+
+    image_height, image_width = image.shape[:2]
+    if crop.left + crop.width > image_width or crop.top + crop.height > image_height:
+        return (False, None, 'CROP_PREVIEW_REGION_OUT_OF_BOUNDS')
+
+    cropped = image[
+        crop.top:crop.top + crop.height,
+        crop.left:crop.left + crop.width,
+    ].copy()
+    return (True, cropped, None)
+
+
+def build_coordinate_diagnostics_dir(base_dir='logs/macos-coordinate-diagnostics'):
+    """Return one timestamped diagnostics directory path without creating it."""
+    return Path(base_dir) / time.strftime('%Y%m%d-%H%M%S')
+
+
+def save_crop_preview_for_manual_check(
+    image,
+    crop,
+    *,
+    output_dir,
+    filename='crop_preview.png',
+):
+    """Save only one local crop preview for manual verification."""
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).name != filename
+        or any(part == '..' for part in Path(filename).parts)
+    ):
+        return CropPreviewResult(
+            saved=False,
+            preview_path=None,
+            crop_size=None,
+            message='crop preview filename 非法，拒绝路径穿越',
+            error_code='CROP_PREVIEW_PATH_INVALID',
+        )
+
+    cropped_ok, cropped, crop_error = crop_image_for_preview(image, crop)
+    if not cropped_ok:
+        error_messages = {
+            'CROP_PREVIEW_IMAGE_INVALID': 'crop preview image 非法',
+            'CROP_PREVIEW_REGION_INVALID': 'crop preview region 非法',
+            'CROP_PREVIEW_REGION_OUT_OF_BOUNDS': (
+                'crop preview region 超出 image bounds'
+            ),
+        }
+        return CropPreviewResult(
+            saved=False,
+            preview_path=None,
+            crop_size=None,
+            message=error_messages.get(crop_error, 'crop preview 失败'),
+            error_code=crop_error,
+        )
+
+    try:
+        from PIL import Image
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        preview_path = output_path / filename
+        Image.fromarray(cropped).save(preview_path)
+    except Exception as exc:
+        return CropPreviewResult(
+            saved=False,
+            preview_path=None,
+            crop_size=None,
+            message=f'crop preview 保存失败: {exc}',
+            error_code='CROP_PREVIEW_SAVE_FAILED',
+        )
+
+    return CropPreviewResult(
+        saved=True,
+        preview_path=str(preview_path),
+        crop_size=(cropped.shape[1], cropped.shape[0]),
+        message='crop preview 已保存到本地诊断目录',
     )
 
 

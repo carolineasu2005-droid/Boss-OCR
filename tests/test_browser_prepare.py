@@ -1,9 +1,11 @@
 from contextlib import ExitStack
+import tempfile
 import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import simple_brush
 
 
@@ -337,6 +339,26 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertIn("display_fingerprint: fingerprint", rendered)
         self.assertIn("passed: True", rendered)
         self.assertIn("message: ok", rendered)
+
+    def test_coordinate_diagnostics_only_does_not_save_crop_preview(self):
+        result = simple_brush.ScreenCoordinateDiagnostics(
+            platform="darwin",
+            pyautogui_size=(1512, 982),
+            pyautogui_position=(12, 34),
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version="8.6",
+            tcl_version="8.6",
+            display_fingerprint="fingerprint",
+            passed=True,
+            message="ok",
+        )
+        with patch.object(
+            simple_brush, "save_crop_preview_for_manual_check"
+        ) as save_preview:
+            self._coordinate_diagnostics_output(result)
+
+        save_preview.assert_not_called()
 
     def test_capture_screen_coordinate_diagnostics_collects_macos_metadata(self):
         class FakeCapture:
@@ -813,6 +835,232 @@ class BrowserPrepareTests(unittest.TestCase):
             typewrite,
             listener_start,
             initialize_ocr,
+        ):
+            mock.assert_not_called()
+
+    def test_crop_image_for_preview_extracts_correct_region_from_2d_image(self):
+        image = np.arange(25, dtype=np.uint8).reshape(5, 5)
+        crop = simple_brush.ScreenshotCropRegion(1, 2, 3, 2)
+
+        ok, cropped, error_code = simple_brush.crop_image_for_preview(image, crop)
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_code)
+        self.assertTrue(
+            np.array_equal(cropped, np.array([[11, 12, 13], [16, 17, 18]], dtype=np.uint8))
+        )
+
+    def test_crop_image_for_preview_extracts_correct_region_from_3d_image(self):
+        image = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+        crop = simple_brush.ScreenshotCropRegion(2, 1, 2, 2)
+
+        ok, cropped, error_code = simple_brush.crop_image_for_preview(image, crop)
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_code)
+        self.assertEqual(cropped.shape, (2, 2, 3))
+        self.assertTrue(np.array_equal(cropped, image[1:3, 2:4, :]))
+
+    def test_crop_image_for_preview_does_not_modify_original_image(self):
+        image = np.arange(16, dtype=np.uint8).reshape(4, 4)
+        original = image.copy()
+        crop = simple_brush.ScreenshotCropRegion(1, 1, 2, 2)
+
+        ok, cropped, error_code = simple_brush.crop_image_for_preview(image, crop)
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_code)
+        cropped[0, 0] = 255
+        self.assertTrue(np.array_equal(image, original))
+
+    def test_crop_image_for_preview_rejects_negative_origin(self):
+        image = np.zeros((4, 4), dtype=np.uint8)
+        for crop in (
+            simple_brush.ScreenshotCropRegion(-1, 0, 1, 1),
+            simple_brush.ScreenshotCropRegion(0, -1, 1, 1),
+        ):
+            with self.subTest(crop=crop):
+                ok, cropped, error_code = simple_brush.crop_image_for_preview(
+                    image, crop
+                )
+
+            self.assertFalse(ok)
+            self.assertIsNone(cropped)
+            self.assertEqual(error_code, "CROP_PREVIEW_REGION_INVALID")
+
+    def test_crop_image_for_preview_rejects_right_and_bottom_overflow(self):
+        image = np.zeros((4, 4), dtype=np.uint8)
+        for crop in (
+            simple_brush.ScreenshotCropRegion(3, 0, 2, 1),
+            simple_brush.ScreenshotCropRegion(0, 3, 1, 2),
+        ):
+            with self.subTest(crop=crop):
+                ok, cropped, error_code = simple_brush.crop_image_for_preview(
+                    image, crop
+                )
+
+            self.assertFalse(ok)
+            self.assertIsNone(cropped)
+            self.assertEqual(error_code, "CROP_PREVIEW_REGION_OUT_OF_BOUNDS")
+
+    def test_crop_image_for_preview_rejects_empty_region(self):
+        image = np.zeros((4, 4), dtype=np.uint8)
+        for crop in (
+            simple_brush.ScreenshotCropRegion(0, 0, 0, 1),
+            simple_brush.ScreenshotCropRegion(0, 0, 1, 0),
+        ):
+            with self.subTest(crop=crop):
+                ok, cropped, error_code = simple_brush.crop_image_for_preview(
+                    image, crop
+                )
+
+            self.assertFalse(ok)
+            self.assertIsNone(cropped)
+            self.assertEqual(error_code, "CROP_PREVIEW_REGION_INVALID")
+
+    def test_crop_image_for_preview_rejects_non_numpy_and_invalid_dimensions(self):
+        invalid_images = (
+            [[1, 2], [3, 4]],
+            np.zeros((4,), dtype=np.uint8),
+            np.zeros((1, 2, 3, 4), dtype=np.uint8),
+        )
+
+        for image in invalid_images:
+            with self.subTest(image_type=type(image), shape=getattr(image, "shape", None)):
+                ok, cropped, error_code = simple_brush.crop_image_for_preview(
+                    image,
+                    simple_brush.ScreenshotCropRegion(0, 0, 1, 1),
+                )
+
+            self.assertFalse(ok)
+            self.assertIsNone(cropped)
+            self.assertEqual(error_code, "CROP_PREVIEW_IMAGE_INVALID")
+
+    def test_build_coordinate_diagnostics_dir_returns_timestamp_child(self):
+        base_dir = "logs/macos-coordinate-diagnostics"
+
+        result = simple_brush.build_coordinate_diagnostics_dir(base_dir)
+
+        self.assertEqual(result.parent.as_posix(), base_dir)
+        self.assertTrue(result.name)
+
+    def test_save_crop_preview_for_manual_check_saves_only_crop(self):
+        image = np.arange(6 * 7 * 3, dtype=np.uint8).reshape(6, 7, 3)
+        crop = simple_brush.ScreenshotCropRegion(2, 1, 3, 2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = simple_brush.Path(tmpdir) / "nested" / "preview"
+
+            result = simple_brush.save_crop_preview_for_manual_check(
+                image,
+                crop,
+                output_dir=output_dir,
+            )
+
+            from PIL import Image
+
+            saved_image = np.asarray(Image.open(result.preview_path))
+            self.assertTrue(output_dir.exists())
+            self.assertTrue(result.preview_path.endswith("crop_preview.png"))
+            self.assertEqual(saved_image.shape[:2], (2, 3))
+
+        self.assertTrue(result.saved)
+        self.assertEqual(result.crop_size, (3, 2))
+        self.assertFalse(np.array_equal(saved_image, image))
+
+    def test_gitignore_already_covers_macos_coordinate_diagnostics_logs(self):
+        result = subprocess.run(
+            ["git", "check-ignore", "logs/macos-coordinate-diagnostics/example.png"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=simple_brush.Path(__file__).resolve().parents[1],
+        )
+
+        self.assertEqual(result.returncode, 0)
+
+    def test_save_crop_preview_for_manual_check_rejects_path_traversal(self):
+        image = np.zeros((4, 4), dtype=np.uint8)
+        crop = simple_brush.ScreenshotCropRegion(0, 0, 2, 2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = simple_brush.save_crop_preview_for_manual_check(
+                image,
+                crop,
+                output_dir=tmpdir,
+                filename="../escape.png",
+            )
+
+        self.assertFalse(result.saved)
+        self.assertEqual(result.error_code, "CROP_PREVIEW_PATH_INVALID")
+        self.assertIsNone(result.preview_path)
+
+    def test_save_crop_preview_for_manual_check_fail_closed_when_save_fails(self):
+        image = np.zeros((4, 4), dtype=np.uint8)
+        crop = simple_brush.ScreenshotCropRegion(0, 0, 2, 2)
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("PIL.Image.Image.save", side_effect=OSError("disk full")),
+        ):
+            result = simple_brush.save_crop_preview_for_manual_check(
+                image,
+                crop,
+                output_dir=tmpdir,
+            )
+
+        self.assertFalse(result.saved)
+        self.assertEqual(result.error_code, "CROP_PREVIEW_SAVE_FAILED")
+        self.assertIn("disk full", result.message)
+
+    def test_crop_preview_helpers_have_no_capture_gui_or_ocr_side_effects(self):
+        image = np.arange(25, dtype=np.uint8).reshape(5, 5)
+        crop = simple_brush.ScreenshotCropRegion(1, 1, 2, 2)
+        fake_mss = SimpleNamespace(MSS=Mock())
+        fake_tk = SimpleNamespace(Tk=Mock())
+        with (
+            patch.dict("sys.modules", {"mss": fake_mss, "tkinter": fake_tk}),
+            patch.object(simple_brush, "select_screen_region") as select_region,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush.pyautogui, "typewrite") as typewrite,
+            patch.object(simple_brush, "MSSScreenCapture") as screen_capture,
+            patch.object(simple_brush, "OCRKeywordDetector") as detector,
+        ):
+            ok, cropped, error_code = simple_brush.crop_image_for_preview(image, crop)
+            built_dir = simple_brush.build_coordinate_diagnostics_dir()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                saved = simple_brush.save_crop_preview_for_manual_check(
+                    image,
+                    crop,
+                    output_dir=tmpdir,
+                )
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_code)
+        self.assertEqual(cropped.shape, (2, 2))
+        self.assertTrue(built_dir.parent.as_posix().endswith("logs/macos-coordinate-diagnostics"))
+        self.assertTrue(saved.saved)
+        fake_mss.MSS.assert_not_called()
+        fake_tk.Tk.assert_not_called()
+        for mock in (
+            select_region,
+            initialize_ocr,
+            listener_start,
+            click,
+            move,
+            mouse_down,
+            mouse_up,
+            press,
+            hotkey,
+            scroll,
+            typewrite,
+            screen_capture,
+            detector,
         ):
             mock.assert_not_called()
 
