@@ -492,6 +492,26 @@ class MacSafeBrowseActionResult:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class MacSafeBrowseDryRunStep:
+    """One named noop-only step in the 5F-1 audit pipeline."""
+
+    action: str
+    description: str
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseDryRunResult:
+    """Dry pipeline result that can never enable browsing or forwarding."""
+
+    completed: bool
+    state: MacSafeBrowseActionState
+    real_browsing_enabled: bool
+    forwarding_enabled: bool
+    message: str
+    error_code: str | None = None
+
+
 MAC_SAFE_BROWSE_ACTIONS = (
     'candidate_open',
     'scroll',
@@ -778,6 +798,118 @@ def execute_mac_safe_browse_action(
         allowed=True,
         state=committed,
         message=f'{action} 执行成功并提交计数',
+    )
+
+
+def build_mac_safe_browse_dry_run_plan(
+    config: MacSafeBrowseConfig,
+) -> tuple[MacSafeBrowseDryRunStep, ...]:
+    """Build the fixed 5F-1 noop plan; config cannot add real actions."""
+    if not isinstance(config, MacSafeBrowseConfig):
+        raise TypeError('config 必须是 MacSafeBrowseConfig')
+    return (
+        MacSafeBrowseDryRunStep(
+            action='focus_restore',
+            description='noop audit of the focus_restore budget path',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='ocr_capture',
+            description='noop audit of the ocr_capture budget path',
+        ),
+    )
+
+
+def run_mac_safe_browse_dry_pipeline(
+    budget: MacSafeBrowseActionBudget,
+    plan: tuple[MacSafeBrowseDryRunStep, ...],
+    *,
+    started_at: float,
+    now: float,
+    action_fns=None,
+) -> MacSafeBrowseDryRunResult:
+    """Execute injected/noop callables only; never bind real browser actions."""
+    if not isinstance(budget, MacSafeBrowseActionBudget):
+        raise TypeError('budget 必须是 MacSafeBrowseActionBudget')
+    state = MacSafeBrowseActionState(started_at=started_at)
+    if not isinstance(plan, tuple):
+        stopped = stop_mac_safe_browse(
+            state,
+            'dry run plan 必须是 tuple',
+            'MAC_SAFE_BROWSE_DRY_PIPELINE_FAILED',
+        )
+        return MacSafeBrowseDryRunResult(
+            completed=False,
+            state=stopped,
+            real_browsing_enabled=False,
+            forwarding_enabled=False,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+    if action_fns is not None and not isinstance(action_fns, dict):
+        stopped = stop_mac_safe_browse(
+            state,
+            'action_fns 必须是 dict 或 None',
+            'MAC_SAFE_BROWSE_DRY_PIPELINE_FAILED',
+        )
+        return MacSafeBrowseDryRunResult(
+            completed=False,
+            state=stopped,
+            real_browsing_enabled=False,
+            forwarding_enabled=False,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    def noop_action():
+        return True
+
+    injected = action_fns or {}
+    for step in plan:
+        if not isinstance(step, MacSafeBrowseDryRunStep):
+            stopped = stop_mac_safe_browse(
+                state,
+                'dry run plan 包含无效 step',
+                'MAC_SAFE_BROWSE_DRY_PIPELINE_FAILED',
+            )
+            return MacSafeBrowseDryRunResult(
+                completed=False,
+                state=stopped,
+                real_browsing_enabled=False,
+                forwarding_enabled=False,
+                message=stopped.stop_reason,
+                error_code=stopped.error_code,
+            )
+        action_fn = injected.get(step.action, noop_action)
+        action_result = execute_mac_safe_browse_action(
+            budget,
+            state,
+            step.action,
+            action_fn,
+            now=now,
+        )
+        state = action_result.state
+        if not action_result.allowed:
+            return MacSafeBrowseDryRunResult(
+                completed=False,
+                state=state,
+                real_browsing_enabled=False,
+                forwarding_enabled=False,
+                message=(
+                    f'dry pipeline step {step.action} failed: '
+                    f'{action_result.message}'
+                ),
+                error_code=action_result.error_code,
+            )
+
+    return MacSafeBrowseDryRunResult(
+        completed=True,
+        state=state,
+        real_browsing_enabled=False,
+        forwarding_enabled=False,
+        message=(
+            'noop dry pipeline completed; real browsing and forwarding remain '
+            'disabled'
+        ),
     )
 
 
@@ -2722,10 +2854,27 @@ def run_mac_safe_browse_only(cli_args) -> int:
     print(f'  max_focus_restore: {action_budget.max_focus_restore}')
     print(f'  max_ocr_capture: {action_budget.max_ocr_capture}')
     print(f'  max_forward: {action_budget.max_forward}')
-    print('  error_code: MAC_SAFE_BROWSE_NOT_IMPLEMENTED')
+    dry_plan = build_mac_safe_browse_dry_run_plan(config)
+    dry_result = run_mac_safe_browse_dry_pipeline(
+        action_budget,
+        dry_plan,
+        started_at=0.0,
+        now=0.0,
+    )
+    print(f'  dry_pipeline_completed: {dry_result.completed}')
+    print(f'  real_browsing_enabled: {dry_result.real_browsing_enabled}')
+    print(f'  forwarding_enabled: {dry_result.forwarding_enabled}')
+    print(f'  focus_restore_count: {dry_result.state.focus_restore}')
+    print(f'  ocr_capture_count: {dry_result.state.ocr_capture}')
+    if not dry_result.completed:
+        print(f'  error_code: {dry_result.error_code}')
+        print(f'  message: {dry_result.message}')
+        return 2
+
+    print('  error_code: MAC_SAFE_BROWSE_REAL_BROWSING_NOT_IMPLEMENTED')
     print(
-        '  message: OCR evidence and action budget are ready for the next '
-        'implementation step; no action is executed in 5E'
+        '  message: noop dry pipeline completed; real browsing remains disabled '
+        'and is not implemented in 5F-1'
     )
     return 2
 

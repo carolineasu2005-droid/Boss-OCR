@@ -1,4 +1,5 @@
 from contextlib import ExitStack
+from dataclasses import replace
 import tempfile
 import subprocess
 import unittest
@@ -2830,7 +2831,6 @@ class MacSafeBrowseCLITests(unittest.TestCase):
             "next_candidate",
             "refresh_page",
             "forward_one_candidate",
-            "execute_mac_safe_browse_action",
         )
         pyautogui_names = (
             "position",
@@ -2891,7 +2891,10 @@ class MacSafeBrowseCLITests(unittest.TestCase):
             for entry in print_output.call_args_list
         )
         self.assertIn("NO FORWARDING ENABLED", rendered)
-        self.assertIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
+        self.assertIn("dry_pipeline_completed: True", rendered)
+        self.assertIn("real_browsing_enabled: False", rendered)
+        self.assertIn("forwarding_enabled: False", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_REAL_BROWSING_NOT_IMPLEMENTED", rendered)
         prompt.assert_not_called()
         for name, mocked in blocked.items():
             with self.subTest(blocked_action=name):
@@ -3073,6 +3076,10 @@ class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
         with (
             patch.object(simple_brush.sys, "platform", "darwin"),
             patch.object(simple_brush, "ocr_calibrated_region", None),
+            patch.object(
+                simple_brush,
+                "run_mac_safe_browse_dry_pipeline",
+            ) as dry_pipeline,
             patch("builtins.print") as print_output,
         ):
             result = simple_brush.run_mac_safe_browse_only(self.safe_args())
@@ -3083,7 +3090,8 @@ class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(result, 2)
         self.assertIn("MAC_SAFE_BROWSE_OCR_REGION_MISSING", rendered)
-        self.assertNotIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
+        self.assertNotIn("dry_pipeline_completed", rendered)
+        dry_pipeline.assert_not_called()
 
     def test_run_safe_browse_with_complete_metadata_still_does_not_browse(self):
         with (
@@ -3097,8 +3105,9 @@ class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
             patch.object(simple_brush, "forward_one_candidate") as forward,
             patch.object(
                 simple_brush,
-                "execute_mac_safe_browse_action",
-            ) as execute_action,
+                "run_mac_safe_browse_dry_pipeline",
+                wraps=simple_brush.run_mac_safe_browse_dry_pipeline,
+            ) as dry_pipeline,
             patch.object(simple_brush.listener, "start") as listener_start,
             patch("builtins.print") as print_output,
         ):
@@ -3111,11 +3120,13 @@ class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("NO FORWARDING ENABLED", rendered)
         self.assertIn("action_budget_ready: True", rendered)
-        self.assertIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
-        self.assertIn("ready for the next implementation step", rendered)
+        self.assertIn("dry_pipeline_completed: True", rendered)
+        self.assertIn("real_browsing_enabled: False", rendered)
+        self.assertIn("forwarding_enabled: False", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_REAL_BROWSING_NOT_IMPLEMENTED", rendered)
         prepare_browser.assert_not_called()
         forward.assert_not_called()
-        execute_action.assert_not_called()
+        dry_pipeline.assert_called_once()
         listener_start.assert_not_called()
 
 
@@ -3325,6 +3336,209 @@ class MacSafeBrowseActionBudgetTests(unittest.TestCase):
         self.assertEqual(
             result.error_code,
             "MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED",
+        )
+        action_fn.assert_not_called()
+
+
+class MacSafeBrowseDryPipelineTests(unittest.TestCase):
+    def make_config(self):
+        return simple_brush.MacSafeBrowseConfig(
+            enabled=True,
+            no_forward_required=True,
+            max_candidates=1,
+            max_runtime_minutes=5,
+            require_page_allowed=True,
+            require_coordinate_validated=True,
+            require_manual_confirmation=True,
+        )
+
+    def make_budget(self):
+        return simple_brush.build_default_mac_safe_browse_action_budget(
+            self.make_config()
+        )
+
+    def test_default_plan_contains_only_noop_budget_paths(self):
+        plan = simple_brush.build_mac_safe_browse_dry_run_plan(
+            self.make_config()
+        )
+        actions = tuple(step.action for step in plan)
+
+        self.assertEqual(actions, ("focus_restore", "ocr_capture"))
+        self.assertNotIn("candidate_open", actions)
+        self.assertNotIn("scroll", actions)
+        self.assertNotIn("next_candidate", actions)
+        self.assertNotIn("refresh", actions)
+        self.assertNotIn("filter_click", actions)
+        self.assertNotIn("forward", actions)
+
+    def test_dry_pipeline_success_commits_expected_counts(self):
+        focus_noop = Mock(return_value=True)
+        ocr_noop = Mock(return_value=True)
+        result = simple_brush.run_mac_safe_browse_dry_pipeline(
+            self.make_budget(),
+            simple_brush.build_mac_safe_browse_dry_run_plan(self.make_config()),
+            started_at=100.0,
+            now=101.0,
+            action_fns={
+                "focus_restore": focus_noop,
+                "ocr_capture": ocr_noop,
+            },
+        )
+
+        self.assertTrue(result.completed)
+        self.assertFalse(result.real_browsing_enabled)
+        self.assertFalse(result.forwarding_enabled)
+        self.assertEqual(result.state.focus_restore, 1)
+        self.assertEqual(result.state.ocr_capture, 1)
+        self.assertEqual(result.state.candidate_open, 0)
+        self.assertEqual(result.state.forward, 0)
+        self.assertIsNone(result.error_code)
+        focus_noop.assert_called_once_with()
+        ocr_noop.assert_called_once_with()
+
+    def test_default_noop_pipeline_does_not_call_real_actions(self):
+        blocked_names = (
+            "prepare_browser",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+            "initialize_ocr",
+            "ensure_ocr_region_calibrated",
+            "select_screen_region",
+            "save_region_preview",
+            "human_click",
+            "click_in_region",
+            "human_scroll_once",
+            "next_candidate",
+            "refresh_page",
+            "click_first_candidate",
+            "apply_batch_filter_and_open_first_candidate",
+            "forward_one_candidate",
+        )
+        pyautogui_names = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["OCRKeywordDetector.detect"] = stack.enter_context(
+                patch.object(simple_brush.OCRKeywordDetector, "detect")
+            )
+            blocked["MSSScreenCapture.capture"] = stack.enter_context(
+                patch.object(simple_brush.MSSScreenCapture, "capture")
+            )
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            result = simple_brush.run_mac_safe_browse_dry_pipeline(
+                self.make_budget(),
+                simple_brush.build_mac_safe_browse_dry_run_plan(
+                    self.make_config()
+                ),
+                started_at=100.0,
+                now=101.0,
+            )
+
+        self.assertTrue(result.completed)
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_injected_false_or_exception_stops_pipeline(self):
+        cases = (
+            Mock(return_value=False),
+            Mock(side_effect=RuntimeError("injected failure")),
+        )
+        plan = (
+            simple_brush.MacSafeBrowseDryRunStep(
+                action="focus_restore",
+                description="injected failure test",
+            ),
+        )
+        for action_fn in cases:
+            with self.subTest(side_effect=action_fn.side_effect):
+                result = simple_brush.run_mac_safe_browse_dry_pipeline(
+                    self.make_budget(),
+                    plan,
+                    started_at=100.0,
+                    now=101.0,
+                    action_fns={"focus_restore": action_fn},
+                )
+                self.assertFalse(result.completed)
+                self.assertFalse(result.real_browsing_enabled)
+                self.assertFalse(result.forwarding_enabled)
+                self.assertTrue(result.state.stopped)
+                self.assertEqual(
+                    result.error_code,
+                    "MAC_SAFE_BROWSE_ACTION_FAILED",
+                )
+                action_fn.assert_called_once_with()
+
+    def test_budget_rejection_does_not_call_injected_action(self):
+        action_fn = Mock(return_value=True)
+        budget = replace(self.make_budget(), max_focus_restore=0)
+        plan = (
+            simple_brush.MacSafeBrowseDryRunStep(
+                action="focus_restore",
+                description="zero budget test",
+            ),
+        )
+        result = simple_brush.run_mac_safe_browse_dry_pipeline(
+            budget,
+            plan,
+            started_at=100.0,
+            now=101.0,
+            action_fns={"focus_restore": action_fn},
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED",
+        )
+        action_fn.assert_not_called()
+
+    def test_forward_step_is_hard_blocked_before_action_fn(self):
+        action_fn = Mock(return_value=True)
+        plan = (
+            simple_brush.MacSafeBrowseDryRunStep(
+                action="forward",
+                description="must never run",
+            ),
+        )
+        result = simple_brush.run_mac_safe_browse_dry_pipeline(
+            self.make_budget(),
+            plan,
+            started_at=100.0,
+            now=101.0,
+            action_fns={"forward": action_fn},
+        )
+
+        self.assertFalse(result.completed)
+        self.assertFalse(result.real_browsing_enabled)
+        self.assertFalse(result.forwarding_enabled)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_FORWARDING_BLOCKED",
         )
         action_fn.assert_not_called()
 
