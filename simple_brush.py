@@ -326,6 +326,186 @@ class CalibratedScreenRegion:
     coordinate_metadata: CoordinateCalibrationMetadata | None = None
 
 
+@dataclass(frozen=True)
+class MacSafeBrowseConfig:
+    """Pure configuration for a future, separately guarded macOS browse mode."""
+
+    enabled: bool
+    no_forward_required: bool
+    max_candidates: int | None
+    max_runtime_minutes: int | None
+    require_page_allowed: bool
+    require_coordinate_validated: bool
+    require_manual_confirmation: bool
+    allow_scroll: bool = False
+    allow_next_candidate: bool = False
+    allow_refresh: bool = False
+    allow_filter: bool = False
+    message: str = ''
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseEvidence:
+    """Caller-supplied facts; collecting them is outside this pure guard."""
+
+    platform: str
+    no_forward_enabled: bool
+    forwarding_email_present: bool
+    page_allowed: bool
+    page_stage_allowed: bool
+    chrome_frontmost: bool
+    coordinate_validated: bool
+    manual_confirmed: bool
+    listener_available: bool
+    profile_unique: bool | None = None
+    display_fingerprint_matches: bool | None = None
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseGuard:
+    """Fail-closed result that never changes browser or business readiness."""
+
+    passed: bool
+    ready_for_browse: bool
+    no_forward_enforced: bool
+    page_allowed: bool
+    coordinate_validated: bool
+    manual_confirmed: bool
+    message: str
+    error_code: str | None = None
+
+
+def validate_mac_safe_browse_guard(
+    config: MacSafeBrowseConfig,
+    evidence: MacSafeBrowseEvidence,
+) -> MacSafeBrowseGuard:
+    """Validate supplied safe-browse facts without I/O or global state changes.
+
+    ``ready_for_browse`` belongs only to this future restricted mode. It does
+    not imply ``BrowserPrepareResult.ready`` or coordinate ``business_ready``.
+    """
+    if not isinstance(config, MacSafeBrowseConfig):
+        raise TypeError('config 必须是 MacSafeBrowseConfig')
+    if not isinstance(evidence, MacSafeBrowseEvidence):
+        raise TypeError('evidence 必须是 MacSafeBrowseEvidence')
+
+    no_forward_enforced = (
+        config.no_forward_required is True
+        and evidence.no_forward_enabled is True
+        and evidence.forwarding_email_present is False
+    )
+
+    def failed(message, error_code):
+        return MacSafeBrowseGuard(
+            passed=False,
+            ready_for_browse=False,
+            no_forward_enforced=no_forward_enforced,
+            page_allowed=evidence.page_allowed is True,
+            coordinate_validated=evidence.coordinate_validated is True,
+            manual_confirmed=evidence.manual_confirmed is True,
+            message=message,
+            error_code=error_code,
+        )
+
+    if config.enabled is not True:
+        return failed('macOS safe browse 未启用', 'MAC_SAFE_BROWSE_DISABLED')
+    if evidence.platform != 'darwin':
+        return failed(
+            'macOS safe browse 仅支持 darwin 平台',
+            'MAC_SAFE_BROWSE_UNSUPPORTED_PLATFORM',
+        )
+    if (
+        config.no_forward_required is not True
+        or evidence.no_forward_enabled is not True
+    ):
+        return failed(
+            'safe browse 必须显式并强制启用 no-forward',
+            'MAC_SAFE_BROWSE_NO_FORWARD_REQUIRED',
+        )
+    if evidence.forwarding_email_present is not False:
+        return failed(
+            'safe browse 不允许存在转发邮箱',
+            'MAC_SAFE_BROWSE_FORWARDING_EMAIL_PRESENT',
+        )
+
+    def valid_limit(value, hard_limit):
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= value <= hard_limit
+        )
+
+    if not valid_limit(config.max_candidates, 5):
+        return failed(
+            'max_candidates 必须是 1 到 5 的整数',
+            'MAC_SAFE_BROWSE_LIMIT_INVALID',
+        )
+    if not valid_limit(config.max_runtime_minutes, 15):
+        return failed(
+            'max_runtime_minutes 必须是 1 到 15 的整数',
+            'MAC_SAFE_BROWSE_LIMIT_INVALID',
+        )
+    if config.require_page_allowed and evidence.page_allowed is not True:
+        return failed(
+            '当前页面未通过 BOSS allowlist',
+            'MAC_SAFE_BROWSE_PAGE_NOT_ALLOWED',
+        )
+    if evidence.page_stage_allowed is not True:
+        return failed(
+            '当前页面状态不属于本阶段允许范围',
+            'MAC_SAFE_BROWSE_PAGE_STATE_AMBIGUOUS',
+        )
+    if evidence.chrome_frontmost is not True:
+        return failed(
+            'Chrome 不是 frontmost 窗口',
+            'MAC_SAFE_BROWSE_CHROME_NOT_FRONTMOST',
+        )
+    if (
+        config.require_coordinate_validated
+        and evidence.coordinate_validated is not True
+    ):
+        return failed(
+            '坐标 metadata 未通过验证',
+            'MAC_SAFE_BROWSE_COORDINATE_NOT_VALIDATED',
+        )
+    if (
+        config.require_manual_confirmation
+        and evidence.manual_confirmed is not True
+    ):
+        return failed(
+            'crop preview 尚未人工确认',
+            'MAC_SAFE_BROWSE_PREVIEW_NOT_CONFIRMED',
+        )
+    if evidence.listener_available is not True:
+        return failed(
+            '安全中止 Listener 不可用',
+            'MAC_SAFE_BROWSE_LISTENER_UNAVAILABLE',
+        )
+    if evidence.profile_unique is not True:
+        return failed(
+            'Chrome Profile 或窗口归属不唯一',
+            'MAC_SAFE_BROWSE_PROFILE_AMBIGUOUS',
+        )
+    if evidence.display_fingerprint_matches is not True:
+        return failed(
+            '显示器 fingerprint 缺失或不匹配',
+            'MAC_SAFE_BROWSE_DISPLAY_FINGERPRINT_MISMATCH',
+        )
+
+    return MacSafeBrowseGuard(
+        passed=True,
+        ready_for_browse=True,
+        no_forward_enforced=True,
+        page_allowed=evidence.page_allowed is True,
+        coordinate_validated=evidence.coordinate_validated is True,
+        manual_confirmed=evidence.manual_confirmed is True,
+        message=(
+            'safe browse guard 已通过；仅允许进入后续受控浏览，'
+            '不代表业务 ready，且禁止转发'
+        ),
+    )
+
+
 def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
     """Return whether a URL passes the conservative BOSS page identity gate.
 

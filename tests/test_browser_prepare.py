@@ -2400,5 +2400,260 @@ class BrowserPrepareTests(unittest.TestCase):
         hotkey.assert_not_called()
 
 
+class MacSafeBrowseGuardTests(unittest.TestCase):
+    def make_config(self, **overrides):
+        values = {
+            "enabled": True,
+            "no_forward_required": True,
+            "max_candidates": 1,
+            "max_runtime_minutes": 5,
+            "require_page_allowed": True,
+            "require_coordinate_validated": True,
+            "require_manual_confirmation": True,
+        }
+        values.update(overrides)
+        return simple_brush.MacSafeBrowseConfig(**values)
+
+    def make_evidence(self, **overrides):
+        values = {
+            "platform": "darwin",
+            "no_forward_enabled": True,
+            "forwarding_email_present": False,
+            "page_allowed": True,
+            "page_stage_allowed": True,
+            "chrome_frontmost": True,
+            "coordinate_validated": True,
+            "manual_confirmed": True,
+            "listener_available": True,
+            "profile_unique": True,
+            "display_fingerprint_matches": True,
+        }
+        values.update(overrides)
+        return simple_brush.MacSafeBrowseEvidence(**values)
+
+    def assert_guard_failure(
+        self,
+        error_code,
+        *,
+        config_overrides=None,
+        evidence_overrides=None,
+    ):
+        result = simple_brush.validate_mac_safe_browse_guard(
+            self.make_config(**(config_overrides or {})),
+            self.make_evidence(**(evidence_overrides or {})),
+        )
+        self.assertFalse(result.passed)
+        self.assertFalse(result.ready_for_browse)
+        self.assertEqual(result.error_code, error_code)
+
+    def test_guard_rejects_disabled_or_unsupported_platform(self):
+        cases = (
+            (
+                {"enabled": False},
+                {},
+                "MAC_SAFE_BROWSE_DISABLED",
+            ),
+            (
+                {},
+                {"platform": "win32"},
+                "MAC_SAFE_BROWSE_UNSUPPORTED_PLATFORM",
+            ),
+        )
+        for config, evidence, error_code in cases:
+            with self.subTest(error_code=error_code):
+                self.assert_guard_failure(
+                    error_code,
+                    config_overrides=config,
+                    evidence_overrides=evidence,
+                )
+
+    def test_guard_requires_no_forward_and_no_email(self):
+        cases = (
+            (
+                {"no_forward_required": False},
+                {},
+                "MAC_SAFE_BROWSE_NO_FORWARD_REQUIRED",
+            ),
+            (
+                {},
+                {"no_forward_enabled": False},
+                "MAC_SAFE_BROWSE_NO_FORWARD_REQUIRED",
+            ),
+            (
+                {},
+                {"forwarding_email_present": True},
+                "MAC_SAFE_BROWSE_FORWARDING_EMAIL_PRESENT",
+            ),
+        )
+        for config, evidence, error_code in cases:
+            with self.subTest(config=config, evidence=evidence):
+                self.assert_guard_failure(
+                    error_code,
+                    config_overrides=config,
+                    evidence_overrides=evidence,
+                )
+
+    def test_guard_rejects_invalid_candidate_limits(self):
+        for value in (None, 0, 6):
+            with self.subTest(max_candidates=value):
+                self.assert_guard_failure(
+                    "MAC_SAFE_BROWSE_LIMIT_INVALID",
+                    config_overrides={"max_candidates": value},
+                )
+
+    def test_guard_rejects_invalid_runtime_limits(self):
+        for value in (None, 0, 16):
+            with self.subTest(max_runtime_minutes=value):
+                self.assert_guard_failure(
+                    "MAC_SAFE_BROWSE_LIMIT_INVALID",
+                    config_overrides={"max_runtime_minutes": value},
+                )
+
+    def test_guard_rejects_page_focus_coordinate_and_confirmation_failures(self):
+        cases = (
+            ("page_allowed", False, "MAC_SAFE_BROWSE_PAGE_NOT_ALLOWED"),
+            (
+                "page_stage_allowed",
+                False,
+                "MAC_SAFE_BROWSE_PAGE_STATE_AMBIGUOUS",
+            ),
+            (
+                "chrome_frontmost",
+                False,
+                "MAC_SAFE_BROWSE_CHROME_NOT_FRONTMOST",
+            ),
+            (
+                "coordinate_validated",
+                False,
+                "MAC_SAFE_BROWSE_COORDINATE_NOT_VALIDATED",
+            ),
+            (
+                "manual_confirmed",
+                False,
+                "MAC_SAFE_BROWSE_PREVIEW_NOT_CONFIRMED",
+            ),
+            (
+                "listener_available",
+                False,
+                "MAC_SAFE_BROWSE_LISTENER_UNAVAILABLE",
+            ),
+        )
+        for field_name, value, error_code in cases:
+            with self.subTest(field_name=field_name):
+                self.assert_guard_failure(
+                    error_code,
+                    evidence_overrides={field_name: value},
+                )
+
+    def test_guard_rejects_ambiguous_profile(self):
+        for value in (False, None):
+            with self.subTest(profile_unique=value):
+                self.assert_guard_failure(
+                    "MAC_SAFE_BROWSE_PROFILE_AMBIGUOUS",
+                    evidence_overrides={"profile_unique": value},
+                )
+
+    def test_guard_rejects_missing_or_mismatched_display_fingerprint(self):
+        for value in (False, None):
+            with self.subTest(display_fingerprint_matches=value):
+                self.assert_guard_failure(
+                    "MAC_SAFE_BROWSE_DISPLAY_FINGERPRINT_MISMATCH",
+                    evidence_overrides={"display_fingerprint_matches": value},
+                )
+
+    def test_guard_passes_with_all_required_evidence(self):
+        result = simple_brush.validate_mac_safe_browse_guard(
+            self.make_config(),
+            self.make_evidence(),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertTrue(result.ready_for_browse)
+        self.assertTrue(result.no_forward_enforced)
+        self.assertTrue(result.page_allowed)
+        self.assertTrue(result.coordinate_validated)
+        self.assertTrue(result.manual_confirmed)
+        self.assertIsNone(result.error_code)
+        self.assertIn("不代表业务 ready", result.message)
+        self.assertIn("禁止转发", result.message)
+
+    def test_guard_success_does_not_change_existing_readiness_objects(self):
+        browser_result = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            page_allowed=True,
+        )
+        coordinate_metadata = simple_brush.CoordinateCalibrationMetadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=None,
+            tk_to_screenshot_mapping=None,
+            crop_preview=None,
+            validated=True,
+            manually_confirmed=True,
+            message="validated for test",
+        )
+
+        result = simple_brush.validate_mac_safe_browse_guard(
+            self.make_config(),
+            self.make_evidence(),
+        )
+
+        self.assertTrue(result.ready_for_browse)
+        self.assertFalse(browser_result.ready)
+        self.assertFalse(coordinate_metadata.business_ready)
+
+    def test_guard_is_pure_and_does_not_call_runtime_helpers(self):
+        blocked_names = (
+            "prepare_browser",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+            "initialize_ocr",
+            "select_screen_region",
+            "save_region_preview",
+            "MSSScreenCapture",
+            "OCRKeywordDetector",
+            "forward_one_candidate",
+        )
+        pyautogui_names = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            result = simple_brush.validate_mac_safe_browse_guard(
+                self.make_config(),
+                self.make_evidence(),
+            )
+
+        self.assertTrue(result.passed)
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
