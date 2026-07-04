@@ -1,7 +1,8 @@
 from contextlib import ExitStack
 import subprocess
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import simple_brush
 
@@ -26,6 +27,8 @@ class BrowserPrepareTests(unittest.TestCase):
             "save_region_preview",
             "MSSScreenCapture",
             "OCRKeywordDetector",
+            "capture_screen_coordinate_diagnostics",
+            "run_coordinate_diagnostics_only",
         )
         pyautogui_actions = (
             "position",
@@ -92,6 +95,36 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertTrue(combined_args["no_batch_filter"])
         self.assertTrue(combined_args["simple_mouse"])
 
+    def test_parse_args_recognizes_coordinate_diagnostics_only_and_conflict(self):
+        with patch.object(simple_brush.sys, "argv", ["simple_brush.py"]):
+            default_args = simple_brush.parse_args()
+
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            [
+                "simple_brush.py",
+                "--coordinate-diagnostics-only",
+            ],
+        ):
+            coordinate_args = simple_brush.parse_args()
+
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            [
+                "simple_brush.py",
+                "--coordinate-diagnostics-only",
+                "--preflight-only",
+            ],
+        ):
+            with self.assertRaisesRegex(ValueError, "不能与 --preflight-only 同时使用"):
+                simple_brush.parse_args()
+
+        self.assertFalse(default_args["coordinate_diagnostics_only"])
+        self.assertTrue(coordinate_args["coordinate_diagnostics_only"])
+        self.assertFalse(coordinate_args["preflight_only"])
+
     def test_preflight_only_combined_flags_still_only_run_preflight(self):
         result = simple_brush.BrowserPrepareResult(
             ready=False,
@@ -148,6 +181,21 @@ class BrowserPrepareTests(unittest.TestCase):
         tab_identity.assert_not_called()
         page_allowed.assert_not_called()
 
+    def test_preflight_only_does_not_touch_coordinate_diagnostics(self):
+        result = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            launched=True,
+            error_code="MACOS_PERMISSIONS_NOT_READY",
+        )
+        with patch.object(
+            simple_brush, "capture_screen_coordinate_diagnostics"
+        ) as coordinate:
+            self.assert_preflight_exits_without_business_actions(result)
+
+        coordinate.assert_not_called()
+
     def test_preflight_only_prints_page_diagnostics_and_still_exits(self):
         result = simple_brush.BrowserPrepareResult(
             ready=False,
@@ -175,6 +223,523 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertIn(
             "page_error_code: MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY", rendered
         )
+
+    def _coordinate_diagnostics_output(self, result):
+        argv = ["simple_brush.py", "--coordinate-diagnostics-only"]
+        module_actions = (
+            "prepare_browser",
+            "run_preflight_only",
+            "get_user_input",
+            "initialize_ocr",
+            "click_first_candidate",
+            "apply_batch_filter_and_open_first_candidate",
+            "ensure_batch_filter_regions_calibrated",
+            "ensure_focus_restore_region_calibrated",
+            "ensure_forward_click_regions_calibrated",
+            "ensure_ocr_region_calibrated",
+            "view_candidate",
+            "next_candidate",
+            "refresh_page",
+            "forward_one_candidate",
+            "select_screen_region",
+            "save_region_preview",
+            "MSSScreenCapture",
+            "OCRKeywordDetector",
+        )
+        pyautogui_actions = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "argv", argv))
+            coordinate = stack.enter_context(
+                patch.object(
+                    simple_brush,
+                    "capture_screen_coordinate_diagnostics",
+                    return_value=result,
+                )
+            )
+            blocked_actions = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in module_actions
+            }
+            blocked_actions["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked_actions.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_actions
+                }
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            self.assertEqual(simple_brush.run(), 0)
+
+        coordinate.assert_called_once_with()
+        for name, mock in blocked_actions.items():
+            with self.subTest(blocked_action=name):
+                mock.assert_not_called()
+        return print_output
+
+    def test_coordinate_diagnostics_only_runs_helper_and_exits(self):
+        result = simple_brush.ScreenCoordinateDiagnostics(
+            platform="darwin",
+            pyautogui_size=(1512, 982),
+            pyautogui_position=(12, 34),
+            mss_monitors=(
+                {
+                    "left": 0,
+                    "top": 0,
+                    "width": 1512,
+                    "height": 982,
+                    "is_primary": True,
+                },
+                {
+                    "left": 0,
+                    "top": 0,
+                    "width": 1512,
+                    "height": 982,
+                    "is_primary": True,
+                },
+            ),
+            primary_monitor={
+                "left": 0,
+                "top": 0,
+                "width": 1512,
+                "height": 982,
+                "is_primary": True,
+            },
+            tk_version="8.6",
+            tcl_version="8.6",
+            display_fingerprint="fingerprint",
+            passed=True,
+            message="ok",
+        )
+        output = self._coordinate_diagnostics_output(result)
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in output.call_args_list
+        )
+        self.assertIn("Coordinate diagnostics only (no business actions):", rendered)
+        self.assertIn("platform: darwin", rendered)
+        self.assertIn("pyautogui_size: (1512, 982)", rendered)
+        self.assertIn("pyautogui_position: (12, 34)", rendered)
+        self.assertIn("display_fingerprint: fingerprint", rendered)
+        self.assertIn("passed: True", rendered)
+        self.assertIn("message: ok", rendered)
+
+    def test_capture_screen_coordinate_diagnostics_collects_macos_metadata(self):
+        class FakeCapture:
+            def __init__(self):
+                self.grab = Mock()
+                self.monitors = [
+                    {
+                        "left": 0,
+                        "top": 0,
+                        "width": 1512,
+                        "height": 982,
+                        "is_primary": False,
+                    },
+                    {
+                        "left": 0,
+                        "top": 0,
+                        "width": 1512,
+                        "height": 982,
+                        "is_primary": True,
+                    },
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_capture = FakeCapture()
+        fake_mss = SimpleNamespace(MSS=Mock(return_value=fake_capture))
+        fake_tk = SimpleNamespace(TkVersion=8.6, TclVersion=8.6)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "size", return_value=(1512, 982)),
+            patch.object(simple_brush.pyautogui, "position", return_value=(12, 34)),
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush.pyautogui, "typewrite") as typewrite,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+            patch.object(simple_brush, "select_screen_region") as select_region,
+            patch.dict(
+                "sys.modules",
+                {"mss": fake_mss, "tkinter": fake_tk},
+            ),
+        ):
+            result = simple_brush.capture_screen_coordinate_diagnostics()
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.platform, "darwin")
+        self.assertEqual(result.pyautogui_size, (1512, 982))
+        self.assertEqual(result.pyautogui_position, (12, 34))
+        self.assertEqual(len(result.mss_monitors), 2)
+        self.assertEqual(result.primary_monitor["is_primary"], True)
+        self.assertEqual(result.tk_version, "8.6")
+        self.assertEqual(result.tcl_version, "8.6")
+        self.assertTrue(result.display_fingerprint)
+        fake_mss.MSS.assert_called_once_with()
+        fake_capture.grab.assert_not_called()
+        for mock in (
+            move,
+            click,
+            mouse_down,
+            mouse_up,
+            press,
+            hotkey,
+            scroll,
+            typewrite,
+        ):
+            mock.assert_not_called()
+        listener_start.assert_not_called()
+        initialize_ocr.assert_not_called()
+        select_region.assert_not_called()
+
+    def test_display_fingerprint_is_stable_for_same_monitor_snapshot(self):
+        monitors = (
+            {"left": 0, "top": 0, "width": 100, "height": 200, "is_primary": True},
+            {"left": 100, "top": 0, "width": 100, "height": 200, "is_primary": False},
+        )
+        first = simple_brush._build_display_fingerprint(monitors)
+        second = simple_brush._build_display_fingerprint(monitors)
+        self.assertEqual(first, second)
+
+    def test_display_fingerprint_changes_when_geometry_changes(self):
+        base = (
+            {"left": 0, "top": 0, "width": 100, "height": 200, "is_primary": True},
+        )
+        changed = (
+            {"left": 0, "top": 0, "width": 120, "height": 200, "is_primary": True},
+        )
+        self.assertNotEqual(
+            simple_brush._build_display_fingerprint(base),
+            simple_brush._build_display_fingerprint(changed),
+        )
+
+    def test_infer_retina_scale_accepts_one_two_and_non_integer_scales(self):
+        cases = (
+            ((1000, 800), (1000, 800), 1.0),
+            ((1000, 800), (2000, 1600), 2.0),
+            ((1000, 800), (1500, 1200), 1.5),
+        )
+
+        for request_size, image_size, expected_scale in cases:
+            with self.subTest(expected_scale=expected_scale):
+                result = simple_brush.infer_retina_scale(request_size, image_size)
+
+            self.assertTrue(result.passed)
+            self.assertEqual(result.request_size, request_size)
+            self.assertEqual(result.image_size, image_size)
+            self.assertEqual(result.scale_x, expected_scale)
+            self.assertEqual(result.scale_y, expected_scale)
+            self.assertIsNone(result.error_code)
+
+    def test_infer_retina_scale_rejects_invalid_request_dimensions(self):
+        for request_size in ((0, 800), (1000, 0), (-1, 800), (1000, -1)):
+            with self.subTest(request_size=request_size):
+                result = simple_brush.infer_retina_scale(
+                    request_size, (1000, 800)
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(
+                result.error_code, "RETINA_SCALE_REQUEST_SIZE_INVALID"
+            )
+
+    def test_infer_retina_scale_rejects_invalid_image_dimensions(self):
+        for image_size in ((0, 800), (1000, 0), (-1, 800), (1000, -1)):
+            with self.subTest(image_size=image_size):
+                result = simple_brush.infer_retina_scale(
+                    (1000, 800), image_size
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "RETINA_SCALE_IMAGE_SIZE_INVALID")
+
+    def test_infer_retina_scale_rejects_non_integer_sizes(self):
+        invalid_sizes = ((1000.0, 800), (True, 800), ("1000", 800))
+        for invalid_size in invalid_sizes:
+            with self.subTest(invalid_size=invalid_size):
+                request_result = simple_brush.infer_retina_scale(
+                    invalid_size, (1000, 800)
+                )
+                image_result = simple_brush.infer_retina_scale(
+                    (1000, 800), invalid_size
+                )
+
+            self.assertEqual(
+                request_result.error_code, "RETINA_SCALE_REQUEST_SIZE_INVALID"
+            )
+            self.assertEqual(
+                image_result.error_code, "RETINA_SCALE_IMAGE_SIZE_INVALID"
+            )
+
+    def test_infer_retina_scale_rejects_axis_mismatch(self):
+        result = simple_brush.infer_retina_scale((1000, 1000), (2000, 2200))
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.scale_x, 2.0)
+        self.assertEqual(result.scale_y, 2.2)
+        self.assertEqual(result.error_code, "RETINA_SCALE_AXIS_MISMATCH")
+
+    def test_infer_retina_scale_rejects_scales_outside_inclusive_range(self):
+        for image_size in ((400, 400), (5000, 5000)):
+            with self.subTest(image_size=image_size):
+                result = simple_brush.infer_retina_scale(
+                    (1000, 1000), image_size
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "RETINA_SCALE_OUT_OF_RANGE")
+
+    def test_infer_retina_scale_rejects_non_finite_overflow(self):
+        result = simple_brush.infer_retina_scale(
+            (1, 1), (10 ** 400, 10 ** 400)
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "RETINA_SCALE_NON_FINITE")
+
+    def test_infer_retina_scale_honors_tolerance_boundary(self):
+        within = simple_brush.infer_retina_scale(
+            (1000, 1000), (2000, 2020), tolerance=0.02
+        )
+        outside = simple_brush.infer_retina_scale(
+            (1000, 1000), (2000, 2021), tolerance=0.02
+        )
+
+        self.assertTrue(within.passed)
+        self.assertFalse(outside.passed)
+        self.assertEqual(outside.error_code, "RETINA_SCALE_AXIS_MISMATCH")
+
+    def test_infer_retina_scale_rejects_invalid_tolerance(self):
+        for tolerance in (-0.01, float("inf"), float("nan"), True):
+            with self.subTest(tolerance=tolerance):
+                result = simple_brush.infer_retina_scale(
+                    (1000, 800), (2000, 1600), tolerance=tolerance
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(
+                result.error_code, "RETINA_SCALE_TOLERANCE_INVALID"
+            )
+
+    def test_infer_monitor_capture_scale_uses_monitor_request_size(self):
+        monitor = {"left": 0, "top": 0, "width": 1000, "height": 800}
+
+        result = simple_brush.infer_monitor_capture_scale(
+            monitor, (1500, 1200)
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.request_size, (1000, 800))
+        self.assertEqual(result.scale_x, 1.5)
+        self.assertEqual(result.scale_y, 1.5)
+
+    def test_infer_monitor_capture_scale_rejects_invalid_monitor_metadata(self):
+        invalid_monitors = (
+            {},
+            {"height": 800},
+            {"width": 1000},
+            {"width": 1000.0, "height": 800},
+            {"width": 1000, "height": 800.0},
+            {"width": True, "height": 800},
+            {"width": 0, "height": 800},
+            {"width": 1000, "height": 0},
+            {"width": -1, "height": 800},
+            {"width": 1000, "height": -1},
+            None,
+        )
+
+        for monitor in invalid_monitors:
+            with self.subTest(monitor=monitor):
+                result = simple_brush.infer_monitor_capture_scale(
+                    monitor, (1000, 800)
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "RETINA_SCALE_MONITOR_INVALID")
+
+    def test_scale_inference_helpers_have_no_screen_input_or_ocr_side_effects(self):
+        fake_mss = SimpleNamespace(MSS=Mock())
+        monitor = {"width": 1000, "height": 800}
+        with (
+            patch.dict("sys.modules", {"mss": fake_mss}),
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush.pyautogui, "typewrite") as typewrite,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+        ):
+            direct = simple_brush.infer_retina_scale(
+                (1000, 800), (2000, 1600)
+            )
+            from_monitor = simple_brush.infer_monitor_capture_scale(
+                monitor, (2000, 1600)
+            )
+
+        self.assertTrue(direct.passed)
+        self.assertTrue(from_monitor.passed)
+        fake_mss.MSS.assert_not_called()
+        for mock in (
+            click,
+            move,
+            mouse_down,
+            mouse_up,
+            press,
+            hotkey,
+            scroll,
+            typewrite,
+            listener_start,
+            initialize_ocr,
+        ):
+            mock.assert_not_called()
+
+    def test_capture_screen_coordinate_diagnostics_fails_closed_when_pyautogui_size_fails(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(
+                simple_brush.pyautogui,
+                "size",
+                side_effect=RuntimeError("size failed"),
+            ),
+            patch.object(simple_brush.pyautogui, "position") as position,
+        ):
+            result = simple_brush.capture_screen_coordinate_diagnostics()
+
+        position.assert_not_called()
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "COORDINATE_DIAGNOSTICS_PYAUTOGUI_FAILED")
+        self.assertIn("size failed", result.message)
+
+    def test_capture_screen_coordinate_diagnostics_fails_closed_when_pyautogui_position_fails(self):
+        fake_capture = SimpleNamespace(monitors=[])
+        fake_mss = SimpleNamespace(MSS=Mock(return_value=fake_capture))
+        fake_tk = SimpleNamespace(TkVersion=8.6, TclVersion=8.6)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "size", return_value=(1512, 982)),
+            patch.object(
+                simple_brush.pyautogui,
+                "position",
+                side_effect=RuntimeError("position failed"),
+            ),
+            patch.dict(
+                "sys.modules",
+                {"mss": fake_mss, "tkinter": fake_tk},
+            ),
+        ):
+            result = simple_brush.capture_screen_coordinate_diagnostics()
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "COORDINATE_DIAGNOSTICS_PYAUTOGUI_FAILED")
+        self.assertIn("position failed", result.message)
+
+    def test_capture_screen_coordinate_diagnostics_fails_closed_when_mss_init_fails(self):
+        class BrokenMSS:
+            def __call__(self):
+                raise RuntimeError("mss init failed")
+
+        fake_tk = SimpleNamespace(TkVersion=8.6, TclVersion=8.6)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "size", return_value=(1512, 982)),
+            patch.object(simple_brush.pyautogui, "position", return_value=(12, 34)),
+            patch.dict("sys.modules", {"mss": SimpleNamespace(MSS=BrokenMSS()), "tkinter": fake_tk}),
+        ):
+            result = simple_brush.capture_screen_coordinate_diagnostics()
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "COORDINATE_DIAGNOSTICS_MSS_FAILED")
+        self.assertIn("mss 监视器读取失败", result.message)
+
+    def test_capture_screen_coordinate_diagnostics_fails_closed_when_mss_monitor_read_fails(self):
+        class FailingCapture:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            @property
+            def monitors(self):
+                raise RuntimeError("monitor failed")
+
+        fake_mss = SimpleNamespace(MSS=Mock(return_value=FailingCapture()))
+        fake_tk = SimpleNamespace(TkVersion=8.6, TclVersion=8.6)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "size", return_value=(1512, 982)),
+            patch.object(simple_brush.pyautogui, "position", return_value=(12, 34)),
+            patch.dict(
+                "sys.modules",
+                {"mss": fake_mss, "tkinter": fake_tk},
+            ),
+        ):
+            result = simple_brush.capture_screen_coordinate_diagnostics()
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "COORDINATE_DIAGNOSTICS_MSS_FAILED")
+        self.assertIn("mss 监视器读取失败", result.message)
+
+    def test_capture_screen_coordinate_diagnostics_fails_closed_when_tk_read_fails(self):
+        class FakeCapture:
+            def __init__(self):
+                self.monitors = [
+                    {
+                        "left": 0,
+                        "top": 0,
+                        "width": 1512,
+                        "height": 982,
+                        "is_primary": True,
+                    }
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_capture = FakeCapture()
+        fake_mss = SimpleNamespace(MSS=Mock(return_value=fake_capture))
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "size", return_value=(1512, 982)),
+            patch.object(simple_brush.pyautogui, "position", return_value=(12, 34)),
+            patch.dict("sys.modules", {"mss": fake_mss, "tkinter": None}),
+        ):
+            result = simple_brush.capture_screen_coordinate_diagnostics()
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "COORDINATE_DIAGNOSTICS_TK_FAILED")
+        self.assertIn("Tk/Tcl 版本读取失败", result.message)
 
     def test_allowed_boss_page_accepts_only_explicit_https_paths(self):
         allowed_urls = (

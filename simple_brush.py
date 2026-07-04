@@ -15,6 +15,8 @@ BOSS 直聘推荐牛人自动刷简历 v4 —— 键盘翻页 + 智能邮件转�
 import sys
 import io
 import os
+import json
+import hashlib
 import ctypes
 from ctypes import wintypes
 import time
@@ -77,6 +79,7 @@ def parse_args():
         'simple_mouse': False,
         'auto': False,
         'preflight_only': False,
+        'coordinate_diagnostics_only': False,
     }
     i = 1
     while i < len(sys.argv):
@@ -106,8 +109,15 @@ def parse_args():
         elif sys.argv[i] == '--preflight-only':
             args['preflight_only'] = True
             i += 1
+        elif sys.argv[i] == '--coordinate-diagnostics-only':
+            args['coordinate_diagnostics_only'] = True
+            i += 1
         else:
             i += 1
+    if args['preflight_only'] and args['coordinate_diagnostics_only']:
+        raise ValueError(
+            '--coordinate-diagnostics-only 不能与 --preflight-only 同时使用'
+        )
     return args
 
 # 修复 Windows 终端 UTF-8 输出
@@ -219,6 +229,36 @@ class MacOSChromeTabIdentity:
     title: str = ''
     message: str = ''
     error_code: str = ''
+
+
+@dataclass(frozen=True)
+class ScreenCoordinateDiagnostics:
+    """Structured result for read-only screen coordinate diagnostics."""
+
+    platform: str
+    pyautogui_size: tuple[int, int] | None
+    pyautogui_position: tuple[int, int] | None
+    mss_monitors: tuple[dict, ...]
+    primary_monitor: dict | None
+    tk_version: str | None
+    tcl_version: str | None
+    display_fingerprint: str | None
+    passed: bool
+    message: str
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class RetinaScaleInference:
+    """Pure metadata result for MSS request-to-image scale inference."""
+
+    request_size: tuple[int, int] | None
+    image_size: tuple[int, int] | None
+    scale_x: float | None
+    scale_y: float | None
+    passed: bool
+    message: str
+    error_code: str | None = None
 
 
 def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
@@ -715,6 +755,336 @@ def prepare_browser(platform_name=None):
     )
 
 
+def _normalize_monitor_entry(monitor):
+    """Keep only stable monitor fields for diagnostics and fingerprinting."""
+    return {
+        'left': int(monitor['left']),
+        'top': int(monitor['top']),
+        'width': int(monitor['width']),
+        'height': int(monitor['height']),
+        'is_primary': bool(monitor.get('is_primary', False)),
+    }
+
+
+def _select_primary_monitor(monitors):
+    """Choose the primary physical monitor from an MSS monitor list."""
+    physical_monitors = monitors[1:] if len(monitors) > 1 else monitors
+    if not physical_monitors:
+        return None
+    for monitor in physical_monitors:
+        if monitor.get('is_primary'):
+            return _normalize_monitor_entry(monitor)
+    return _normalize_monitor_entry(physical_monitors[0])
+
+
+def _build_display_fingerprint(monitors):
+    """Hash a stable monitor snapshot into a display fingerprint."""
+    canonical = [_normalize_monitor_entry(monitor) for monitor in monitors]
+    payload = json.dumps(canonical, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _valid_positive_integer_size(size):
+    """Return a normalized positive integer size, or None when invalid."""
+    if not isinstance(size, tuple) or len(size) != 2:
+        return None
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in size):
+        return None
+    if any(value <= 0 for value in size):
+        return None
+    return size
+
+
+def infer_retina_scale(request_size, image_size, *, tolerance=0.02):
+    """Infer per-axis scale from request/image metadata without screen access."""
+    normalized_request = _valid_positive_integer_size(request_size)
+    if normalized_request is None:
+        return RetinaScaleInference(
+            request_size=None,
+            image_size=_valid_positive_integer_size(image_size),
+            scale_x=None,
+            scale_y=None,
+            passed=False,
+            message='MSS request size 必须是两个正整数',
+            error_code='RETINA_SCALE_REQUEST_SIZE_INVALID',
+        )
+
+    normalized_image = _valid_positive_integer_size(image_size)
+    if normalized_image is None:
+        return RetinaScaleInference(
+            request_size=normalized_request,
+            image_size=None,
+            scale_x=None,
+            scale_y=None,
+            passed=False,
+            message='captured image size 必须是两个正整数',
+            error_code='RETINA_SCALE_IMAGE_SIZE_INVALID',
+        )
+
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, (int, float))
+        or not math.isfinite(tolerance)
+        or tolerance < 0
+    ):
+        return RetinaScaleInference(
+            request_size=normalized_request,
+            image_size=normalized_image,
+            scale_x=None,
+            scale_y=None,
+            passed=False,
+            message='scale tolerance 必须是有限非负数',
+            error_code='RETINA_SCALE_TOLERANCE_INVALID',
+        )
+
+    try:
+        scale_x = normalized_image[0] / normalized_request[0]
+        scale_y = normalized_image[1] / normalized_request[1]
+    except OverflowError:
+        scale_x = None
+        scale_y = None
+
+    if (
+        scale_x is None
+        or scale_y is None
+        or not math.isfinite(scale_x)
+        or not math.isfinite(scale_y)
+        or scale_x <= 0
+        or scale_y <= 0
+    ):
+        return RetinaScaleInference(
+            request_size=normalized_request,
+            image_size=normalized_image,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            passed=False,
+            message='推断出的 Retina scale 不是有限正数',
+            error_code='RETINA_SCALE_NON_FINITE',
+        )
+
+    if not (0.5 <= scale_x <= 4.0 and 0.5 <= scale_y <= 4.0):
+        return RetinaScaleInference(
+            request_size=normalized_request,
+            image_size=normalized_image,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            passed=False,
+            message='推断出的 Retina scale 超出允许范围 [0.5, 4.0]',
+            error_code='RETINA_SCALE_OUT_OF_RANGE',
+        )
+
+    axis_difference = abs(scale_x - scale_y)
+    tolerance_value = float(tolerance)
+    if axis_difference > tolerance_value and not math.isclose(
+        axis_difference,
+        tolerance_value,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        return RetinaScaleInference(
+            request_size=normalized_request,
+            image_size=normalized_image,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            passed=False,
+            message=(
+                'Retina scale 两轴不一致：'
+                f'scale_x={scale_x}, scale_y={scale_y}, tolerance={tolerance}'
+            ),
+            error_code='RETINA_SCALE_AXIS_MISMATCH',
+        )
+
+    return RetinaScaleInference(
+        request_size=normalized_request,
+        image_size=normalized_image,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        passed=True,
+        message='MSS request/result scale metadata 推断通过；不代表真实屏幕已验证',
+    )
+
+
+def infer_monitor_capture_scale(monitor, image_size, *, tolerance=0.02):
+    """Infer scale from an MSS monitor dict and supplied image metadata only."""
+    if not isinstance(monitor, dict):
+        monitor_size = None
+    else:
+        monitor_size = _valid_positive_integer_size(
+            (monitor.get('width'), monitor.get('height'))
+        )
+
+    if monitor_size is None:
+        return RetinaScaleInference(
+            request_size=None,
+            image_size=_valid_positive_integer_size(image_size),
+            scale_x=None,
+            scale_y=None,
+            passed=False,
+            message='MSS monitor 必须包含有效的正整数 width/height',
+            error_code='RETINA_SCALE_MONITOR_INVALID',
+        )
+
+    return infer_retina_scale(monitor_size, image_size, tolerance=tolerance)
+
+
+def capture_screen_coordinate_diagnostics():
+    """Collect read-only coordinate metadata without screenshots or input."""
+    platform_name = sys.platform
+
+    if platform_name != 'darwin':
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=None,
+            pyautogui_position=None,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message=(
+                'coordinate diagnostics are only implemented as a read-only '
+                f'macOS probe; unsupported platform: {platform_name}'
+            ),
+            error_code='COORDINATE_DIAGNOSTICS_UNSUPPORTED_PLATFORM',
+        )
+
+    try:
+        pyautogui_size = tuple(int(value) for value in pyautogui.size())
+    except Exception as exc:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=None,
+            pyautogui_position=None,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message=f'pyautogui.size() 读取失败: {exc}',
+            error_code='COORDINATE_DIAGNOSTICS_PYAUTOGUI_FAILED',
+        )
+
+    try:
+        pyautogui_position = tuple(int(value) for value in pyautogui.position())
+    except Exception as exc:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=pyautogui_size,
+            pyautogui_position=None,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message=f'pyautogui.position() 读取失败: {exc}',
+            error_code='COORDINATE_DIAGNOSTICS_PYAUTOGUI_FAILED',
+        )
+
+    try:
+        import mss
+    except ImportError as exc:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=pyautogui_size,
+            pyautogui_position=pyautogui_position,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message=f'mss 不可用: {exc}',
+            error_code='COORDINATE_DIAGNOSTICS_MSS_FAILED',
+        )
+
+    try:
+        with mss.MSS() as capture:
+            raw_monitors = tuple(capture.monitors)
+    except Exception as exc:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=pyautogui_size,
+            pyautogui_position=pyautogui_position,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message=f'mss 监视器读取失败: {exc}',
+            error_code='COORDINATE_DIAGNOSTICS_MSS_FAILED',
+        )
+
+    if not raw_monitors:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=pyautogui_size,
+            pyautogui_position=pyautogui_position,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message='mss 监视器列表为空',
+            error_code='COORDINATE_DIAGNOSTICS_MSS_FAILED',
+        )
+
+    try:
+        mss_monitors = tuple(_normalize_monitor_entry(monitor) for monitor in raw_monitors)
+        primary_monitor = _select_primary_monitor(raw_monitors)
+        display_fingerprint = _build_display_fingerprint(raw_monitors)
+    except Exception as exc:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=pyautogui_size,
+            pyautogui_position=pyautogui_position,
+            mss_monitors=(),
+            primary_monitor=None,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=None,
+            passed=False,
+            message=f'display fingerprint 生成失败: {exc}',
+            error_code='COORDINATE_DIAGNOSTICS_FAILED',
+        )
+
+    try:
+        import tkinter as tk
+        tk_version = str(tk.TkVersion)
+        tcl_version = str(tk.TclVersion)
+    except Exception as exc:
+        return ScreenCoordinateDiagnostics(
+            platform=platform_name,
+            pyautogui_size=pyautogui_size,
+            pyautogui_position=pyautogui_position,
+            mss_monitors=mss_monitors,
+            primary_monitor=primary_monitor,
+            tk_version=None,
+            tcl_version=None,
+            display_fingerprint=display_fingerprint,
+            passed=False,
+            message=f'Tk/Tcl 版本读取失败: {exc}',
+            error_code='COORDINATE_DIAGNOSTICS_TK_FAILED',
+        )
+
+    return ScreenCoordinateDiagnostics(
+        platform=platform_name,
+        pyautogui_size=pyautogui_size,
+        pyautogui_position=pyautogui_position,
+        mss_monitors=mss_monitors,
+        primary_monitor=primary_monitor,
+        tk_version=tk_version,
+        tcl_version=tcl_version,
+        display_fingerprint=display_fingerprint,
+        passed=True,
+        message='坐标系统基础信息只读采集成功',
+    )
+
+
 def resolve_chrome_executable(chrome_path=MACOS_CHROME_EXECUTABLE):
     """Resolve the fixed macOS Chrome executable without launching it."""
     path = Path(chrome_path)
@@ -1026,6 +1396,29 @@ def run_preflight_only(_cli_args=None):
         '  note: preflight diagnoses window focus and page identity, but does not '
         'validate Retina coordinates, calibration, OCR, forwarding, or real '
         'business safety.'
+    )
+    return 0
+
+
+def run_coordinate_diagnostics_only(_cli_args=None):
+    """Run coordinate diagnostics only, then always exit."""
+    result = capture_screen_coordinate_diagnostics()
+    print('Coordinate diagnostics only (no business actions):')
+    print(f'  platform: {result.platform}')
+    print(f'  pyautogui_size: {result.pyautogui_size}')
+    print(f'  pyautogui_position: {result.pyautogui_position}')
+    print(f'  mss_monitors: {result.mss_monitors}')
+    print(f'  primary_monitor: {result.primary_monitor}')
+    print(f'  tk_version: {result.tk_version or "none"}')
+    print(f'  tcl_version: {result.tcl_version or "none"}')
+    print(f'  display_fingerprint: {result.display_fingerprint or "none"}')
+    print(f'  passed: {result.passed}')
+    print(f'  error_code: {result.error_code or "none"}')
+    print(f'  message: {result.message}')
+    print(
+        '  note: this helper only records read-only coordinate metadata; it '
+        'does not screenshot, create a Tk overlay, calibrate OCR, or start '
+        'business actions.'
     )
     return 0
 
@@ -1906,6 +2299,8 @@ def run():
     # ── 交互/参数输入 ──
     try:
         cli_args = parse_args()
+        if cli_args.get('coordinate_diagnostics_only', False):
+            return run_coordinate_diagnostics_only(cli_args)
         if cli_args.get('preflight_only', False):
             return run_preflight_only(cli_args)
         no_forward_mode = cli_args['no_forward']
