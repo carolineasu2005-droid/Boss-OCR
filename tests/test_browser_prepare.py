@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import unittest
 from unittest.mock import patch
 
@@ -5,6 +6,147 @@ import simple_brush
 
 
 class BrowserPrepareTests(unittest.TestCase):
+    def assert_preflight_exits_without_business_actions(self, result, extra_args=()):
+        argv = ["simple_brush.py", "--preflight-only", *extra_args]
+        module_actions = (
+            "get_user_input",
+            "initialize_ocr",
+            "click_first_candidate",
+            "apply_batch_filter_and_open_first_candidate",
+            "ensure_batch_filter_regions_calibrated",
+            "ensure_focus_restore_region_calibrated",
+            "ensure_forward_click_regions_calibrated",
+            "ensure_ocr_region_calibrated",
+            "view_candidate",
+            "next_candidate",
+            "refresh_page",
+            "forward_one_candidate",
+            "select_screen_region",
+            "save_region_preview",
+            "MSSScreenCapture",
+            "OCRKeywordDetector",
+        )
+        pyautogui_actions = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "argv", argv))
+            prepare = stack.enter_context(
+                patch.object(simple_brush, "prepare_browser", return_value=result)
+            )
+            blocked_actions = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in module_actions
+            }
+            blocked_actions["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked_actions.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_actions
+                }
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            self.assertEqual(simple_brush.run(), 0)
+
+        prepare.assert_called_once_with()
+        for name, mock in blocked_actions.items():
+            with self.subTest(blocked_action=name):
+                mock.assert_not_called()
+        return print_output
+
+    def test_parse_args_recognizes_preflight_only_and_defaults_off(self):
+        with patch.object(simple_brush.sys, "argv", ["simple_brush.py"]):
+            default_args = simple_brush.parse_args()
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            [
+                "simple_brush.py",
+                "--preflight-only",
+                "--auto",
+                "--no-forward",
+                "--no-batch-filter",
+                "--simple-mouse",
+            ],
+        ):
+            combined_args = simple_brush.parse_args()
+
+        self.assertFalse(default_args["preflight_only"])
+        self.assertTrue(combined_args["preflight_only"])
+        self.assertTrue(combined_args["auto"])
+        self.assertTrue(combined_args["no_forward"])
+        self.assertTrue(combined_args["no_batch_filter"])
+        self.assertTrue(combined_args["simple_mouse"])
+
+    def test_preflight_only_combined_flags_still_only_run_preflight(self):
+        result = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            launched=True,
+            message="permissions unknown",
+            error_code="MACOS_PERMISSIONS_NOT_READY",
+        )
+        output = self.assert_preflight_exits_without_business_actions(
+            result,
+            (
+                "--keywords",
+                '"Python"',
+                "--auto",
+                "--no-forward",
+                "--no-batch-filter",
+                "--simple-mouse",
+            ),
+        )
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in output.call_args_list
+        )
+        self.assertIn("platform: macos", rendered)
+        self.assertIn("browser: chrome", rendered)
+        self.assertIn("launched: True", rendered)
+        self.assertIn("ready: False", rendered)
+        self.assertIn("MACOS_PERMISSIONS_NOT_READY", rendered)
+        self.assertIn("does not validate window focus", rendered)
+
+    def test_preflight_only_exits_on_windows_macos_and_unknown_platforms(self):
+        results = (
+            simple_brush.BrowserPrepareResult(
+                ready=True,
+                platform="windows",
+                browser="edge",
+            ),
+            simple_brush.BrowserPrepareResult(
+                ready=False,
+                platform="macos",
+                browser="chrome",
+                launched=True,
+                error_code="MACOS_PERMISSIONS_NOT_READY",
+            ),
+            simple_brush.BrowserPrepareResult(
+                ready=False,
+                platform="linux",
+                browser="",
+                error_code="UNSUPPORTED_PLATFORM",
+            ),
+        )
+        for result in results:
+            with self.subTest(platform=result.platform):
+                self.assert_preflight_exits_without_business_actions(result)
+
     def test_macos_default_chrome_path_is_exact(self):
         self.assertEqual(
             str(simple_brush.MACOS_CHROME_EXECUTABLE),

@@ -75,6 +75,7 @@ def parse_args():
         'no_batch_filter': False,
         'simple_mouse': False,
         'auto': False,
+        'preflight_only': False,
     }
     i = 1
     while i < len(sys.argv):
@@ -100,6 +101,9 @@ def parse_args():
             i += 1
         elif sys.argv[i] == '--auto':
             args['auto'] = True  # 跳过所有交互
+            i += 1
+        elif sys.argv[i] == '--preflight-only':
+            args['preflight_only'] = True
             i += 1
         else:
             i += 1
@@ -697,6 +701,23 @@ def check_macos_permissions():
         ready=ready,
         message=message,
     )
+
+
+def run_preflight_only(_cli_args=None):
+    """Run browser and permission preparation diagnostics, then always exit."""
+    result = prepare_browser()
+    print('Browser preflight only (no business actions):')
+    print(f'  platform: {result.platform}')
+    print(f'  browser: {result.browser or "unsupported"}')
+    print(f'  launched: {result.launched}')
+    print(f'  ready: {result.ready}')
+    print(f'  error_code: {result.error_code or "none"}')
+    print(f'  message: {result.message or "none"}')
+    print(
+        '  note: preflight does not validate window focus, page identity, '
+        'Retina coordinates, calibration, or real business safety.'
+    )
+    return 0
 
 
 def safe_wait(seconds):
@@ -1575,6 +1596,8 @@ def run():
     # ── 交互/参数输入 ──
     try:
         cli_args = parse_args()
+        if cli_args.get('preflight_only', False):
+            return run_preflight_only(cli_args)
         no_forward_mode = cli_args['no_forward']
         simple_mouse_enabled = bool(cli_args.get('simple_mouse', False))
         get_user_input(
