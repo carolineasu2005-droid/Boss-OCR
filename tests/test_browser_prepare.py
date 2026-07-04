@@ -3511,6 +3511,15 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         capture_instance = CaptureStub()
         capture_factory = Mock(return_value=capture_instance)
         click_first_candidate = Mock(return_value=True)
+        candidate_focus_fn = Mock(
+            return_value=simple_brush.MacOSChromeFocusResult(
+                platform="macos",
+                browser="chrome",
+                activated=True,
+                frontmost=True,
+                message="focus ok",
+            )
+        )
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
@@ -3565,6 +3574,7 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                 preview_dir="logs/macos-coordinate-diagnostics/mock",
                 real_capture_focus_fn=Mock(return_value=True),
                 real_capture_factory=capture_factory,
+                candidate_focus_fn=candidate_focus_fn,
                 candidate_open_confirm_fn=Mock(return_value="YES"),
                 candidate_open_position_fn=Mock(
                     return_value=SimpleNamespace(x=321, y=654)
@@ -3581,6 +3591,7 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         self.assertIn("candidate_open_count: 1", rendered)
         self.assertIn("candidate_opened: True", rendered)
         self.assertIn("MAC_SAFE_BROWSE_BROWSE_LOOP_NOT_IMPLEMENTED", rendered)
+        candidate_focus_fn.assert_called_once_with()
         click_first_candidate.assert_called_once_with(321, 654)
         for name, mocked in blocked.items():
             if name == "click_first_candidate":
@@ -3588,7 +3599,7 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
             with self.subTest(blocked_action=name):
                 mocked.assert_not_called()
 
-    def test_open_candidate_once_default_path_confirmation_or_click_failure_fails_closed(self):
+    def test_open_candidate_once_default_path_confirmation_focus_or_click_failure_fails_closed(self):
         region = simple_brush.ScreenRegion(10, 20, 300, 200)
         base_kwargs = {
             "diagnostics_fn": Mock(return_value=self.diagnostics()),
@@ -3624,18 +3635,46 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         cases = (
             (
                 Mock(return_value="NO"),
+                Mock(),
                 Mock(return_value=True),
                 "MAC_SAFE_BROWSE_CANDIDATE_OPEN_CONFIRMATION_REQUIRED",
+                False,
                 False,
             ),
             (
                 Mock(return_value="YES"),
+                Mock(
+                    return_value=simple_brush.MacOSChromeFocusResult(
+                        platform="macos",
+                        browser="chrome",
+                        activated=True,
+                        frontmost=False,
+                        message="focus failed",
+                        error_code="MACOS_CHROME_NOT_FRONTMOST",
+                    )
+                ),
+                Mock(return_value=True),
+                "MAC_SAFE_BROWSE_CANDIDATE_OPEN_FOCUS_FAILED",
+                False,
+                True,
+            ),
+            (
+                Mock(return_value="YES"),
+                Mock(return_value=True),
                 Mock(side_effect=RuntimeError("click boom")),
                 "MAC_SAFE_BROWSE_CANDIDATE_OPEN_FAILED",
                 True,
+                True,
             ),
         )
-        for confirm_fn, click_mock, expected_code, should_call_click in cases:
+        for (
+            confirm_fn,
+            focus_mock,
+            click_mock,
+            expected_code,
+            should_call_click,
+            should_call_focus,
+        ) in cases:
             with self.subTest(expected_code=expected_code):
                 with (
                     patch.object(simple_brush.sys, "platform", "darwin"),
@@ -3648,6 +3687,7 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                             mac_safe_browse_real_capture_once=True,
                             mac_safe_browse_open_candidate_once=True,
                         ),
+                        candidate_focus_fn=focus_mock,
                         candidate_open_confirm_fn=confirm_fn,
                         **base_kwargs,
                     )
@@ -3659,6 +3699,10 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                 self.assertEqual(result, 2)
                 self.assertIn("dry_pipeline_completed: False", rendered)
                 self.assertIn(expected_code, rendered)
+                if should_call_focus:
+                    focus_mock.assert_called_once_with()
+                else:
+                    focus_mock.assert_not_called()
                 if should_call_click:
                     click_mock.assert_called_once_with(50, 60)
                 else:

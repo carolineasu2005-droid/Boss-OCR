@@ -1941,6 +1941,7 @@ def build_mac_safe_browse_real_action_fns(
     focus_fn=None,
     capture_factory=None,
     candidate_open_fn=None,
+    candidate_focus_fn=None,
     candidate_open_confirm_fn=input,
     candidate_open_position_fn=pyautogui.position,
     open_candidate_once=False,
@@ -2035,6 +2036,25 @@ def build_mac_safe_browse_real_action_fns(
                     confirm_fn=candidate_open_confirm_fn,
                     position_fn=candidate_open_position_fn,
                 )
+                focus_check = (
+                    focus_chrome_window()
+                    if candidate_focus_fn is None
+                    else candidate_focus_fn()
+                )
+                if isinstance(focus_check, MacOSChromeFocusResult):
+                    focus_succeeded = focus_check.frontmost is True
+                else:
+                    focus_succeeded = bool(focus_check)
+                if not focus_succeeded:
+                    message = (
+                        focus_check.message
+                        if isinstance(focus_check, MacOSChromeFocusResult)
+                        else 'candidate_open 前 Chrome focus/frontmost 校验失败'
+                    )
+                    raise MacSafeBrowseRuntimeError(
+                        'MAC_SAFE_BROWSE_CANDIDATE_OPEN_FOCUS_FAILED',
+                        message,
+                    )
                 succeeded = bool(click_first_candidate(x, y))
             else:
                 succeeded = bool(candidate_open_fn())
@@ -3752,6 +3772,7 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     real_capture_focus_fn=None,
     real_capture_factory=None,
     candidate_open_fn=None,
+    candidate_focus_fn=None,
     candidate_open_confirm_fn=input,
     candidate_open_position_fn=pyautogui.position,
 ) -> int:
@@ -3817,6 +3838,7 @@ def run_mac_safe_browse_calibrate_and_dry_run(
                 focus_fn=real_capture_focus_fn,
                 capture_factory=real_capture_factory,
                 candidate_open_fn=candidate_open_fn,
+                candidate_focus_fn=candidate_focus_fn,
                 candidate_open_confirm_fn=candidate_open_confirm_fn,
                 candidate_open_position_fn=candidate_open_position_fn,
                 open_candidate_once=open_candidate_enabled,
