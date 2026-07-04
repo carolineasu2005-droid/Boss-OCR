@@ -17,6 +17,8 @@ logs/
 # Local project documentation
 *.md
 !README.md
+!docs/
+!docs/*.md
 !release-notes/
 !release-notes/*.md
 

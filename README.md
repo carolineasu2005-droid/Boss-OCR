@@ -6,6 +6,8 @@ BossOCR 是一个面向 Windows 的 BOSS 直聘候选人简历辅助浏览工具
 
 > 使用前请确认你的操作符合 BOSS 直聘服务条款、招聘合规要求和个人信息保护规定。程序包含真实鼠标/键盘自动化，必须先在 `--no-forward` 安全模式下验证。
 
+macOS Chrome 目前仅提供浏览器启动与权限诊断 baseline，**不是完整业务可用版**。请参阅 [macOS Chrome preflight 与人工验收指南](docs/macos-chrome-preflight.md)。
+
 ## 下载与运行
 
 推荐从 [GitHub Releases](https://github.com/carolineasu2005-droid/Boss-OCR/releases/latest) 下载 `BossOCR-Windows-x64.zip`。
@@ -377,7 +379,7 @@ logs/ocr_hits/
 - 自动筛选不读取按钮文字、不检测筛选是否生效，也不判断列表或详情页是否加载完成；慢网络、空列表、骨架屏或页面布局异常可能导致安全停止或误点。
 - 校准结束时通过 Esc 最佳努力关闭筛选面板；Esc 能否在当前 BOSS 页面稳定关闭面板，以及筛选确定后首位卡片是否仍位于校准区域，需要在实际页面人工确认。
 - 跳过、取消或校准失败时会回退到现有默认坐标区域；默认值基于 1920×1080 Windows Edge 布局，其他布局必须先人工验证。
-- 当前仍仅支持 Windows + Microsoft Edge，macOS Chrome 适配尚未完成。
+- 完整业务流程仍仅支持 Windows + Microsoft Edge；macOS Chrome 当前仅支持 [preflight baseline](docs/macos-chrome-preflight.md)，不会进入业务循环。
 - EXE 当前未进行商业代码签名。
 - 自动化工具不能替代人工招聘判断；正式启用前应使用 `--no-forward` 人工核对足够样本。
 
