@@ -103,6 +103,7 @@ def parse_args():
         'mac_safe_browse_only': False,
         'mac_safe_browse_calibrate_only': False,
         'mac_safe_browse_calibrate_and_dry_run': False,
+        'mac_safe_browse_real_capture_once': False,
         'max_candidates': None,
         'max_runtime_minutes': None,
     }
@@ -146,6 +147,9 @@ def parse_args():
         elif sys.argv[i] == '--mac-safe-browse-calibrate-and-dry-run':
             args['mac_safe_browse_calibrate_and_dry_run'] = True
             i += 1
+        elif sys.argv[i] == '--mac-safe-browse-real-capture-once':
+            args['mac_safe_browse_real_capture_once'] = True
+            i += 1
         elif sys.argv[i] == '--max-candidates':
             if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
                 raise MacSafeBrowseArgumentError(
@@ -182,6 +186,20 @@ def parse_args():
             '--mac-safe-browse-calibrate-and-dry-run 不能与 safe browse、'
             'calibrate-only、--auto、--preflight-only 或 '
             '--coordinate-diagnostics-only 同时使用',
+        )
+    if args['mac_safe_browse_real_capture_once'] and (
+        not args['mac_safe_browse_calibrate_and_dry_run']
+        or args['mac_safe_browse_only']
+        or args['mac_safe_browse_calibrate_only']
+        or args['auto']
+        or args['preflight_only']
+        or args['coordinate_diagnostics_only']
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_REAL_CAPTURE_CONFLICTING_MODE',
+            '--mac-safe-browse-real-capture-once 只能与 '
+            '--mac-safe-browse-calibrate-and-dry-run 同用，且不能与 '
+            '--auto、--preflight-only 或 --coordinate-diagnostics-only 共用',
         )
     if args['mac_safe_browse_calibrate_only'] and (
         args['mac_safe_browse_only']
@@ -562,6 +580,17 @@ class MacSafeBrowseCalibrationMetadataSupplyResult:
 
     metadata: CoordinateCalibrationMetadata | None
     preview_path: str | None
+    message: str
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseRealCaptureResult:
+    """Structured summary for the one-shot real focus/capture wiring."""
+
+    focus_restored: bool
+    capture_completed: bool
+    capture_size: tuple[int, int] | None
     message: str
     error_code: str | None = None
 
@@ -1802,6 +1831,109 @@ def publish_mac_safe_browse_calibration(
     if result.published and result.calibrated_region is not None:
         ocr_calibrated_region = result.calibrated_region
     return result
+
+
+def build_mac_safe_browse_real_capture_action_fns(
+    calibrated_region: CalibratedScreenRegion,
+    *,
+    focus_fn=None,
+    capture_factory=None,
+):
+    """Build one-shot real focus/capture actions without browsing or OCR."""
+    if not isinstance(calibrated_region, CalibratedScreenRegion):
+        raise TypeError('calibrated_region 必须是 CalibratedScreenRegion')
+    if not isinstance(calibrated_region.region, ScreenRegion):
+        raise TypeError('calibrated_region.region 必须是 ScreenRegion')
+
+    metadata = calibrated_region.coordinate_metadata
+    if not isinstance(metadata, CoordinateCalibrationMetadata):
+        raise ValueError('calibrated_region 缺少 coordinate metadata')
+    if (
+        metadata.validated is not True
+        or metadata.manually_confirmed is not True
+        or metadata.business_ready is not False
+    ):
+        raise ValueError('coordinate metadata 未满足 real capture once 前置条件')
+
+    state = {
+        'focus_restored': False,
+        'capture_completed': False,
+        'capture_size': None,
+        'error_code': None,
+        'message': 'real capture once actions prepared',
+    }
+
+    def focus_restore_action():
+        if focus_fn is None:
+            state['focus_restored'] = True
+            state['message'] = (
+                'focus_restore 使用 no-op 上下文确认；未点击、未按键、未切换候选人'
+            )
+            return True
+        succeeded = bool(focus_fn())
+        if not succeeded:
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_FOCUS_FAILED'
+            state['message'] = 'focus_restore 验证失败'
+            return False
+        state['focus_restored'] = True
+        state['message'] = 'focus_restore 验证成功'
+        return True
+
+    def ocr_capture_action():
+        factory = capture_factory or MSSScreenCapture
+        try:
+            capture = factory()
+        except Exception as exc:
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_CAPTURE_FAILED'
+            state['message'] = f'capture factory 创建失败: {exc}'
+            return False
+        if not hasattr(capture, 'capture') or not callable(capture.capture):
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_CAPTURE_FAILED'
+            state['message'] = 'capture factory 未返回可用 capture 对象'
+            return False
+        try:
+            image = capture.capture(calibrated_region.region)
+        except Exception as exc:
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_CAPTURE_FAILED'
+            state['message'] = f'ocr_capture 执行异常: {exc}'
+            return False
+        if image is None:
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_CAPTURE_EMPTY'
+            state['message'] = 'ocr_capture 未返回图像'
+            return False
+        try:
+            import numpy as np
+
+            array = np.asarray(image)
+        except Exception as exc:
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_CAPTURE_FAILED'
+            state['message'] = f'ocr_capture 图像解析失败: {exc}'
+            return False
+        if array.ndim not in (2, 3) or array.shape[0] <= 0 or array.shape[1] <= 0:
+            state['error_code'] = 'MAC_SAFE_BROWSE_REAL_CAPTURE_EMPTY'
+            state['message'] = 'ocr_capture 返回空图或无效图像'
+            return False
+        state['capture_completed'] = True
+        state['capture_size'] = (int(array.shape[1]), int(array.shape[0]))
+        state['message'] = 'ocr_capture 已完成一次区域截图；未保存、未 OCR'
+        return True
+
+    def build_result():
+        return MacSafeBrowseRealCaptureResult(
+            focus_restored=state['focus_restored'],
+            capture_completed=state['capture_completed'],
+            capture_size=state['capture_size'],
+            message=state['message'],
+            error_code=state['error_code'],
+        )
+
+    return (
+        {
+            'focus_restore': focus_restore_action,
+            'ocr_capture': ocr_capture_action,
+        },
+        build_result,
+    )
 
 
 def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
@@ -3479,6 +3611,8 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     save_crop_preview_fn=None,
     confirmation_fn=None,
     preview_dir=None,
+    real_capture_focus_fn=None,
+    real_capture_factory=None,
 ) -> int:
     """Run same-process calibration publication, then the noop dry pipeline."""
     try:
@@ -3526,26 +3660,53 @@ def run_mac_safe_browse_calibrate_and_dry_run(
 
     action_budget = build_default_mac_safe_browse_action_budget(config)
     dry_plan = build_mac_safe_browse_dry_run_plan(config)
+    real_capture_enabled = cli_args.get('mac_safe_browse_real_capture_once') is True
+    action_fns = None
+    build_real_capture_result = None
+    if real_capture_enabled:
+        action_fns, build_real_capture_result = (
+            build_mac_safe_browse_real_capture_action_fns(
+                calibration_result.calibrated_region,
+                focus_fn=real_capture_focus_fn,
+                capture_factory=real_capture_factory,
+            )
+        )
     dry_result = run_mac_safe_browse_dry_pipeline(
         action_budget,
         dry_plan,
         started_at=0.0,
         now=0.0,
+        action_fns=action_fns,
     )
+    real_capture_result = (
+        build_real_capture_result()
+        if callable(build_real_capture_result)
+        else MacSafeBrowseRealCaptureResult(
+            focus_restored=False,
+            capture_completed=False,
+            capture_size=None,
+            message='real capture once 未启用；保持 5F-4 noop dry pipeline',
+        )
+    )
+    print(f'  real_capture_enabled: {real_capture_enabled}')
     print(f'  dry_pipeline_completed: {dry_result.completed}')
     print(f'  real_browsing_enabled: {dry_result.real_browsing_enabled}')
     print(f'  forwarding_enabled: {dry_result.forwarding_enabled}')
     print(f'  focus_restore_count: {dry_result.state.focus_restore}')
     print(f'  ocr_capture_count: {dry_result.state.ocr_capture}')
+    print(f'  capture_completed: {real_capture_result.capture_completed}')
+    print(f'  capture_size: {real_capture_result.capture_size}')
     if not dry_result.completed:
-        print(f'  error_code: {dry_result.error_code}')
-        print(f'  message: {dry_result.message}')
+        error_code = real_capture_result.error_code or dry_result.error_code
+        print(f'  error_code: {error_code}')
+        print(f'  message: {real_capture_result.message or dry_result.message}')
         return 2
 
     print('  error_code: MAC_SAFE_BROWSE_REAL_BROWSING_NOT_IMPLEMENTED')
     print(
-        '  message: calibration 已在同进程发布，noop dry pipeline 已完成；'
-        'real browsing remains disabled and is not implemented in 5F-4'
+        '  message: calibration 已在同进程发布，'
+        'focus_restore/ocr_capture 仅执行最小安全接线；'
+        'real browsing remains disabled and is not implemented in 5F-5'
     )
     return 2
 

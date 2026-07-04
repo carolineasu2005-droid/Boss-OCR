@@ -2815,9 +2815,24 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         parsed = self.valid_args()
 
         self.assertFalse(defaults["mac_safe_browse_calibrate_and_dry_run"])
+        self.assertFalse(defaults["mac_safe_browse_real_capture_once"])
         self.assertTrue(parsed["mac_safe_browse_calibrate_and_dry_run"])
         self.assertEqual(parsed["max_candidates"], 1)
         self.assertEqual(parsed["max_runtime_minutes"], 5)
+
+    def test_parse_args_recognizes_real_capture_once(self):
+        parsed = self.parse(
+            "--mac-safe-browse-calibrate-and-dry-run",
+            "--mac-safe-browse-real-capture-once",
+            "--no-forward",
+            "--max-candidates",
+            "1",
+            "--max-runtime-minutes",
+            "5",
+        )
+
+        self.assertTrue(parsed["mac_safe_browse_calibrate_and_dry_run"])
+        self.assertTrue(parsed["mac_safe_browse_real_capture_once"])
 
     def test_parse_args_rejects_calibrate_and_dry_run_conflicts(self):
         for conflicting_flag in (
@@ -2844,6 +2859,14 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                     caught.exception.error_code,
                     "MAC_SAFE_BROWSE_CALIBRATE_AND_DRY_RUN_CONFLICTING_MODE",
                 )
+
+    def test_parse_args_rejects_real_capture_once_without_combo_mode(self):
+        with self.assertRaises(simple_brush.MacSafeBrowseArgumentError) as caught:
+            self.parse("--mac-safe-browse-real-capture-once")
+        self.assertEqual(
+            caught.exception.error_code,
+            "MAC_SAFE_BROWSE_REAL_CAPTURE_CONFLICTING_MODE",
+        )
 
     def test_config_rejects_platform_no_forward_email_and_missing_limits(self):
         self.assert_argument_error(
@@ -2992,6 +3015,249 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         for name, mocked in blocked.items():
             with self.subTest(blocked_action=name):
                 mocked.assert_not_called()
+
+    def test_real_capture_once_keeps_noop_path_off_when_flag_is_missing(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        captured = self.capture_image(width=600, height=400)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush, "ocr_calibrated_region", None),
+            patch.object(
+                simple_brush,
+                "build_mac_safe_browse_real_capture_action_fns",
+            ) as build_actions,
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                self.valid_args(),
+                diagnostics_fn=Mock(return_value=self.diagnostics()),
+                select_region_fn=Mock(return_value=region),
+                capture_fn=Mock(return_value=captured),
+                save_crop_preview_fn=Mock(
+                    return_value=simple_brush.CropPreviewResult(
+                        saved=True,
+                        preview_path=(
+                            "logs/macos-coordinate-diagnostics/mock/"
+                            "crop_preview.png"
+                        ),
+                        crop_size=(600, 400),
+                        message="saved",
+                    )
+                ),
+                confirmation_fn=Mock(return_value="YES"),
+                preview_dir="logs/macos-coordinate-diagnostics/mock",
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("real_capture_enabled: False", rendered)
+        self.assertIn("capture_completed: False", rendered)
+        build_actions.assert_not_called()
+
+    def test_real_capture_once_success_records_capture_size_without_saving_or_ocr(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        captured = self.capture_image(width=600, height=400)
+        blocked_names = (
+            "prepare_browser",
+            "run_mac_safe_browse_only",
+            "initialize_ocr",
+            "ensure_ocr_region_calibrated",
+            "save_region_preview",
+            "human_click",
+            "click_in_region",
+            "click_first_candidate",
+            "apply_batch_filter_and_open_first_candidate",
+            "human_scroll_once",
+            "next_candidate",
+            "refresh_page",
+            "forward_one_candidate",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+        )
+        pyautogui_names = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        class CaptureStub:
+            def capture(self, selected_region):
+                self.selected_region = selected_region
+                return captured
+
+        capture_instance = CaptureStub()
+        capture_factory = Mock(return_value=capture_instance)
+        focus_fn = Mock(return_value=True)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            stack.enter_context(
+                patch.object(simple_brush, "ocr_calibrated_region", None)
+            )
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["OCRKeywordDetector"] = stack.enter_context(
+                patch.object(simple_brush, "OCRKeywordDetector")
+            )
+            blocked["OCRKeywordDetector.detect"] = stack.enter_context(
+                patch.object(simple_brush.OCRKeywordDetector, "detect")
+            )
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                self.valid_args(mac_safe_browse_real_capture_once=True),
+                diagnostics_fn=Mock(return_value=self.diagnostics()),
+                select_region_fn=Mock(return_value=region),
+                capture_fn=Mock(return_value=captured),
+                save_crop_preview_fn=Mock(
+                    return_value=simple_brush.CropPreviewResult(
+                        saved=True,
+                        preview_path=(
+                            "logs/macos-coordinate-diagnostics/mock/"
+                            "crop_preview.png"
+                        ),
+                        crop_size=(600, 400),
+                        message="saved",
+                    )
+                ),
+                confirmation_fn=Mock(return_value="YES"),
+                preview_dir="logs/macos-coordinate-diagnostics/mock",
+                real_capture_focus_fn=focus_fn,
+                real_capture_factory=capture_factory,
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(capture_instance.selected_region, region)
+        self.assertIn("real_capture_enabled: True", rendered)
+        self.assertIn("capture_completed: True", rendered)
+        self.assertIn("capture_size: (600, 400)", rendered)
+        self.assertIn("real_browsing_enabled: False", rendered)
+        self.assertIn("forwarding_enabled: False", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_REAL_BROWSING_NOT_IMPLEMENTED", rendered)
+        focus_fn.assert_called_once_with()
+        capture_factory.assert_called_once_with()
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_real_capture_once_focus_failure_stops_pipeline(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        captured = self.capture_image(width=600, height=400)
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush, "ocr_calibrated_region", None),
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                self.valid_args(mac_safe_browse_real_capture_once=True),
+                diagnostics_fn=Mock(return_value=self.diagnostics()),
+                select_region_fn=Mock(return_value=region),
+                capture_fn=Mock(return_value=captured),
+                save_crop_preview_fn=Mock(
+                    return_value=simple_brush.CropPreviewResult(
+                        saved=True,
+                        preview_path=(
+                            "logs/macos-coordinate-diagnostics/mock/"
+                            "crop_preview.png"
+                        ),
+                        crop_size=(600, 400),
+                        message="saved",
+                    )
+                ),
+                confirmation_fn=Mock(return_value="YES"),
+                preview_dir="logs/macos-coordinate-diagnostics/mock",
+                real_capture_focus_fn=Mock(return_value=False),
+                real_capture_factory=Mock(),
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("real_capture_enabled: True", rendered)
+        self.assertIn("dry_pipeline_completed: False", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_REAL_FOCUS_FAILED", rendered)
+
+    def test_real_capture_once_empty_or_exception_capture_fails_closed(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        base_kwargs = {
+            "diagnostics_fn": Mock(return_value=self.diagnostics()),
+            "select_region_fn": Mock(return_value=region),
+            "capture_fn": Mock(return_value=self.capture_image(width=600, height=400)),
+            "save_crop_preview_fn": Mock(
+                return_value=simple_brush.CropPreviewResult(
+                    saved=True,
+                    preview_path=(
+                        "logs/macos-coordinate-diagnostics/mock/crop_preview.png"
+                    ),
+                    crop_size=(600, 400),
+                    message="saved",
+                )
+            ),
+            "confirmation_fn": Mock(return_value="YES"),
+            "preview_dir": "logs/macos-coordinate-diagnostics/mock",
+            "real_capture_focus_fn": Mock(return_value=True),
+        }
+
+        class EmptyCapture:
+            def capture(self, _region):
+                return None
+
+        class ExplodingCapture:
+            def capture(self, _region):
+                raise RuntimeError("capture boom")
+
+        cases = (
+            (Mock(return_value=EmptyCapture()), "MAC_SAFE_BROWSE_REAL_CAPTURE_EMPTY"),
+            (Mock(return_value=ExplodingCapture()), "MAC_SAFE_BROWSE_REAL_CAPTURE_FAILED"),
+        )
+        for capture_factory, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                with (
+                    patch.object(simple_brush.sys, "platform", "darwin"),
+                    patch.object(simple_brush, "ocr_calibrated_region", None),
+                    patch("builtins.print") as print_output,
+                ):
+                    result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                        self.valid_args(mac_safe_browse_real_capture_once=True),
+                        real_capture_factory=capture_factory,
+                        **base_kwargs,
+                    )
+
+                rendered = "\n".join(
+                    " ".join(str(item) for item in entry.args)
+                    for entry in print_output.call_args_list
+                )
+                self.assertEqual(result, 2)
+                self.assertIn("dry_pipeline_completed: False", rendered)
+                self.assertIn(expected_code, rendered)
 
     def test_run_dispatches_calibrate_and_dry_run_before_normal_flow(self):
         argv = [
