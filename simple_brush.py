@@ -203,6 +203,18 @@ class MacOSChromeFocusResult:
     error_code: str = ''
 
 
+@dataclass(frozen=True)
+class MacOSChromeTabIdentity:
+    """Structured result for macOS Chrome active tab metadata queries."""
+
+    platform: str
+    browser: str
+    url: str = ''
+    title: str = ''
+    message: str = ''
+    error_code: str = ''
+
+
 def region_around(x, y, radius):
     """Return the inclusive +/- radius around a point as a ScreenRegion."""
     if radius < 0:
@@ -772,6 +784,98 @@ def focus_chrome_window():
             browser='chrome',
             activated=False,
             frontmost=False,
+            message=f'macOS osascript 调用失败: {exc}',
+            error_code='MACOS_OSASCRIPT_ERROR',
+        )
+
+
+def get_chrome_active_tab_identity():
+    """Read the URL/title of Chrome's current active tab without activating it."""
+    tab_query_script = """
+tell application "Google Chrome"
+    if not (exists front window) then
+        error "NO_FRONT_WINDOW"
+    end if
+    set frontWindow to front window
+    try
+        set activeTab to active tab of frontWindow
+    on error
+        error "NO_ACTIVE_TAB"
+    end try
+    set tabUrl to URL of activeTab
+    set tabTitle to title of activeTab
+    return tabUrl & linefeed & tabTitle
+end tell
+""".strip()
+
+    try:
+        query_result = run_osascript(tab_query_script)
+        if query_result.returncode != 0:
+            error_detail = (
+                query_result.stderr.strip()
+                or query_result.stdout.strip()
+                or 'unknown osascript error'
+            )
+            if 'NO_FRONT_WINDOW' in error_detail:
+                return MacOSChromeTabIdentity(
+                    platform='macos',
+                    browser='chrome',
+                    message='macOS Chrome 当前没有 front window',
+                    error_code='MACOS_CHROME_NO_FRONT_WINDOW',
+                )
+            if 'NO_ACTIVE_TAB' in error_detail:
+                return MacOSChromeTabIdentity(
+                    platform='macos',
+                    browser='chrome',
+                    message='macOS Chrome front window 没有 active tab',
+                    error_code='MACOS_CHROME_NO_ACTIVE_TAB',
+                )
+            return MacOSChromeTabIdentity(
+                platform='macos',
+                browser='chrome',
+                message=f'macOS Chrome active tab 查询失败: {error_detail}',
+                error_code='MACOS_CHROME_TAB_QUERY_FAILED',
+            )
+
+        output = query_result.stdout.rstrip('\r\n')
+        lines = output.splitlines()
+        tab_url = lines[0].strip() if lines else ''
+        tab_title = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ''
+
+        if not tab_url:
+            return MacOSChromeTabIdentity(
+                platform='macos',
+                browser='chrome',
+                title=tab_title,
+                message='macOS Chrome active tab URL 缺失',
+                error_code='MACOS_CHROME_ACTIVE_TAB_URL_MISSING',
+            )
+
+        return MacOSChromeTabIdentity(
+            platform='macos',
+            browser='chrome',
+            url=tab_url,
+            title=tab_title,
+            message='macOS Chrome active tab URL/title 查询成功',
+        )
+    except subprocess.TimeoutExpired as exc:
+        return MacOSChromeTabIdentity(
+            platform='macos',
+            browser='chrome',
+            message=f'macOS osascript 调用超时: {exc}',
+            error_code='MACOS_OSASCRIPT_TIMEOUT',
+        )
+    except FileNotFoundError as exc:
+        return MacOSChromeTabIdentity(
+            platform='macos',
+            browser='chrome',
+            message=f'macOS osascript 不可用: {exc}',
+            error_code='MACOS_OSASCRIPT_UNAVAILABLE',
+        )
+    except OSError as exc:
+        return MacOSChromeTabIdentity(
+            platform='macos',
+            browser='chrome',
             message=f'macOS osascript 调用失败: {exc}',
             error_code='MACOS_OSASCRIPT_ERROR',
         )

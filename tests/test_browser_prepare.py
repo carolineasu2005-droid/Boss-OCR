@@ -123,6 +123,21 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertIn("MACOS_PERMISSIONS_NOT_READY", rendered)
         self.assertIn("does not validate window focus", rendered)
 
+    def test_preflight_only_does_not_query_chrome_tab_identity(self):
+        result = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            launched=True,
+            error_code="MACOS_PERMISSIONS_NOT_READY",
+        )
+        with patch.object(
+            simple_brush, "get_chrome_active_tab_identity"
+        ) as tab_identity:
+            self.assert_preflight_exits_without_business_actions(result)
+
+        tab_identity.assert_not_called()
+
     def test_preflight_only_exits_on_windows_macos_and_unknown_platforms(self):
         results = (
             simple_brush.BrowserPrepareResult(
@@ -496,6 +511,146 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertFalse(any("active tab" in script.lower() for script in seen_scripts))
         self.assertFalse(any("url" in script.lower() for script in seen_scripts))
         self.assertFalse(any("title" in script.lower() for script in seen_scripts))
+
+    def test_get_chrome_active_tab_identity_successfully_reads_url_and_title(self):
+        script_result = subprocess.CompletedProcess(
+            args=["osascript", "-e", "tab query"],
+            returncode=0,
+            stdout="https://www.zhipin.com/web/geek/job-recommend\nBOSS Page\n",
+            stderr="",
+        )
+        with (
+            patch.object(simple_brush, "run_osascript", return_value=script_result) as run,
+            patch.object(simple_brush, "focus_chrome_window") as focus,
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+        ):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        run.assert_called_once()
+        script_text = run.call_args.args[0]
+        self.assertIn('tell application "Google Chrome"', script_text)
+        self.assertIn('active tab of frontWindow', script_text)
+        self.assertNotIn('activate', script_text.lower())
+        self.assertEqual(result.platform, "macos")
+        self.assertEqual(result.browser, "chrome")
+        self.assertEqual(result.url, "https://www.zhipin.com/web/geek/job-recommend")
+        self.assertEqual(result.title, "BOSS Page")
+        self.assertEqual(result.error_code, "")
+        focus.assert_not_called()
+        click.assert_not_called()
+        move.assert_not_called()
+        press.assert_not_called()
+        scroll.assert_not_called()
+        hotkey.assert_not_called()
+        listener_start.assert_not_called()
+        initialize_ocr.assert_not_called()
+
+    def test_get_chrome_active_tab_identity_preserves_title_newlines(self):
+        script_result = subprocess.CompletedProcess(
+            args=["osascript", "-e", "tab query"],
+            returncode=0,
+            stdout="https://example.com\nLine 1\nLine 2\nLine 3\n",
+            stderr="",
+        )
+        with patch.object(simple_brush, "run_osascript", return_value=script_result):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.url, "https://example.com")
+        self.assertEqual(result.title, "Line 1\nLine 2\nLine 3")
+        self.assertEqual(result.error_code, "")
+
+    def test_get_chrome_active_tab_identity_missing_url_is_fail_closed(self):
+        script_result = subprocess.CompletedProcess(
+            args=["osascript", "-e", "tab query"],
+            returncode=0,
+            stdout="\nTitle Only\n",
+            stderr="",
+        )
+        with patch.object(simple_brush, "run_osascript", return_value=script_result):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.url, "")
+        self.assertEqual(result.title, "Title Only")
+        self.assertEqual(result.error_code, "MACOS_CHROME_ACTIVE_TAB_URL_MISSING")
+
+    def test_get_chrome_active_tab_identity_query_failure_is_fail_closed(self):
+        script_result = subprocess.CompletedProcess(
+            args=["osascript", "-e", "tab query"],
+            returncode=1,
+            stdout="",
+            stderr="apple event failed",
+        )
+        with patch.object(simple_brush, "run_osascript", return_value=script_result):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.error_code, "MACOS_CHROME_TAB_QUERY_FAILED")
+        self.assertIn("apple event failed", result.message)
+
+    def test_get_chrome_active_tab_identity_maps_no_front_window(self):
+        script_result = subprocess.CompletedProcess(
+            args=["osascript", "-e", "tab query"],
+            returncode=1,
+            stdout="",
+            stderr="NO_FRONT_WINDOW",
+        )
+        with patch.object(simple_brush, "run_osascript", return_value=script_result):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.error_code, "MACOS_CHROME_NO_FRONT_WINDOW")
+        self.assertIn("front window", result.message)
+
+    def test_get_chrome_active_tab_identity_maps_no_active_tab(self):
+        script_result = subprocess.CompletedProcess(
+            args=["osascript", "-e", "tab query"],
+            returncode=1,
+            stdout="",
+            stderr="NO_ACTIVE_TAB",
+        )
+        with patch.object(simple_brush, "run_osascript", return_value=script_result):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.error_code, "MACOS_CHROME_NO_ACTIVE_TAB")
+        self.assertIn("active tab", result.message)
+
+    def test_get_chrome_active_tab_identity_timeout_is_fail_closed(self):
+        with patch.object(
+            simple_brush,
+            "run_osascript",
+            side_effect=subprocess.TimeoutExpired(cmd=["osascript"], timeout=3.0),
+        ):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.error_code, "MACOS_OSASCRIPT_TIMEOUT")
+        self.assertEqual(result.url, "")
+        self.assertEqual(result.title, "")
+
+    def test_get_chrome_active_tab_identity_missing_osascript_is_fail_closed(self):
+        with patch.object(
+            simple_brush,
+            "run_osascript",
+            side_effect=FileNotFoundError("osascript not found"),
+        ):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.error_code, "MACOS_OSASCRIPT_UNAVAILABLE")
+        self.assertIn("osascript not found", result.message)
+
+    def test_get_chrome_active_tab_identity_osascript_oserror_is_fail_closed(self):
+        with patch.object(
+            simple_brush,
+            "run_osascript",
+            side_effect=OSError("apple events unavailable"),
+        ):
+            result = simple_brush.get_chrome_active_tab_identity()
+
+        self.assertEqual(result.error_code, "MACOS_OSASCRIPT_ERROR")
+        self.assertIn("apple events unavailable", result.message)
 
     def test_macos_successful_launch_is_started_but_not_ready(self):
         resolved = simple_brush.BrowserPrepareResult(
