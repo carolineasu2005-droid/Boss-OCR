@@ -17,6 +17,7 @@ logs/
 # Local project documentation
 *.md
 !README.md
+!Issue-Mac-2-chrome-launch-permission-baseline-acceptance-report.md
 !docs/
 !docs/*.md
 !release-notes/
