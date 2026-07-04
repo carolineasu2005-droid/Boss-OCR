@@ -70,7 +70,7 @@ class BrowserPrepareTests(unittest.TestCase):
             print_output = stack.enter_context(patch("builtins.print"))
             self.assertEqual(simple_brush.run(), 0)
 
-        prepare.assert_called_once_with()
+        prepare.assert_called_once_with(launch_safe_target=True)
         for name, mock in blocked_actions.items():
             with self.subTest(blocked_action=name):
                 mock.assert_not_called()
@@ -1236,6 +1236,19 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertTrue(
             simple_brush.is_allowed_boss_page("https://www.zhipin.com/web/jobs", None)
         )
+        self.assertTrue(
+            simple_brush.is_allowed_boss_page(
+                "https://www.zhipin.com/web/chat/recommend", None
+            )
+        )
+
+    def test_allowed_boss_page_denies_recommendation_lookalike(self):
+        self.assertFalse(
+            simple_brush.is_allowed_boss_page(
+                "https://www.zhipin.com/web/chat/recommendation",
+                "BOSS直聘",
+            )
+        )
 
     def test_allowed_boss_page_is_pure_and_does_not_query_or_focus_chrome(self):
         with (
@@ -1352,6 +1365,67 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertEqual(result.error_code, "CHROME_NOT_FOUND")
         self.assertTrue(result.message)
 
+    def test_macos_prepare_does_not_launch_about_blank_before_reading_existing_tab(self):
+        resolved = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            executable_path=str(simple_brush.MACOS_CHROME_EXECUTABLE),
+        )
+        permissions = simple_brush.MacOSPermissionStatus(
+            accessibility="unknown",
+            screen_recording="unknown",
+            keyboard_listener="unknown",
+            ready=False,
+            message="permissions unknown.",
+        )
+        focus = simple_brush.MacOSChromeFocusResult(
+            platform="macos",
+            browser="chrome",
+            activated=True,
+            frontmost=True,
+            message="frontmost",
+        )
+        tab = simple_brush.MacOSChromeTabIdentity(
+            platform="macos",
+            browser="chrome",
+            url="https://www.zhipin.com/web/chat/recommend",
+            title="BOSS直聘",
+        )
+        with (
+            patch.object(
+                simple_brush, "resolve_chrome_executable", return_value=resolved
+            ) as resolve,
+            patch.object(simple_brush, "launch_chrome_safe_target") as launch,
+            patch.object(
+                simple_brush, "check_macos_permissions", return_value=permissions
+            ) as permission_check,
+            patch.object(simple_brush, "focus_chrome_window", return_value=focus) as focus_check,
+            patch.object(
+                simple_brush, "get_chrome_active_tab_identity", return_value=tab
+            ) as tab_identity,
+            patch.object(
+                simple_brush,
+                "is_allowed_boss_page",
+                wraps=simple_brush.is_allowed_boss_page,
+            ) as page_allowed,
+        ):
+            result = simple_brush.prepare_browser("darwin")
+
+        resolve.assert_called_once_with()
+        launch.assert_not_called()
+        permission_check.assert_called_once_with()
+        focus_check.assert_called_once_with()
+        tab_identity.assert_called_once_with()
+        page_allowed.assert_called_once_with(tab.url, tab.title)
+        self.assertFalse(result.ready)
+        self.assertFalse(result.launched)
+        self.assertTrue(result.page_allowed)
+        self.assertEqual(result.page_url, tab.url)
+        self.assertEqual(
+            result.error_code, "MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY"
+        )
+
     def test_macos_launch_failure_stops_before_focus_tab_and_allowlist(self):
         resolved = simple_brush.BrowserPrepareResult(
             ready=False,
@@ -1382,7 +1456,7 @@ class BrowserPrepareTests(unittest.TestCase):
             ) as tab_identity,
             patch.object(simple_brush, "is_allowed_boss_page") as page_allowed,
         ):
-            result = simple_brush.prepare_browser("darwin")
+            result = simple_brush.prepare_browser("darwin", launch_safe_target=True)
 
         self.assertEqual(result.error_code, "CHROME_LAUNCH_FAILED")
         self.assertFalse(result.ready)
@@ -1855,12 +1929,12 @@ class BrowserPrepareTests(unittest.TestCase):
             result = simple_brush.prepare_browser("darwin")
 
         resolve.assert_called_once_with()
-        launch.assert_called_once_with(simple_brush.MACOS_CHROME_EXECUTABLE)
+        launch.assert_not_called()
         focus.assert_called_once_with()
         tab_identity.assert_not_called()
         page_allowed.assert_not_called()
         self.assertFalse(result.ready)
-        self.assertTrue(result.launched)
+        self.assertFalse(result.launched)
         self.assertFalse(result.focus_frontmost)
         self.assertEqual(result.error_code, "MACOS_CHROME_ACTIVATE_FAILED")
         self.assertIn("accessibility=unknown", result.message)
@@ -1897,7 +1971,7 @@ class BrowserPrepareTests(unittest.TestCase):
             ),
             patch.object(
                 simple_brush, "launch_chrome_safe_target", return_value=launched
-            ),
+            ) as launch,
             patch.object(simple_brush, "focus_chrome_window", return_value=focus),
             patch.object(
                 simple_brush,
@@ -1908,6 +1982,7 @@ class BrowserPrepareTests(unittest.TestCase):
         ):
             result = simple_brush.prepare_browser("darwin")
 
+        launch.assert_not_called()
         tab_identity.assert_called_once_with()
         page_allowed.assert_not_called()
         self.assertFalse(result.ready)
@@ -1953,7 +2028,7 @@ class BrowserPrepareTests(unittest.TestCase):
                         simple_brush,
                         "launch_chrome_safe_target",
                         return_value=launched,
-                    ),
+                    ) as launch,
                     patch.object(
                         simple_brush, "focus_chrome_window", return_value=focus
                     ),
@@ -1970,6 +2045,7 @@ class BrowserPrepareTests(unittest.TestCase):
                 ):
                     result = simple_brush.prepare_browser("darwin")
 
+                launch.assert_not_called()
                 page_allowed.assert_called_once_with(url, "Page")
                 self.assertFalse(result.ready)
                 self.assertFalse(result.page_allowed)
@@ -2017,7 +2093,7 @@ class BrowserPrepareTests(unittest.TestCase):
             ),
             patch.object(
                 simple_brush, "launch_chrome_safe_target", return_value=launched
-            ),
+            ) as launch,
             patch.object(
                 simple_brush, "check_macos_permissions", return_value=permissions
             ),
@@ -2031,6 +2107,7 @@ class BrowserPrepareTests(unittest.TestCase):
         ):
             result = simple_brush.prepare_browser("darwin")
 
+        launch.assert_not_called()
         page_allowed.assert_called_once_with(tab.url, tab.title)
         self.assertFalse(result.ready)
         self.assertTrue(result.focus_frontmost)
@@ -2118,7 +2195,7 @@ class BrowserPrepareTests(unittest.TestCase):
             result = simple_brush.prepare_browser("darwin")
 
         self.assertFalse(result.ready)
-        self.assertTrue(result.launched)
+        self.assertFalse(result.launched)
         self.assertEqual(result.error_code, "MACOS_PERMISSION_CHECK_FAILED")
         self.assertIn("diagnostic failed", result.message)
         self.assertIn("完全退出并重启宿主进程", result.message)
@@ -2176,7 +2253,7 @@ class BrowserPrepareTests(unittest.TestCase):
             result = simple_brush.prepare_browser("darwin")
 
         self.assertFalse(result.ready)
-        self.assertTrue(result.launched)
+        self.assertFalse(result.launched)
         self.assertTrue(result.page_allowed)
         self.assertEqual(
             result.error_code, "MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY"

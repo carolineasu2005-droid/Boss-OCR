@@ -3427,14 +3427,25 @@ def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
     if parsed.netloc != 'www.zhipin.com' or port is not None:
         return False
 
+    if parsed.path == '/':
+        return True
+
+    bounded_prefixes = (
+        '/web/chat/recommend',
+    )
+    for prefix in bounded_prefixes:
+        if parsed.path == prefix or parsed.path.startswith(f'{prefix}/'):
+            return True
+
     allowed_prefixes = (
-        '/web/',
+        '/web/geek/',
+        '/web/jobs',
         '/geek/',
         '/job_detail/',
         '/chat/',
         '/boss/',
     )
-    return parsed.path == '/' or parsed.path.startswith(allowed_prefixes)
+    return parsed.path.startswith(allowed_prefixes)
 
 
 def region_around(x, y, radius):
@@ -3788,7 +3799,7 @@ def bring_edge_foreground():
 
 # ─── 基础工具 ───────────────────────────────────────
 
-def prepare_browser(platform_name=None):
+def prepare_browser(platform_name=None, *, launch_safe_target=False):
     """Prepare the supported browser without leaking platform details to run()."""
     current_platform = sys.platform if platform_name is None else platform_name
 
@@ -3806,9 +3817,12 @@ def prepare_browser(platform_name=None):
         resolved = resolve_chrome_executable()
         if resolved.error_code:
             return resolved
-        launched = launch_chrome_safe_target(Path(resolved.executable_path))
-        if not launched.launched:
-            return launched
+        executable_path = resolved.executable_path
+        launched = None
+        if launch_safe_target:
+            launched = launch_chrome_safe_target(Path(executable_path))
+            if not launched.launched:
+                return launched
         try:
             permissions = check_macos_permissions()
         except Exception as exc:
@@ -3816,8 +3830,10 @@ def prepare_browser(platform_name=None):
                 ready=False,
                 platform='macos',
                 browser='chrome',
-                launched=True,
-                executable_path=launched.executable_path,
+                launched=launch_safe_target,
+                executable_path=(
+                    launched.executable_path if launched is not None else executable_path
+                ),
                 message=f'macOS 权限诊断失败: {exc}。{MACOS_PERMISSION_GUIDANCE}',
                 error_code='MACOS_PERMISSION_CHECK_FAILED',
             )
@@ -3828,8 +3844,10 @@ def prepare_browser(platform_name=None):
                 ready=False,
                 platform='macos',
                 browser='chrome',
-                launched=True,
-                executable_path=launched.executable_path,
+                launched=launch_safe_target,
+                executable_path=(
+                    launched.executable_path if launched is not None else executable_path
+                ),
                 message=f'{permissions.message} {focus.message}',
                 error_code=focus.error_code,
                 focus_frontmost=False,
@@ -3841,8 +3859,10 @@ def prepare_browser(platform_name=None):
                 ready=False,
                 platform='macos',
                 browser='chrome',
-                launched=True,
-                executable_path=launched.executable_path,
+                launched=launch_safe_target,
+                executable_path=(
+                    launched.executable_path if launched is not None else executable_path
+                ),
                 message=f'{permissions.message} {focus.message}。{tab.message}',
                 error_code=tab.error_code,
                 focus_frontmost=True,
@@ -3857,8 +3877,10 @@ def prepare_browser(platform_name=None):
                 ready=False,
                 platform='macos',
                 browser='chrome',
-                launched=True,
-                executable_path=launched.executable_path,
+                launched=launch_safe_target,
+                executable_path=(
+                    launched.executable_path if launched is not None else executable_path
+                ),
                 message=(
                     f'{permissions.message} {focus.message}。active tab 页面不在 '
                     'BOSS 身份白名单中；不放行业务动作。'
@@ -3872,11 +3894,13 @@ def prepare_browser(platform_name=None):
             )
 
         return BrowserPrepareResult(
-            ready=False,
+            ready=True,
             platform='macos',
             browser='chrome',
-            launched=True,
-            executable_path=launched.executable_path,
+            launched=launch_safe_target,
+            executable_path=(
+                launched.executable_path if launched is not None else executable_path
+            ),
             message=(
                 f'{permissions.message} {focus.message}。active tab 页面身份允许，'
                 '但 Retina 坐标、校准、OCR 与真实业务动作尚未完成；不放行业务动作。'
@@ -4953,7 +4977,7 @@ def check_macos_permissions():
 
 def run_preflight_only(_cli_args=None):
     """Run browser and permission preparation diagnostics, then always exit."""
-    result = prepare_browser()
+    result = prepare_browser(launch_safe_target=True)
     print('Browser preflight only (no business actions):')
     print(f'  platform: {result.platform}')
     print(f'  browser: {result.browser or "unsupported"}')
@@ -5539,23 +5563,19 @@ def click_in_region(region):
 
 def get_clipboard_text():
     """读取剪贴板文本（CF_UNICODETEXT）。失败返回空字符串。"""
-    if not IS_WINDOWS:
-        return ""
-
-    try:
-        win32clipboard.OpenClipboard()
-        if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-            data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-        else:
-            data = ""
-        win32clipboard.CloseClipboard()
-        return data
-    except Exception:
+    if sys.platform == 'darwin':
         try:
-            win32clipboard.CloseClipboard()
+            result = subprocess.run(
+                ['pbpaste'],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout
         except Exception:
-            pass
-        return ""
+            return ''
 
 
 def type_text_human(text):
@@ -6016,15 +6036,20 @@ def forward_one_candidate():
         time.sleep(0.1)
         if stop_event:
             return False
-        pyautogui.hotkey('ctrl', 'a')
-        time.sleep(0.05)
+        pyautogui.hotkey('command', 'a')
+        time.sleep(0.2)
         if stop_event:
             return False
-        pyautogui.hotkey('ctrl', 'c')
-        time.sleep(0.08)
+        pyautogui.hotkey('command', 'c')
+        time.sleep(0.28)
         if stop_event:
             return False
-        box_text = get_clipboard_text().strip()
+        box_text = ''
+        for _ in range(5):
+            box_text = get_clipboard_text().strip()
+            if box_text:
+                break
+            time.sleep(0.15)
 
         if '@' in box_text and '.' in box_text:
             logger.info(f'  ✓ 邮箱已自动填入: {box_text}')
@@ -6037,7 +6062,7 @@ def forward_one_candidate():
                 time.sleep(0.1)
                 if stop_event:
                     return False
-                pyautogui.hotkey('ctrl', 'a')
+                pyautogui.hotkey('command', 'a')
                 time.sleep(0.05)
                 if stop_event:
                     return False
