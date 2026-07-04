@@ -38,6 +38,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "ocr_backend",
                 "ocr_capture",
                 "ocr_detector",
+                "ocr_calibrated_region",
                 "ocr_initialization_attempted",
                 "ocr_calibration_attempted",
                 "ocr_calibration_in_progress",
@@ -59,6 +60,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.paused = False
         simple_brush.run_duration_seconds = 0
         simple_brush._programmatic_esc = False
+        simple_brush.ocr_calibrated_region = None
 
     def tearDown(self):
         for name, value in self.saved.items():
@@ -1005,6 +1007,241 @@ class SimpleBrushOCRTests(unittest.TestCase):
             self.assertFalse(simple_brush.ensure_ocr_region_calibrated())
         self.assertEqual(select.call_count, 1)
         self.assertFalse(simple_brush.stop_event)
+
+    def test_attach_coordinate_metadata_none_preserves_screen_region(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+
+        calibrated = simple_brush.attach_coordinate_metadata_to_region(
+            region,
+            None,
+        )
+
+        self.assertIs(calibrated.region, region)
+        self.assertIsNone(calibrated.coordinate_metadata)
+
+    def test_coordinate_calibration_metadata_carries_validated_evidence(self):
+        scale = simple_brush.infer_retina_scale((1000, 800), (2000, 1600))
+        selection = simple_brush.TkSelectionRegion(10, 20, 100, 50)
+        mapping = simple_brush.map_tk_selection_to_screenshot_crop(
+            selection,
+            (1000, 800),
+            (2000, 1600),
+        )
+        preview = simple_brush.CropPreviewResult(
+            saved=True,
+            preview_path="logs/macos-coordinate-diagnostics/test/crop.png",
+            crop_size=(200, 100),
+            message="saved",
+        )
+
+        metadata = simple_brush.build_coordinate_calibration_metadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=scale,
+            tk_to_screenshot_mapping=mapping,
+            crop_preview=preview,
+            preview_confirmed=True,
+        )
+
+        self.assertEqual(metadata.display_fingerprint, "display-fingerprint")
+        self.assertIs(metadata.scale_inference, scale)
+        self.assertIs(metadata.tk_to_screenshot_mapping, mapping)
+        self.assertIs(metadata.crop_preview, preview)
+        self.assertTrue(metadata.validated)
+        self.assertTrue(metadata.manually_confirmed)
+        self.assertFalse(metadata.business_ready)
+        self.assertEqual(
+            metadata.error_code,
+            "COORDINATE_CALIBRATION_VALIDATED_NOT_BUSINESS_READY",
+        )
+
+    def test_coordinate_calibration_failed_scale_is_not_validated(self):
+        failed_scale = simple_brush.infer_retina_scale(
+            (1000, 800),
+            (2000, 1200),
+        )
+        mapping = simple_brush.map_tk_selection_to_screenshot_crop(
+            simple_brush.TkSelectionRegion(10, 20, 100, 50),
+            (1000, 800),
+            (2000, 1600),
+        )
+        metadata = simple_brush.build_coordinate_calibration_metadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=failed_scale,
+            tk_to_screenshot_mapping=mapping,
+            crop_preview=None,
+        )
+
+        self.assertFalse(metadata.validated)
+        self.assertFalse(metadata.manually_confirmed)
+        self.assertFalse(metadata.business_ready)
+        self.assertEqual(
+            metadata.error_code,
+            "COORDINATE_CALIBRATION_SCALE_NOT_VALIDATED",
+        )
+
+    def test_coordinate_calibration_failed_mapping_is_not_validated(self):
+        scale = simple_brush.infer_retina_scale((1000, 800), (2000, 1600))
+        failed_mapping = simple_brush.map_tk_selection_to_screenshot_crop(
+            simple_brush.TkSelectionRegion(-1, 20, 100, 50),
+            (1000, 800),
+            (2000, 1600),
+        )
+        metadata = simple_brush.build_coordinate_calibration_metadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=scale,
+            tk_to_screenshot_mapping=failed_mapping,
+            crop_preview=None,
+        )
+
+        self.assertFalse(metadata.validated)
+        self.assertFalse(metadata.manually_confirmed)
+        self.assertEqual(
+            metadata.error_code,
+            "COORDINATE_CALIBRATION_MAPPING_NOT_VALIDATED",
+        )
+
+    def test_coordinate_calibration_unsaved_preview_is_not_confirmed(self):
+        scale = simple_brush.infer_retina_scale((1000, 800), (2000, 1600))
+        mapping = simple_brush.map_tk_selection_to_screenshot_crop(
+            simple_brush.TkSelectionRegion(10, 20, 100, 50),
+            (1000, 800),
+            (2000, 1600),
+        )
+        preview = simple_brush.CropPreviewResult(
+            saved=False,
+            preview_path=None,
+            crop_size=None,
+            message="not saved",
+            error_code="CROP_PREVIEW_SAVE_FAILED",
+        )
+        metadata = simple_brush.build_coordinate_calibration_metadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=scale,
+            tk_to_screenshot_mapping=mapping,
+            crop_preview=preview,
+            preview_confirmed=True,
+        )
+
+        self.assertTrue(metadata.validated)
+        self.assertFalse(metadata.manually_confirmed)
+        self.assertFalse(metadata.business_ready)
+        self.assertEqual(
+            metadata.error_code,
+            "COORDINATE_CALIBRATION_PREVIEW_NOT_CONFIRMED",
+        )
+
+    def test_coordinate_calibration_missing_fingerprint_is_fail_closed(self):
+        scale = simple_brush.infer_retina_scale((1000, 800), (2000, 1600))
+        mapping = simple_brush.map_tk_selection_to_screenshot_crop(
+            simple_brush.TkSelectionRegion(10, 20, 100, 50),
+            (1000, 800),
+            (2000, 1600),
+        )
+        metadata = simple_brush.build_coordinate_calibration_metadata(
+            display_fingerprint=None,
+            scale_inference=scale,
+            tk_to_screenshot_mapping=mapping,
+            crop_preview=None,
+        )
+
+        self.assertFalse(metadata.validated)
+        self.assertEqual(
+            metadata.error_code,
+            "COORDINATE_CALIBRATION_METADATA_MISSING",
+        )
+
+    def test_ocr_calibration_publishes_metadata_without_running_ocr(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        scale = simple_brush.infer_retina_scale((1000, 800), (2000, 1600))
+        mapping = simple_brush.map_tk_selection_to_screenshot_crop(
+            simple_brush.TkSelectionRegion(10, 20, 100, 50),
+            (1000, 800),
+            (2000, 1600),
+        )
+        metadata = simple_brush.build_coordinate_calibration_metadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=scale,
+            tk_to_screenshot_mapping=mapping,
+            crop_preview=None,
+        )
+        simple_brush.ocr_backend = Mock(name="backend")
+        simple_brush.ocr_capture = Mock(name="capture")
+        simple_brush.ocr_detector = None
+        simple_brush.ocr_initialization_attempted = True
+        simple_brush.ocr_calibration_attempted = False
+        detector = Mock(name="detector")
+
+        with (
+            patch.object(simple_brush, "select_screen_region", return_value=region),
+            patch.object(
+                simple_brush,
+                "save_region_preview",
+                return_value=simple_brush.OCR_PREVIEW_PATH,
+            ),
+            patch.object(
+                simple_brush, "OCRKeywordDetector", return_value=detector
+            ) as detector_factory,
+            patch.object(simple_brush, "RapidOCRBackend") as rapid_ocr,
+            patch.object(simple_brush, "MSSScreenCapture") as screen_capture,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush, "forward_one_candidate") as forward,
+        ):
+            result = simple_brush.ensure_ocr_region_calibrated(metadata)
+
+        self.assertTrue(result)
+        self.assertIs(simple_brush.ocr_detector, detector)
+        self.assertEqual(simple_brush.ocr_calibrated_region.region, region)
+        self.assertIs(
+            simple_brush.ocr_calibrated_region.coordinate_metadata,
+            metadata,
+        )
+        detector_factory.assert_called_once()
+        self.assertEqual(detector_factory.call_args.kwargs["region"], region)
+        detector.detect.assert_not_called()
+        simple_brush.ocr_capture.capture.assert_not_called()
+        rapid_ocr.assert_not_called()
+        screen_capture.assert_not_called()
+        listener_start.assert_not_called()
+        click.assert_not_called()
+        move.assert_not_called()
+        press.assert_not_called()
+        scroll.assert_not_called()
+        forward.assert_not_called()
+
+    def test_ocr_calibration_metadata_publish_rolls_back_atomically(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        simple_brush.ocr_backend = Mock(name="backend")
+        simple_brush.ocr_capture = Mock(name="capture")
+        simple_brush.ocr_detector = None
+        simple_brush.ocr_calibrated_region = None
+        simple_brush.ocr_initialization_attempted = True
+        simple_brush.ocr_calibration_attempted = False
+
+        with (
+            patch.object(simple_brush, "select_screen_region", return_value=region),
+            patch.object(
+                simple_brush,
+                "save_region_preview",
+                return_value=simple_brush.OCR_PREVIEW_PATH,
+            ),
+            patch.object(
+                simple_brush,
+                "OCRKeywordDetector",
+                side_effect=RuntimeError("detector construction failed"),
+            ),
+            patch.object(simple_brush.logger, "exception") as log_exception,
+        ):
+            result = simple_brush.ensure_ocr_region_calibrated()
+
+        self.assertFalse(result)
+        self.assertIsNone(simple_brush.ocr_detector)
+        self.assertIsNone(simple_brush.ocr_calibrated_region)
+        self.assertFalse(simple_brush.ocr_calibration_in_progress)
+        log_exception.assert_called_once()
 
     def test_no_forward_argument_is_parsed(self):
         with patch.object(

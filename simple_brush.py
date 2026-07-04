@@ -25,7 +25,7 @@ import math
 import logging
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -303,6 +303,29 @@ class CropPreviewResult:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class CoordinateCalibrationMetadata:
+    """Coordinate evidence attached to a calibration, never business approval."""
+
+    display_fingerprint: str | None
+    scale_inference: RetinaScaleInference | None
+    tk_to_screenshot_mapping: TkToScreenshotMapping | None
+    crop_preview: CropPreviewResult | None
+    validated: bool
+    manually_confirmed: bool
+    message: str
+    error_code: str | None = None
+    business_ready: bool = field(default=False, init=False)
+
+
+@dataclass(frozen=True)
+class CalibratedScreenRegion:
+    """Backward-compatible ScreenRegion plus optional coordinate evidence."""
+
+    region: ScreenRegion
+    coordinate_metadata: CoordinateCalibrationMetadata | None = None
+
+
 def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
     """Return whether a URL passes the conservative BOSS page identity gate.
 
@@ -458,6 +481,7 @@ focus_restore_calibration_in_progress = False
 ocr_backend = None
 ocr_capture = None
 ocr_detector = None
+ocr_calibrated_region = None
 ocr_initialization_attempted = False
 ocr_calibration_attempted = False
 ocr_calibration_in_progress = False
@@ -1312,6 +1336,94 @@ def save_crop_preview_for_manual_check(
     )
 
 
+def build_coordinate_calibration_metadata(
+    *,
+    display_fingerprint,
+    scale_inference,
+    tk_to_screenshot_mapping,
+    crop_preview,
+    preview_confirmed=False,
+):
+    """Build fail-closed coordinate evidence without touching screen APIs."""
+    fingerprint_valid = (
+        isinstance(display_fingerprint, str) and bool(display_fingerprint.strip())
+    )
+    scale_valid = (
+        isinstance(scale_inference, RetinaScaleInference)
+        and scale_inference.passed
+    )
+    mapping_valid = (
+        isinstance(tk_to_screenshot_mapping, TkToScreenshotMapping)
+        and tk_to_screenshot_mapping.passed
+        and tk_to_screenshot_mapping.crop_region is not None
+    )
+    preview_saved = (
+        isinstance(crop_preview, CropPreviewResult)
+        and crop_preview.saved
+        and bool(crop_preview.preview_path)
+    )
+    validated = fingerprint_valid and scale_valid and mapping_valid
+    manually_confirmed = (
+        validated and preview_saved and preview_confirmed is True
+    )
+
+    if not fingerprint_valid:
+        message = '坐标校准 metadata 缺少 display fingerprint'
+        error_code = 'COORDINATE_CALIBRATION_METADATA_MISSING'
+    elif not scale_valid:
+        message = '坐标校准 scale inference 未通过验证'
+        error_code = 'COORDINATE_CALIBRATION_SCALE_NOT_VALIDATED'
+    elif not mapping_valid:
+        message = 'Tk selection 到 screenshot crop mapping 未通过验证'
+        error_code = 'COORDINATE_CALIBRATION_MAPPING_NOT_VALIDATED'
+    elif not manually_confirmed:
+        message = 'crop preview 尚未保存并由人工确认'
+        error_code = 'COORDINATE_CALIBRATION_PREVIEW_NOT_CONFIRMED'
+    else:
+        message = (
+            '坐标校准 metadata 已验证并经人工确认；'
+            '仍不代表 OCR 或真实业务可用'
+        )
+        error_code = 'COORDINATE_CALIBRATION_VALIDATED_NOT_BUSINESS_READY'
+
+    return CoordinateCalibrationMetadata(
+        display_fingerprint=(
+            display_fingerprint.strip() if fingerprint_valid else None
+        ),
+        scale_inference=(
+            scale_inference
+            if isinstance(scale_inference, RetinaScaleInference)
+            else None
+        ),
+        tk_to_screenshot_mapping=(
+            tk_to_screenshot_mapping
+            if isinstance(tk_to_screenshot_mapping, TkToScreenshotMapping)
+            else None
+        ),
+        crop_preview=(
+            crop_preview if isinstance(crop_preview, CropPreviewResult) else None
+        ),
+        validated=validated,
+        manually_confirmed=manually_confirmed,
+        message=message,
+        error_code=error_code,
+    )
+
+
+def attach_coordinate_metadata_to_region(region, metadata=None):
+    """Attach optional evidence while preserving the original ScreenRegion."""
+    if not isinstance(region, ScreenRegion):
+        raise TypeError('region 必须是 ScreenRegion')
+    if metadata is not None and not isinstance(
+        metadata, CoordinateCalibrationMetadata
+    ):
+        raise TypeError('metadata 必须是 CoordinateCalibrationMetadata 或 None')
+    return CalibratedScreenRegion(
+        region=region,
+        coordinate_metadata=metadata,
+    )
+
+
 def capture_screen_coordinate_diagnostics():
     """Collect read-only coordinate metadata without screenshots or input."""
     platform_name = sys.platform
@@ -2071,9 +2183,10 @@ def remaining_stay_seconds(target_seconds, started_at, now=None):
     return max(0.0, target_seconds - (current - started_at))
 
 
-def ensure_ocr_region_calibrated():
+def ensure_ocr_region_calibrated(coordinate_metadata=None):
     """Calibrate once after the first candidate detail is visible."""
-    global ocr_detector, ocr_calibration_attempted, ocr_calibration_in_progress
+    global ocr_detector, ocr_calibrated_region
+    global ocr_calibration_attempted, ocr_calibration_in_progress
 
     if ocr_detector is not None:
         return True
@@ -2090,6 +2203,21 @@ def ensure_ocr_region_calibrated():
     try:
         region = select_screen_region()
         preview = save_region_preview(region, OCR_PREVIEW_PATH, ocr_capture.capture)
+        calibrated_region = attach_coordinate_metadata_to_region(
+            region,
+            coordinate_metadata,
+        )
+        new_detector = OCRKeywordDetector(
+            backend=ocr_backend,
+            capture=ocr_capture,
+            region=region,
+            max_scans=OCR_MAX_SCANS,
+            min_confidence=OCR_MIN_CONFIDENCE,
+            scroll=ocr_scroll_down,
+            wait=ocr_wait,
+            settle_seconds=OCR_SETTLE_SECONDS,
+            confirmation_seconds=OCR_CONFIRMATION_SECONDS,
+        )
     except CalibrationCancelled:
         logger.warning('🛡 OCR 校准已取消，本次运行禁用自动转发并继续浏览')
         return False
@@ -2099,17 +2227,10 @@ def ensure_ocr_region_calibrated():
     finally:
         ocr_calibration_in_progress = False
 
-    ocr_detector = OCRKeywordDetector(
-        backend=ocr_backend,
-        capture=ocr_capture,
-        region=region,
-        max_scans=OCR_MAX_SCANS,
-        min_confidence=OCR_MIN_CONFIDENCE,
-        scroll=ocr_scroll_down,
-        wait=ocr_wait,
-        settle_seconds=OCR_SETTLE_SECONDS,
-        confirmation_seconds=OCR_CONFIRMATION_SECONDS,
-    )
+    # Publish detector and coordinate evidence together only after all
+    # construction steps succeed. Existing OCR still receives ScreenRegion.
+    ocr_detector = new_detector
+    ocr_calibrated_region = calibrated_region
     logger.info(
         '✅ OCR 校准完成: left=%s top=%s width=%s height=%s',
         region.left,
