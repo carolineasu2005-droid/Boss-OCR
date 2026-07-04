@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import platform
+import time
 from typing import Callable, Optional, Tuple
 
 
@@ -103,10 +104,65 @@ class CalibrationCancelled(RuntimeError):
     pass
 
 
+class CalibrationCleanupFailed(RuntimeError):
+    pass
+
+
+_tk_overlay_cleanup_completed = True
+
+
+def is_tk_overlay_cleanup_complete() -> bool:
+    """Return whether the most recent Tk overlay was destroyed and settled."""
+    return _tk_overlay_cleanup_completed
+
+
+def cleanup_tk_overlay(
+    root,
+    *,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    settle_seconds: float = 0.2,
+) -> None:
+    """Synchronously hide, flush, destroy, and settle one Tk overlay."""
+    global _tk_overlay_cleanup_completed
+    _tk_overlay_cleanup_completed = False
+    if not callable(sleep_fn):
+        raise TypeError("sleep_fn must be callable")
+    if settle_seconds < 0:
+        raise ValueError("settle_seconds must be non-negative")
+
+    cleanup_errors = []
+    for operation in (
+        root.quit,
+        lambda: root.attributes("-topmost", False),
+        root.withdraw,
+        root.update_idletasks,
+        root.update,
+    ):
+        try:
+            operation()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+    try:
+        root.destroy()
+    except Exception as exc:
+        cleanup_errors.append(exc)
+
+    if cleanup_errors:
+        raise CalibrationCleanupFailed(
+            f"Tk overlay cleanup failed: {cleanup_errors[0]}"
+        ) from cleanup_errors[0]
+
+    sleep_fn(settle_seconds)
+    _tk_overlay_cleanup_completed = True
+
+
 def select_screen_region(
     min_size: int = 80,
     instruction: str = "拖动框选候选人详情区域 · Esc 取消",
     subtitle: str = "第一版仅支持主显示器",
+    overlay_cleanup_fn=None,
+    cleanup_sleep_fn: Callable[[float], None] = time.sleep,
+    cleanup_settle_seconds: float = 0.2,
 ) -> ScreenRegion:
     """Show a primary-monitor Tk overlay and return physical MSS coordinates."""
 
@@ -115,42 +171,10 @@ def select_screen_region(
 
     monitor = primary_monitor_region()
     root = tk.Tk()
-    root.overrideredirect(True)
-    root.geometry(
-        f"{monitor.width}x{monitor.height}{monitor.left:+d}{monitor.top:+d}"
-    )
-    root.attributes("-topmost", True)
-    try:
-        root.attributes("-alpha", 0.28)
-    except tk.TclError:
-        pass
-    root.configure(cursor="crosshair", bg="black")
-
-    canvas = tk.Canvas(root, bg="black", highlightthickness=0, cursor="crosshair")
-    canvas.pack(fill=tk.BOTH, expand=True)
-    canvas.create_text(
-        24,
-        24,
-        anchor="nw",
-        fill="white",
-        font=("Arial", 18, "bold"),
-        text=instruction,
-    )
-    size_text = canvas.create_text(
-        24,
-        56,
-        anchor="nw",
-        fill="white",
-        font=("Arial", 13),
-        text=subtitle,
-    )
-
-    state = {
-        "start": None,
-        "rect": None,
-        "region": None,
-        "cancelled": False,
-    }
+    cleanup = overlay_cleanup_fn or cleanup_tk_overlay
+    global _tk_overlay_cleanup_completed
+    _tk_overlay_cleanup_completed = False
+    state = {"start": None, "rect": None, "region": None, "cancelled": False}
 
     def on_press(event):
         state["start"] = (event.x, event.y)
@@ -200,14 +224,62 @@ def select_screen_region(
         state["cancelled"] = True
         root.quit()
 
-    canvas.bind("<ButtonPress-1>", on_press)
-    canvas.bind("<B1-Motion>", on_drag)
-    canvas.bind("<ButtonRelease-1>", on_release)
-    root.bind("<Escape>", on_cancel)
-    root.lift()
-    root.focus_force()
-    root.mainloop()
-    root.destroy()
+    try:
+        root.overrideredirect(True)
+        root.geometry(
+            f"{monitor.width}x{monitor.height}{monitor.left:+d}{monitor.top:+d}"
+        )
+        root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", 0.28)
+        except tk.TclError:
+            pass
+        root.configure(cursor="crosshair", bg="black")
+
+        canvas = tk.Canvas(
+            root,
+            bg="black",
+            highlightthickness=0,
+            cursor="crosshair",
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.create_text(
+            24,
+            24,
+            anchor="nw",
+            fill="white",
+            font=("Arial", 18, "bold"),
+            text=instruction,
+        )
+        size_text = canvas.create_text(
+            24,
+            56,
+            anchor="nw",
+            fill="white",
+            font=("Arial", 13),
+            text=subtitle,
+        )
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        root.bind("<Escape>", on_cancel)
+        root.lift()
+        root.focus_force()
+        root.mainloop()
+    finally:
+        try:
+            cleanup(
+                root,
+                sleep_fn=cleanup_sleep_fn,
+                settle_seconds=cleanup_settle_seconds,
+            )
+        except CalibrationCleanupFailed:
+            raise
+        except Exception as exc:
+            raise CalibrationCleanupFailed(
+                f"Tk overlay cleanup failed: {exc}"
+            ) from exc
 
     if state["cancelled"] or state["region"] is None:
         raise CalibrationCancelled("OCR region calibration cancelled")

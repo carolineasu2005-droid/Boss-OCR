@@ -1,5 +1,6 @@
 from contextlib import ExitStack
 from dataclasses import replace
+import sys
 import tempfile
 import subprocess
 import unittest
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import ocr_calibration
 import simple_brush
 
 
@@ -2754,6 +2756,202 @@ class MacSafeBrowseCLITests(unittest.TestCase):
         )
 
 
+class TkOverlayLifecycleTests(unittest.TestCase):
+    class FakeCanvas:
+        def __init__(self):
+            self.bindings = {}
+
+        def pack(self, **_kwargs):
+            return None
+
+        def create_text(self, *_args, **_kwargs):
+            return 1
+
+        def create_rectangle(self, *_args, **_kwargs):
+            return 2
+
+        def delete(self, *_args):
+            return None
+
+        def coords(self, *_args):
+            return None
+
+        def itemconfigure(self, *_args, **_kwargs):
+            return None
+
+        def winfo_width(self):
+            return 1000
+
+        def winfo_height(self):
+            return 800
+
+        def bind(self, event_name, callback):
+            self.bindings[event_name] = callback
+
+    class FakeRoot:
+        def __init__(self, mainloop_mode):
+            self.mainloop_mode = mainloop_mode
+            self.bindings = {}
+            self.canvas = None
+
+        def overrideredirect(self, *_args):
+            return None
+
+        def geometry(self, *_args):
+            return None
+
+        def attributes(self, *_args):
+            return None
+
+        def configure(self, **_kwargs):
+            return None
+
+        def bind(self, event_name, callback):
+            self.bindings[event_name] = callback
+
+        def lift(self):
+            return None
+
+        def focus_force(self):
+            return None
+
+        def quit(self):
+            return None
+
+        def mainloop(self):
+            if self.mainloop_mode == "success":
+                self.canvas.bindings["<ButtonPress-1>"](
+                    SimpleNamespace(x=10, y=20)
+                )
+                self.canvas.bindings["<ButtonRelease-1>"](
+                    SimpleNamespace(x=210, y=220)
+                )
+                return
+            if self.mainloop_mode == "cancel":
+                self.bindings["<Escape>"](SimpleNamespace())
+                return
+            raise RuntimeError("mainloop failed")
+
+    def fake_tk_module(self, root):
+        def canvas_factory(_root, **_kwargs):
+            canvas = self.FakeCanvas()
+            root.canvas = canvas
+            return canvas
+
+        return SimpleNamespace(
+            Tk=Mock(return_value=root),
+            Canvas=canvas_factory,
+            BOTH="both",
+            TclError=RuntimeError,
+        )
+
+    def run_selection(self, mainloop_mode, cleanup_fn):
+        root = self.FakeRoot(mainloop_mode)
+        with (
+            patch.dict(sys.modules, {"tkinter": self.fake_tk_module(root)}),
+            patch.object(
+                ocr_calibration,
+                "primary_monitor_region",
+                return_value=ocr_calibration.ScreenRegion(0, 0, 1000, 800),
+            ),
+        ):
+            result = ocr_calibration.select_screen_region(
+                overlay_cleanup_fn=cleanup_fn,
+                cleanup_sleep_fn=Mock(),
+                cleanup_settle_seconds=0.2,
+            )
+        return root, result
+
+    def test_successful_selection_always_runs_overlay_cleanup(self):
+        cleanup = Mock()
+
+        root, region = self.run_selection("success", cleanup)
+
+        self.assertEqual(region, ocr_calibration.ScreenRegion(10, 20, 200, 200))
+        cleanup.assert_called_once()
+        self.assertIs(cleanup.call_args.args[0], root)
+
+    def test_cancelled_selection_always_runs_overlay_cleanup(self):
+        cleanup = Mock()
+        root = self.FakeRoot("cancel")
+        with (
+            patch.dict(sys.modules, {"tkinter": self.fake_tk_module(root)}),
+            patch.object(
+                ocr_calibration,
+                "primary_monitor_region",
+                return_value=ocr_calibration.ScreenRegion(0, 0, 1000, 800),
+            ),
+            self.assertRaises(ocr_calibration.CalibrationCancelled),
+        ):
+            ocr_calibration.select_screen_region(overlay_cleanup_fn=cleanup)
+
+        cleanup.assert_called_once()
+        self.assertIs(cleanup.call_args.args[0], root)
+
+    def test_selection_exception_always_runs_overlay_cleanup(self):
+        cleanup = Mock()
+        root = self.FakeRoot("exception")
+        with (
+            patch.dict(sys.modules, {"tkinter": self.fake_tk_module(root)}),
+            patch.object(
+                ocr_calibration,
+                "primary_monitor_region",
+                return_value=ocr_calibration.ScreenRegion(0, 0, 1000, 800),
+            ),
+            self.assertRaisesRegex(RuntimeError, "mainloop failed"),
+        ):
+            ocr_calibration.select_screen_region(overlay_cleanup_fn=cleanup)
+
+        cleanup.assert_called_once()
+        self.assertIs(cleanup.call_args.args[0], root)
+
+    def test_cleanup_failure_replaces_selection_success_with_fail_closed_error(self):
+        cleanup = Mock(side_effect=RuntimeError("destroy failed"))
+
+        with self.assertRaises(
+            ocr_calibration.CalibrationCleanupFailed
+        ) as caught:
+            self.run_selection("success", cleanup)
+
+        self.assertIn("destroy failed", str(caught.exception))
+
+    def test_cleanup_hides_flushes_destroys_and_waits_for_window_server(self):
+        root = SimpleNamespace(
+            quit=Mock(),
+            attributes=Mock(),
+            withdraw=Mock(),
+            update_idletasks=Mock(),
+            update=Mock(),
+            destroy=Mock(),
+        )
+        sleep_fn = Mock()
+
+        ocr_calibration.cleanup_tk_overlay(root, sleep_fn=sleep_fn)
+
+        root.quit.assert_called_once_with()
+        root.attributes.assert_called_once_with("-topmost", False)
+        root.withdraw.assert_called_once_with()
+        root.update_idletasks.assert_called_once_with()
+        root.update.assert_called_once_with()
+        root.destroy.assert_called_once_with()
+        sleep_fn.assert_called_once_with(0.2)
+        self.assertTrue(ocr_calibration.is_tk_overlay_cleanup_complete())
+
+    def test_destroy_failure_leaves_cleanup_incomplete(self):
+        root = SimpleNamespace(
+            quit=Mock(),
+            attributes=Mock(),
+            withdraw=Mock(),
+            update_idletasks=Mock(),
+            update=Mock(),
+            destroy=Mock(side_effect=RuntimeError("destroy failed")),
+        )
+        with self.assertRaises(ocr_calibration.CalibrationCleanupFailed):
+            ocr_calibration.cleanup_tk_overlay(root, sleep_fn=Mock())
+
+        self.assertFalse(ocr_calibration.is_tk_overlay_cleanup_complete())
+
+
 class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
     def parse(self, *args):
         with patch.object(
@@ -2801,6 +2999,21 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
 
     def capture_image(self, width=600, height=400, channels=3):
         return np.zeros((height, width, channels), dtype=np.uint8)
+
+    def calibrated_region(self):
+        metadata = simple_brush.CoordinateCalibrationMetadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=None,
+            tk_to_screenshot_mapping=None,
+            crop_preview=None,
+            validated=True,
+            manually_confirmed=True,
+            message="validated for test",
+        )
+        return simple_brush.CalibratedScreenRegion(
+            region=simple_brush.ScreenRegion(10, 20, 300, 200),
+            coordinate_metadata=metadata,
+        )
 
     def assert_argument_error(self, error_code, args, *, platform="darwin"):
         with self.assertRaises(simple_brush.MacSafeBrowseArgumentError) as caught:
@@ -3003,6 +3216,123 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         self.assertIn("calibration_published: False", rendered)
         self.assertIn("MAC_SAFE_BROWSE_CALIBRATION_DIAGNOSTICS_FAILED", rendered)
         dry_pipeline.assert_not_called()
+
+    def test_overlay_not_closed_stops_before_capture_confirmation_and_candidate(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        capture_fn = Mock(return_value=self.capture_image())
+        confirmation_fn = Mock(return_value="YES")
+        candidate_open_fn = Mock(return_value=True)
+        blocked_names = (
+            "human_scroll_once",
+            "next_candidate",
+            "refresh_page",
+            "forward_one_candidate",
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["OCRKeywordDetector.detect"] = stack.enter_context(
+                patch.object(simple_brush.OCRKeywordDetector, "detect")
+            )
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            dry_pipeline = stack.enter_context(
+                patch.object(simple_brush, "run_mac_safe_browse_dry_pipeline")
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            result = simple_brush.run_mac_safe_browse_calibrate_and_dry_run(
+                self.valid_args(
+                    mac_safe_browse_real_capture_once=True,
+                    mac_safe_browse_open_candidate_once=True,
+                ),
+                diagnostics_fn=Mock(return_value=self.diagnostics()),
+                select_region_fn=Mock(return_value=region),
+                overlay_cleanup_check_fn=Mock(return_value=False),
+                capture_fn=capture_fn,
+                confirmation_fn=confirmation_fn,
+                candidate_open_fn=candidate_open_fn,
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("MAC_SAFE_BROWSE_CALIBRATION_OVERLAY_NOT_CLOSED", rendered)
+        capture_fn.assert_not_called()
+        confirmation_fn.assert_not_called()
+        candidate_open_fn.assert_not_called()
+        dry_pipeline.assert_not_called()
+        for mocked in blocked.values():
+            mocked.assert_not_called()
+
+    def test_overlay_cleanup_check_exception_fails_closed(self):
+        result = simple_brush.prepare_mac_safe_browse_calibrated_region(
+            diagnostics_fn=Mock(return_value=self.diagnostics()),
+            select_region_fn=Mock(
+                return_value=simple_brush.ScreenRegion(10, 20, 300, 200)
+            ),
+            overlay_cleanup_check_fn=Mock(
+                side_effect=RuntimeError("cleanup state unavailable")
+            ),
+            capture_fn=Mock(),
+            confirmation_fn=Mock(),
+        )
+
+        self.assertFalse(result.published)
+        self.assertFalse(result.overlay_cleanup_completed)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_CALIBRATION_TK_CLEANUP_FAILED",
+        )
+
+    def test_selector_cleanup_failure_is_reported_and_stops_calibration(self):
+        capture_fn = Mock()
+        confirmation_fn = Mock()
+
+        result = simple_brush.prepare_mac_safe_browse_calibrated_region(
+            diagnostics_fn=Mock(return_value=self.diagnostics()),
+            select_region_fn=Mock(
+                side_effect=ocr_calibration.CalibrationCleanupFailed(
+                    "destroy failed"
+                )
+            ),
+            capture_fn=capture_fn,
+            confirmation_fn=confirmation_fn,
+        )
+
+        self.assertFalse(result.published)
+        self.assertFalse(result.overlay_cleanup_completed)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_CALIBRATION_TK_CLEANUP_FAILED",
+        )
+        capture_fn.assert_not_called()
+        confirmation_fn.assert_not_called()
+
+    def test_candidate_open_requires_overlay_cleanup_evidence(self):
+        candidate_open_fn = Mock(return_value=True)
+        action_fns, build_result = simple_brush.build_mac_safe_browse_real_action_fns(
+            self.calibrated_region(),
+            candidate_open_fn=candidate_open_fn,
+            open_candidate_once=True,
+            overlay_cleanup_completed=False,
+        )
+
+        succeeded = action_fns["candidate_open"]()
+        result = build_result()
+
+        self.assertFalse(succeeded)
+        candidate_open_fn.assert_not_called()
+        self.assertFalse(result.candidate_open_attempted)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_CALIBRATION_OVERLAY_NOT_CLOSED",
+        )
 
     def test_success_runs_dry_pipeline_but_still_returns_not_implemented(self):
         region = simple_brush.ScreenRegion(10, 20, 300, 200)

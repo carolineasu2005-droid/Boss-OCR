@@ -59,8 +59,10 @@ from pynput import keyboard
 
 from ocr_calibration import (
     CalibrationCancelled,
+    CalibrationCleanupFailed,
     ScreenRegion,
     enable_windows_dpi_awareness,
+    is_tk_overlay_cleanup_complete,
     save_region_preview,
     select_screen_region,
 )
@@ -597,6 +599,7 @@ class MacSafeBrowseCalibrationResult:
     published: bool
     calibrated_region: CalibratedScreenRegion | None
     message: str
+    overlay_cleanup_completed: bool = False
     error_code: str | None = None
 
 
@@ -1632,6 +1635,37 @@ def build_mac_safe_browse_calibration_metadata_from_selection(
     )
 
 
+def verify_mac_safe_browse_overlay_cleanup(
+    *,
+    used_default_selector: bool,
+    cleanup_check_fn=None,
+) -> bool:
+    """Require explicit Tk cleanup evidence before preview or candidate actions."""
+    if cleanup_check_fn is None:
+        if not used_default_selector:
+            # Injected selectors are test seams and have no Tk overlay by default.
+            return True
+        cleanup_check_fn = is_tk_overlay_cleanup_complete
+    if not callable(cleanup_check_fn):
+        raise MacSafeBrowseRuntimeError(
+            'MAC_SAFE_BROWSE_CALIBRATION_TK_CLEANUP_FAILED',
+            'overlay cleanup check 不可调用',
+        )
+    try:
+        completed = cleanup_check_fn() is True
+    except Exception as exc:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_SAFE_BROWSE_CALIBRATION_TK_CLEANUP_FAILED',
+            f'overlay cleanup check 执行失败: {exc}',
+        ) from exc
+    if not completed:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_SAFE_BROWSE_CALIBRATION_OVERLAY_NOT_CLOSED',
+            'Tk overlay 未确认关闭；拒绝 preview、确认和 candidate_open',
+        )
+    return True
+
+
 def prepare_mac_safe_browse_calibrated_region(
     *,
     display_fingerprint=None,
@@ -1646,6 +1680,7 @@ def prepare_mac_safe_browse_calibrated_region(
     save_crop_preview_fn=None,
     confirmation_fn=None,
     preview_dir=None,
+    overlay_cleanup_check_fn=None,
 ) -> MacSafeBrowseCalibrationResult:
     """Prepare calibration evidence only; never initialize or run OCR."""
     fingerprint_valid = (
@@ -1660,12 +1695,20 @@ def prepare_mac_safe_browse_calibrated_region(
         and tk_to_screenshot_mapping.passed
         and tk_to_screenshot_mapping.crop_region is not None
     )
+    used_default_selector = select_region_fn is None
     region_selector = select_region_fn or select_screen_region
     if fingerprint_valid and scale_valid and mapping_valid:
         preview_saver = save_preview_fn or save_region_preview
         destination = OCR_PREVIEW_PATH if preview_path is None else Path(preview_path)
         try:
             region = region_selector()
+        except CalibrationCleanupFailed as exc:
+            return MacSafeBrowseCalibrationResult(
+                published=False,
+                calibrated_region=None,
+                message=f'Tk overlay cleanup 失败: {exc}',
+                error_code='MAC_SAFE_BROWSE_CALIBRATION_TK_CLEANUP_FAILED',
+            )
         except CalibrationCancelled:
             return MacSafeBrowseCalibrationResult(
                 published=False,
@@ -1679,6 +1722,18 @@ def prepare_mac_safe_browse_calibrated_region(
                 calibrated_region=None,
                 message=f'safe browse calibration-only 框选失败: {exc}',
                 error_code='MAC_SAFE_BROWSE_CALIBRATION_REGION_CANCELLED',
+            )
+        try:
+            overlay_cleanup_completed = verify_mac_safe_browse_overlay_cleanup(
+                used_default_selector=used_default_selector,
+                cleanup_check_fn=overlay_cleanup_check_fn,
+            )
+        except MacSafeBrowseRuntimeError as exc:
+            return MacSafeBrowseCalibrationResult(
+                published=False,
+                calibrated_region=None,
+                message=str(exc),
+                error_code=exc.error_code,
             )
         if not isinstance(region, ScreenRegion):
             return MacSafeBrowseCalibrationResult(
@@ -1739,6 +1794,7 @@ def prepare_mac_safe_browse_calibrated_region(
                 'safe browse calibration metadata 已准备；仍非 business ready，'
                 '未执行 OCR 或浏览'
             ),
+            overlay_cleanup_completed=overlay_cleanup_completed,
             error_code='MAC_SAFE_BROWSE_CALIBRATION_PUBLISHED_NOT_BUSINESS_READY',
         )
 
@@ -1774,6 +1830,13 @@ def prepare_mac_safe_browse_calibrated_region(
 
     try:
         region = region_selector()
+    except CalibrationCleanupFailed as exc:
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message=f'Tk overlay cleanup 失败: {exc}',
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_TK_CLEANUP_FAILED',
+        )
     except CalibrationCancelled:
         return MacSafeBrowseCalibrationResult(
             published=False,
@@ -1787,6 +1850,18 @@ def prepare_mac_safe_browse_calibrated_region(
             calibrated_region=None,
             message=f'safe browse calibration-only 框选失败: {exc}',
             error_code='MAC_SAFE_BROWSE_CALIBRATION_REGION_CANCELLED',
+        )
+    try:
+        overlay_cleanup_completed = verify_mac_safe_browse_overlay_cleanup(
+            used_default_selector=used_default_selector,
+            cleanup_check_fn=overlay_cleanup_check_fn,
+        )
+    except MacSafeBrowseRuntimeError as exc:
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message=str(exc),
+            error_code=exc.error_code,
         )
     if not isinstance(region, ScreenRegion):
         return MacSafeBrowseCalibrationResult(
@@ -1851,6 +1926,7 @@ def prepare_mac_safe_browse_calibrated_region(
             'safe browse calibration metadata 已准备；preview 已人工确认，'
             '仍非 business ready，未执行 OCR 或浏览'
         ),
+        overlay_cleanup_completed=overlay_cleanup_completed,
         error_code='MAC_SAFE_BROWSE_CALIBRATION_PUBLISHED_NOT_BUSINESS_READY',
     )
 
@@ -1869,6 +1945,7 @@ def publish_mac_safe_browse_calibration(
     save_crop_preview_fn=None,
     confirmation_fn=None,
     preview_dir=None,
+    overlay_cleanup_check_fn=None,
 ) -> MacSafeBrowseCalibrationResult:
     """Prepare and publish calibration metadata into current-process state."""
     global ocr_calibrated_region
@@ -1885,6 +1962,7 @@ def publish_mac_safe_browse_calibration(
         save_crop_preview_fn=save_crop_preview_fn,
         confirmation_fn=confirmation_fn,
         preview_dir=preview_dir,
+        overlay_cleanup_check_fn=overlay_cleanup_check_fn,
     )
     if result.published and result.calibrated_region is not None:
         ocr_calibrated_region = result.calibrated_region
@@ -1964,6 +2042,7 @@ def build_mac_safe_browse_real_action_fns(
     candidate_open_sleep_fn=time.sleep,
     candidate_open_countdown_seconds=5,
     open_candidate_once=False,
+    overlay_cleanup_completed=False,
 ):
     """Build bounded real actions without OCR, forwarding, or browse loops."""
     if not isinstance(calibrated_region, CalibratedScreenRegion):
@@ -2051,6 +2130,15 @@ def build_mac_safe_browse_real_action_fns(
         if not open_candidate_once:
             state['message'] = 'candidate_open 未启用'
             return True
+        if overlay_cleanup_completed is not True:
+            state['error_code'] = (
+                'MAC_SAFE_BROWSE_CALIBRATION_OVERLAY_NOT_CLOSED'
+            )
+            state['message'] = (
+                'candidate_open 前未取得 Tk overlay cleanup 完成证据；'
+                '拒绝点击'
+            )
+            return False
         try:
             if candidate_open_fn is None:
                 x, y = get_mac_safe_browse_candidate_open_point(
@@ -3733,6 +3821,7 @@ def run_mac_safe_browse_calibration_only(
     save_crop_preview_fn=None,
     confirmation_fn=None,
     preview_dir=None,
+    overlay_cleanup_check_fn=None,
 ) -> int:
     """Prepare and atomically publish calibration metadata, then exit."""
     try:
@@ -3757,6 +3846,7 @@ def run_mac_safe_browse_calibration_only(
         save_crop_preview_fn=save_crop_preview_fn,
         confirmation_fn=confirmation_fn,
         preview_dir=preview_dir,
+        overlay_cleanup_check_fn=overlay_cleanup_check_fn,
     )
     if not result.published or result.calibrated_region is None:
         print('  published: False')
@@ -3774,6 +3864,7 @@ def run_mac_safe_browse_calibration_only(
     print(f'  coordinate_validated: {metadata.validated}')
     print(f'  manually_confirmed: {metadata.manually_confirmed}')
     print(f'  business_ready: {metadata.business_ready}')
+    print(f'  overlay_cleanup_completed: {result.overlay_cleanup_completed}')
     print(f'  display_fingerprint: {metadata.display_fingerprint}')
     print(
         '  preview_path: '
@@ -3807,6 +3898,7 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     candidate_open_position_fn=pyautogui.position,
     candidate_open_sleep_fn=time.sleep,
     candidate_open_countdown_seconds=5,
+    overlay_cleanup_check_fn=None,
 ) -> int:
     """Run same-process calibration, then the bounded browse-only trial plan."""
     try:
@@ -3833,6 +3925,7 @@ def run_mac_safe_browse_calibrate_and_dry_run(
         save_crop_preview_fn=save_crop_preview_fn,
         confirmation_fn=confirmation_fn,
         preview_dir=preview_dir,
+        overlay_cleanup_check_fn=overlay_cleanup_check_fn,
     )
     print(f'  calibration_published: {calibration_result.published}')
     if (
@@ -3847,6 +3940,10 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     print(f'  coordinate_validated: {metadata.validated}')
     print(f'  manually_confirmed: {metadata.manually_confirmed}')
     print(f'  business_ready: {metadata.business_ready}')
+    print(
+        f'  overlay_cleanup_completed: '
+        f'{calibration_result.overlay_cleanup_completed}'
+    )
     print(
         '  preview_path: '
         f'{metadata.crop_preview.preview_path if metadata.crop_preview else "none"}'
@@ -3876,6 +3973,9 @@ def run_mac_safe_browse_calibrate_and_dry_run(
                 candidate_open_sleep_fn=candidate_open_sleep_fn,
                 candidate_open_countdown_seconds=candidate_open_countdown_seconds,
                 open_candidate_once=open_candidate_enabled,
+                overlay_cleanup_completed=(
+                    calibration_result.overlay_cleanup_completed
+                ),
             )
         )
     dry_result = run_mac_safe_browse_dry_pipeline(
