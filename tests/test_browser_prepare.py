@@ -2837,9 +2837,29 @@ class MacSafeBrowseCLITests(unittest.TestCase):
             "scroll",
             "typewrite",
         )
+        metadata = simple_brush.CoordinateCalibrationMetadata(
+            display_fingerprint="display-fingerprint",
+            scale_inference=None,
+            tk_to_screenshot_mapping=None,
+            crop_preview=None,
+            validated=True,
+            manually_confirmed=True,
+            message="validated for test",
+        )
+        calibrated_region = simple_brush.CalibratedScreenRegion(
+            region=simple_brush.ScreenRegion(10, 20, 300, 200),
+            coordinate_metadata=metadata,
+        )
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            stack.enter_context(
+                patch.object(
+                    simple_brush,
+                    "ocr_calibrated_region",
+                    calibrated_region,
+                )
+            )
             blocked = {
                 name: stack.enter_context(patch.object(simple_brush, name))
                 for name in blocked_names
@@ -2870,6 +2890,221 @@ class MacSafeBrowseCLITests(unittest.TestCase):
         for name, mocked in blocked.items():
             with self.subTest(blocked_action=name):
                 mocked.assert_not_called()
+
+
+class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
+    def make_metadata(self, **overrides):
+        values = {
+            "display_fingerprint": "display-fingerprint",
+            "scale_inference": None,
+            "tk_to_screenshot_mapping": None,
+            "crop_preview": None,
+            "validated": True,
+            "manually_confirmed": True,
+            "message": "validated for test",
+        }
+        values.update(overrides)
+        return simple_brush.CoordinateCalibrationMetadata(**values)
+
+    def make_region(self, metadata=None):
+        if metadata is None:
+            metadata = self.make_metadata()
+        return simple_brush.CalibratedScreenRegion(
+            region=simple_brush.ScreenRegion(10, 20, 300, 200),
+            coordinate_metadata=metadata,
+        )
+
+    def safe_args(self):
+        return {
+            "mac_safe_browse_only": True,
+            "no_forward": True,
+            "max_candidates": 1,
+            "max_runtime_minutes": 5,
+            "auto": False,
+            "preflight_only": False,
+            "coordinate_diagnostics_only": False,
+            "email": "",
+        }
+
+    def assert_evidence_failure(self, calibrated_region, error_code):
+        evidence = simple_brush.collect_mac_safe_browse_ocr_evidence(
+            calibrated_region
+        )
+        self.assertFalse(evidence.passed)
+        self.assertEqual(evidence.error_code, error_code)
+        return evidence
+
+    def test_evidence_rejects_missing_calibrated_region(self):
+        evidence = self.assert_evidence_failure(
+            None,
+            "MAC_SAFE_BROWSE_OCR_REGION_MISSING",
+        )
+        self.assertFalse(evidence.has_calibrated_region)
+        self.assertFalse(evidence.has_coordinate_metadata)
+
+    def test_evidence_rejects_missing_coordinate_metadata(self):
+        region = simple_brush.CalibratedScreenRegion(
+            region=simple_brush.ScreenRegion(10, 20, 300, 200),
+            coordinate_metadata=None,
+        )
+        evidence = self.assert_evidence_failure(
+            region,
+            "MAC_SAFE_BROWSE_COORDINATE_METADATA_MISSING",
+        )
+        self.assertTrue(evidence.has_calibrated_region)
+        self.assertFalse(evidence.has_coordinate_metadata)
+
+    def test_evidence_rejects_unvalidated_or_unconfirmed_metadata(self):
+        cases = (
+            (
+                {"validated": False},
+                "MAC_SAFE_BROWSE_COORDINATE_NOT_VALIDATED",
+            ),
+            (
+                {"manually_confirmed": False},
+                "MAC_SAFE_BROWSE_PREVIEW_NOT_CONFIRMED",
+            ),
+        )
+        for metadata_overrides, error_code in cases:
+            with self.subTest(error_code=error_code):
+                self.assert_evidence_failure(
+                    self.make_region(self.make_metadata(**metadata_overrides)),
+                    error_code,
+                )
+
+    def test_evidence_rejects_unexpected_business_ready(self):
+        metadata = self.make_metadata()
+        object.__setattr__(metadata, "business_ready", True)
+
+        evidence = self.assert_evidence_failure(
+            self.make_region(metadata),
+            "MAC_SAFE_BROWSE_BUSINESS_READY_UNEXPECTED",
+        )
+
+        self.assertTrue(evidence.business_ready)
+
+    def test_evidence_rejects_missing_display_fingerprint(self):
+        for value in (None, "", "   "):
+            with self.subTest(display_fingerprint=value):
+                self.assert_evidence_failure(
+                    self.make_region(
+                        self.make_metadata(display_fingerprint=value)
+                    ),
+                    "MAC_SAFE_BROWSE_DISPLAY_FINGERPRINT_MISSING",
+                )
+
+    def test_complete_metadata_passes_read_only_evidence_check(self):
+        evidence = simple_brush.collect_mac_safe_browse_ocr_evidence(
+            self.make_region()
+        )
+
+        self.assertTrue(evidence.passed)
+        self.assertTrue(evidence.has_calibrated_region)
+        self.assertTrue(evidence.has_coordinate_metadata)
+        self.assertTrue(evidence.coordinate_validated)
+        self.assertTrue(evidence.manually_confirmed)
+        self.assertFalse(evidence.business_ready)
+        self.assertEqual(evidence.display_fingerprint, "display-fingerprint")
+        self.assertIsNone(evidence.error_code)
+        self.assertIn("不代表可浏览或业务 ready", evidence.message)
+
+    def test_evidence_helper_has_no_runtime_or_io_side_effects(self):
+        blocked_names = (
+            "ensure_ocr_region_calibrated",
+            "initialize_ocr",
+            "select_screen_region",
+            "save_region_preview",
+            "prepare_browser",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+            "forward_one_candidate",
+        )
+        pyautogui_names = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["OCRKeywordDetector.detect"] = stack.enter_context(
+                patch.object(simple_brush.OCRKeywordDetector, "detect")
+            )
+            blocked["MSSScreenCapture.capture"] = stack.enter_context(
+                patch.object(simple_brush.MSSScreenCapture, "capture")
+            )
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            evidence = simple_brush.collect_mac_safe_browse_ocr_evidence(
+                self.make_region()
+            )
+
+        self.assertTrue(evidence.passed)
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_run_safe_browse_reports_missing_ocr_region(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush, "ocr_calibrated_region", None),
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_safe_browse_only(self.safe_args())
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("MAC_SAFE_BROWSE_OCR_REGION_MISSING", rendered)
+        self.assertNotIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
+
+    def test_run_safe_browse_with_complete_metadata_still_does_not_browse(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(
+                simple_brush,
+                "ocr_calibrated_region",
+                self.make_region(),
+            ),
+            patch.object(simple_brush, "prepare_browser") as prepare_browser,
+            patch.object(simple_brush, "forward_one_candidate") as forward,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_safe_browse_only(self.safe_args())
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn("NO FORWARDING ENABLED", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
+        self.assertIn("ready for the next implementation step", rendered)
+        prepare_browser.assert_not_called()
+        forward.assert_not_called()
+        listener_start.assert_not_called()
 
 
 if __name__ == "__main__":

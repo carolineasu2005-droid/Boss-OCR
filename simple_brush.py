@@ -433,6 +433,111 @@ class MacSafeBrowseGuard:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class MacSafeBrowseOcrEvidence:
+    """Read-only evidence extracted from an existing OCR calibration."""
+
+    passed: bool
+    has_calibrated_region: bool
+    has_coordinate_metadata: bool
+    coordinate_validated: bool
+    manually_confirmed: bool
+    business_ready: bool
+    display_fingerprint: str | None
+    message: str
+    error_code: str | None = None
+
+
+def collect_mac_safe_browse_ocr_evidence(
+    calibrated_region: CalibratedScreenRegion | None,
+) -> MacSafeBrowseOcrEvidence:
+    """Inspect existing calibration metadata without OCR, capture, or GUI I/O."""
+    if not isinstance(calibrated_region, CalibratedScreenRegion):
+        return MacSafeBrowseOcrEvidence(
+            passed=False,
+            has_calibrated_region=False,
+            has_coordinate_metadata=False,
+            coordinate_validated=False,
+            manually_confirmed=False,
+            business_ready=False,
+            display_fingerprint=None,
+            message='safe browse 缺少已校准 OCR 区域',
+            error_code='MAC_SAFE_BROWSE_OCR_REGION_MISSING',
+        )
+
+    metadata = calibrated_region.coordinate_metadata
+    if not isinstance(metadata, CoordinateCalibrationMetadata):
+        return MacSafeBrowseOcrEvidence(
+            passed=False,
+            has_calibrated_region=True,
+            has_coordinate_metadata=False,
+            coordinate_validated=False,
+            manually_confirmed=False,
+            business_ready=False,
+            display_fingerprint=None,
+            message='OCR 区域缺少 coordinate metadata',
+            error_code='MAC_SAFE_BROWSE_COORDINATE_METADATA_MISSING',
+        )
+
+    coordinate_validated = metadata.validated is True
+    manually_confirmed = metadata.manually_confirmed is True
+    business_ready = metadata.business_ready is True
+    fingerprint = (
+        metadata.display_fingerprint.strip()
+        if isinstance(metadata.display_fingerprint, str)
+        and metadata.display_fingerprint.strip()
+        else None
+    )
+
+    def failed(message, error_code):
+        return MacSafeBrowseOcrEvidence(
+            passed=False,
+            has_calibrated_region=True,
+            has_coordinate_metadata=True,
+            coordinate_validated=coordinate_validated,
+            manually_confirmed=manually_confirmed,
+            business_ready=business_ready,
+            display_fingerprint=fingerprint,
+            message=message,
+            error_code=error_code,
+        )
+
+    if not coordinate_validated:
+        return failed(
+            'OCR coordinate metadata 未通过验证',
+            'MAC_SAFE_BROWSE_COORDINATE_NOT_VALIDATED',
+        )
+    if not manually_confirmed:
+        return failed(
+            'OCR crop preview 尚未人工确认',
+            'MAC_SAFE_BROWSE_PREVIEW_NOT_CONFIRMED',
+        )
+    if business_ready:
+        return failed(
+            'coordinate metadata 意外标记为 business ready，拒绝继续',
+            'MAC_SAFE_BROWSE_BUSINESS_READY_UNEXPECTED',
+        )
+    if fingerprint is None:
+        return failed(
+            'OCR coordinate metadata 缺少 display fingerprint',
+            'MAC_SAFE_BROWSE_DISPLAY_FINGERPRINT_MISSING',
+        )
+
+    return MacSafeBrowseOcrEvidence(
+        passed=True,
+        has_calibrated_region=True,
+        has_coordinate_metadata=True,
+        coordinate_validated=True,
+        manually_confirmed=True,
+        business_ready=False,
+        display_fingerprint=fingerprint,
+        message=(
+            'OCR 区域与 coordinate metadata 前置检查通过；'
+            '仅可供下一实现步骤使用，不代表可浏览或业务 ready'
+        ),
+    )
+
+
 def validate_mac_safe_browse_guard(
     config: MacSafeBrowseConfig,
     evidence: MacSafeBrowseEvidence,
@@ -2241,7 +2346,7 @@ def run_coordinate_diagnostics_only(_cli_args=None):
 
 
 def run_mac_safe_browse_only(cli_args) -> int:
-    """Validate the 5C CLI skeleton and always stop before real browsing."""
+    """Validate CLI and existing OCR evidence, then stop before browsing."""
     try:
         config = build_mac_safe_browse_config(cli_args)
     except MacSafeBrowseArgumentError as exc:
@@ -2257,10 +2362,26 @@ def run_mac_safe_browse_only(cli_args) -> int:
     print('  allow_next_candidate: False')
     print('  allow_refresh: False')
     print('  allow_filter: False')
+
+    ocr_evidence = collect_mac_safe_browse_ocr_evidence(ocr_calibrated_region)
+    print(f'  ocr_region_present: {ocr_evidence.has_calibrated_region}')
+    print(f'  coordinate_metadata_present: {ocr_evidence.has_coordinate_metadata}')
+    print(f'  coordinate_validated: {ocr_evidence.coordinate_validated}')
+    print(f'  manually_confirmed: {ocr_evidence.manually_confirmed}')
+    print(f'  business_ready: {ocr_evidence.business_ready}')
+    print(
+        '  display_fingerprint: '
+        f'{ocr_evidence.display_fingerprint or "none"}'
+    )
+    if not ocr_evidence.passed:
+        print(f'  error_code: {ocr_evidence.error_code}')
+        print(f'  message: {ocr_evidence.message}')
+        return 2
+
     print('  error_code: MAC_SAFE_BROWSE_NOT_IMPLEMENTED')
     print(
-        '  message: guard wiring exists; real evidence collection and browsing '
-        'are not implemented in 5C'
+        '  message: OCR coordinate evidence is ready for the next implementation '
+        'step; page, Chrome, Listener, and browsing are not implemented in 5D'
     )
     return 2
 
