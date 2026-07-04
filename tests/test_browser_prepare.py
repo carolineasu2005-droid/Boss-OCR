@@ -621,6 +621,201 @@ class BrowserPrepareTests(unittest.TestCase):
         ):
             mock.assert_not_called()
 
+    def test_normalize_drag_selection_supports_all_four_drag_directions(self):
+        drags = (
+            ((10, 20), (40, 60)),
+            ((40, 60), (10, 20)),
+            ((40, 20), (10, 60)),
+            ((10, 60), (40, 20)),
+        )
+        expected = simple_brush.TkSelectionRegion(10.0, 20.0, 30.0, 40.0)
+
+        for start, end in drags:
+            with self.subTest(start=start, end=end):
+                result = simple_brush.normalize_drag_selection(start, end)
+
+            self.assertTrue(result.passed)
+            self.assertEqual(result.tk_selection, expected)
+            self.assertIsNone(result.crop_region)
+            self.assertIsNone(result.error_code)
+
+    def test_normalize_drag_selection_rejects_too_small_region(self):
+        result = simple_brush.normalize_drag_selection(
+            (10, 20), (10.5, 22), min_size=1.0
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "TK_SELECTION_TOO_SMALL")
+
+    def test_normalize_drag_selection_rejects_nan_and_infinite_points(self):
+        invalid_points = (
+            ((float("nan"), 0), (10, 10)),
+            ((0, float("inf")), (10, 10)),
+            ((0, 0), (float("-inf"), 10)),
+        )
+
+        for start, end in invalid_points:
+            with self.subTest(start=start, end=end):
+                result = simple_brush.normalize_drag_selection(start, end)
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "TK_SELECTION_POINTS_INVALID")
+
+    def test_map_tk_selection_rejects_invalid_overlay_size(self):
+        selection = simple_brush.TkSelectionRegion(0, 0, 10, 10)
+        for overlay_size in ((0, 800), (1000, 0)):
+            with self.subTest(overlay_size=overlay_size):
+                result = simple_brush.map_tk_selection_to_screenshot_crop(
+                    selection, overlay_size, (1000, 800)
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "TK_OVERLAY_SIZE_INVALID")
+
+    def test_map_tk_selection_rejects_invalid_screenshot_size(self):
+        selection = simple_brush.TkSelectionRegion(0, 0, 10, 10)
+        for screenshot_size in ((0, 800), (1000, 0)):
+            with self.subTest(screenshot_size=screenshot_size):
+                result = simple_brush.map_tk_selection_to_screenshot_crop(
+                    selection, (1000, 800), screenshot_size
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "SCREENSHOT_SIZE_INVALID")
+
+    def test_map_tk_selection_accepts_exact_overlay_bounds(self):
+        selection = simple_brush.TkSelectionRegion(0, 0, 1000, 800)
+
+        result = simple_brush.map_tk_selection_to_screenshot_crop(
+            selection, (1000, 800), (2000, 1600)
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(
+            result.crop_region,
+            simple_brush.ScreenshotCropRegion(0, 0, 2000, 1600),
+        )
+
+    def test_map_tk_selection_rejects_negative_and_overflowing_bounds(self):
+        selections = (
+            simple_brush.TkSelectionRegion(-1, 0, 10, 10),
+            simple_brush.TkSelectionRegion(0, -1, 10, 10),
+            simple_brush.TkSelectionRegion(991, 0, 10, 10),
+            simple_brush.TkSelectionRegion(0, 791, 10, 10),
+        )
+
+        for selection in selections:
+            with self.subTest(selection=selection):
+                result = simple_brush.map_tk_selection_to_screenshot_crop(
+                    selection, (1000, 800), (2000, 1600)
+                )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_code, "TK_SELECTION_OUT_OF_BOUNDS")
+
+    def test_map_tk_selection_accepts_right_and_bottom_edges(self):
+        selection = simple_brush.TkSelectionRegion(900, 700, 100, 100)
+
+        result = simple_brush.map_tk_selection_to_screenshot_crop(
+            selection, (1000, 800), (2000, 1600)
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(
+            result.crop_region,
+            simple_brush.ScreenshotCropRegion(1800, 1400, 200, 200),
+        )
+
+    def test_map_tk_selection_maps_one_to_one_and_two_x(self):
+        selection = simple_brush.TkSelectionRegion(10, 20, 100, 50)
+        cases = (
+            ((1000, 800), simple_brush.ScreenshotCropRegion(10, 20, 100, 50)),
+            ((2000, 1600), simple_brush.ScreenshotCropRegion(20, 40, 200, 100)),
+        )
+
+        for screenshot_size, expected_crop in cases:
+            with self.subTest(screenshot_size=screenshot_size):
+                result = simple_brush.map_tk_selection_to_screenshot_crop(
+                    selection, (1000, 800), screenshot_size
+                )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(result.crop_region, expected_crop)
+
+    def test_map_tk_selection_uses_floor_ceil_for_fractional_1_5_scale(self):
+        selection = simple_brush.TkSelectionRegion(10.2, 20.4, 100.1, 50.2)
+
+        result = simple_brush.map_tk_selection_to_screenshot_crop(
+            selection, (1000, 800), (1500, 1200)
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(
+            result.crop_region,
+            simple_brush.ScreenshotCropRegion(15, 30, 151, 76),
+        )
+        self.assertGreater(result.crop_region.width, 0)
+        self.assertGreater(result.crop_region.height, 0)
+
+    def test_validate_screenshot_crop_rejects_empty_and_out_of_bounds(self):
+        empty = simple_brush.validate_screenshot_crop(
+            simple_brush.ScreenshotCropRegion(10, 10, 0, 20),
+            (100, 100),
+        )
+        overflow = simple_brush.validate_screenshot_crop(
+            simple_brush.ScreenshotCropRegion(90, 90, 11, 10),
+            (100, 100),
+        )
+
+        self.assertFalse(empty.passed)
+        self.assertEqual(empty.error_code, "SCREENSHOT_CROP_EMPTY")
+        self.assertFalse(overflow.passed)
+        self.assertEqual(overflow.error_code, "SCREENSHOT_CROP_OUT_OF_BOUNDS")
+        self.assertEqual(overflow.crop_region.left, 90)
+        self.assertEqual(overflow.crop_region.width, 11)
+
+    def test_tk_crop_mapping_helpers_have_no_gui_capture_or_ocr_side_effects(self):
+        fake_mss = SimpleNamespace(MSS=Mock())
+        fake_tk = SimpleNamespace(Tk=Mock())
+        selection = simple_brush.TkSelectionRegion(10, 20, 100, 50)
+        with (
+            patch.dict("sys.modules", {"mss": fake_mss, "tkinter": fake_tk}),
+            patch.object(simple_brush, "select_screen_region") as select_region,
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush.pyautogui, "typewrite") as typewrite,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+        ):
+            normalized = simple_brush.normalize_drag_selection((10, 20), (110, 70))
+            mapped = simple_brush.map_tk_selection_to_screenshot_crop(
+                selection, (1000, 800), (2000, 1600)
+            )
+
+        self.assertTrue(normalized.passed)
+        self.assertTrue(mapped.passed)
+        fake_mss.MSS.assert_not_called()
+        fake_tk.Tk.assert_not_called()
+        for mock in (
+            select_region,
+            click,
+            move,
+            mouse_down,
+            mouse_up,
+            press,
+            hotkey,
+            scroll,
+            typewrite,
+            listener_start,
+            initialize_ocr,
+        ):
+            mock.assert_not_called()
+
     def test_capture_screen_coordinate_diagnostics_fails_closed_when_pyautogui_size_fails(self):
         with (
             patch.object(simple_brush.sys, "platform", "darwin"),

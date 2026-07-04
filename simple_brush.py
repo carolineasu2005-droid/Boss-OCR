@@ -261,6 +261,37 @@ class RetinaScaleInference:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class TkSelectionRegion:
+    """Normalized rectangle in Tk overlay-local coordinates."""
+
+    left: float
+    top: float
+    width: float
+    height: float
+
+
+@dataclass(frozen=True)
+class ScreenshotCropRegion:
+    """Half-open integer rectangle in screenshot image pixels."""
+
+    left: int
+    top: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class TkToScreenshotMapping:
+    """Structured pure-data result for Tk selection-to-crop mapping."""
+
+    tk_selection: TkSelectionRegion | None
+    crop_region: ScreenshotCropRegion | None
+    passed: bool
+    message: str
+    error_code: str | None = None
+
+
 def is_allowed_boss_page(url: str | None, title: str | None) -> bool:
     """Return whether a URL passes the conservative BOSS page identity gate.
 
@@ -925,6 +956,249 @@ def infer_monitor_capture_scale(monitor, image_size, *, tolerance=0.02):
         )
 
     return infer_retina_scale(monitor_size, image_size, tolerance=tolerance)
+
+
+def _is_finite_number(value):
+    """Return whether a value is numeric, finite, and not a bool."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _valid_finite_point(point):
+    """Return a finite numeric point as floats, or None when invalid."""
+    if not isinstance(point, tuple) or len(point) != 2:
+        return None
+    if any(not _is_finite_number(value) for value in point):
+        return None
+    try:
+        return (float(point[0]), float(point[1]))
+    except (OverflowError, ValueError):
+        return None
+
+
+def _valid_tk_selection(selection):
+    """Return whether every selection field is finite numeric metadata."""
+    if not isinstance(selection, TkSelectionRegion):
+        return False
+    values = (selection.left, selection.top, selection.width, selection.height)
+    return all(_is_finite_number(value) for value in values)
+
+
+def normalize_drag_selection(start, end, *, min_size=1.0):
+    """Normalize any drag direction into a Tk overlay-local rectangle."""
+    normalized_start = _valid_finite_point(start)
+    normalized_end = _valid_finite_point(end)
+    if (
+        normalized_start is None
+        or normalized_end is None
+        or not _is_finite_number(min_size)
+        or min_size <= 0
+    ):
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=None,
+            passed=False,
+            message='拖拽点和 min_size 必须是有限有效数值',
+            error_code='TK_SELECTION_POINTS_INVALID',
+        )
+
+    left = min(normalized_start[0], normalized_end[0])
+    top = min(normalized_start[1], normalized_end[1])
+    width = abs(normalized_end[0] - normalized_start[0])
+    height = abs(normalized_end[1] - normalized_start[1])
+    selection = TkSelectionRegion(left, top, width, height)
+    if width < min_size or height < min_size:
+        return TkToScreenshotMapping(
+            tk_selection=selection,
+            crop_region=None,
+            passed=False,
+            message=f'Tk selection 小于最小尺寸 {min_size}',
+            error_code='TK_SELECTION_TOO_SMALL',
+        )
+
+    return TkToScreenshotMapping(
+        tk_selection=selection,
+        crop_region=None,
+        passed=True,
+        message='Tk 拖拽区域已规范化；尚未映射到截图像素',
+    )
+
+
+def validate_screenshot_crop(crop_region, screenshot_size):
+    """Validate a half-open screenshot crop without clamping it."""
+    normalized_screenshot = _valid_positive_integer_size(screenshot_size)
+    if normalized_screenshot is None:
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=None,
+            passed=False,
+            message='screenshot size 必须是两个正整数',
+            error_code='SCREENSHOT_SIZE_INVALID',
+        )
+
+    if not isinstance(crop_region, ScreenshotCropRegion):
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=None,
+            passed=False,
+            message='screenshot crop 数据结构无效',
+            error_code='SCREENSHOT_CROP_EMPTY',
+        )
+
+    crop_values = (
+        crop_region.left,
+        crop_region.top,
+        crop_region.width,
+        crop_region.height,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in crop_values
+    ):
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=crop_region,
+            passed=False,
+            message='screenshot crop 字段必须是整数',
+            error_code='SCREENSHOT_CROP_EMPTY',
+        )
+
+    if crop_region.width <= 0 or crop_region.height <= 0:
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=crop_region,
+            passed=False,
+            message='screenshot crop 必须非空',
+            error_code='SCREENSHOT_CROP_EMPTY',
+        )
+
+    right = crop_region.left + crop_region.width
+    bottom = crop_region.top + crop_region.height
+    if (
+        crop_region.left < 0
+        or crop_region.top < 0
+        or right > normalized_screenshot[0]
+        or bottom > normalized_screenshot[1]
+    ):
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=crop_region,
+            passed=False,
+            message='screenshot crop 超出图像边界；未执行 clamp',
+            error_code='SCREENSHOT_CROP_OUT_OF_BOUNDS',
+        )
+
+    return TkToScreenshotMapping(
+        tk_selection=None,
+        crop_region=crop_region,
+        passed=True,
+        message='screenshot crop 非空且位于图像边界内',
+    )
+
+
+def map_tk_selection_to_screenshot_crop(
+    selection,
+    overlay_size,
+    screenshot_size,
+):
+    """Map one validated Tk-local selection to screenshot image pixels."""
+    normalized_overlay = _valid_positive_integer_size(overlay_size)
+    if normalized_overlay is None:
+        return TkToScreenshotMapping(
+            tk_selection=selection if isinstance(selection, TkSelectionRegion) else None,
+            crop_region=None,
+            passed=False,
+            message='Tk overlay size 必须是两个正整数',
+            error_code='TK_OVERLAY_SIZE_INVALID',
+        )
+
+    normalized_screenshot = _valid_positive_integer_size(screenshot_size)
+    if normalized_screenshot is None:
+        return TkToScreenshotMapping(
+            tk_selection=selection if isinstance(selection, TkSelectionRegion) else None,
+            crop_region=None,
+            passed=False,
+            message='screenshot size 必须是两个正整数',
+            error_code='SCREENSHOT_SIZE_INVALID',
+        )
+
+    if not _valid_tk_selection(selection):
+        return TkToScreenshotMapping(
+            tk_selection=None,
+            crop_region=None,
+            passed=False,
+            message='Tk selection 字段必须是有限数值',
+            error_code='TK_SELECTION_POINTS_INVALID',
+        )
+
+    if selection.width <= 0 or selection.height <= 0:
+        return TkToScreenshotMapping(
+            tk_selection=selection,
+            crop_region=None,
+            passed=False,
+            message='Tk selection 必须非空',
+            error_code='TK_SELECTION_TOO_SMALL',
+        )
+
+    selection_right = selection.left + selection.width
+    selection_bottom = selection.top + selection.height
+    if (
+        selection.left < 0
+        or selection.top < 0
+        or selection_right > normalized_overlay[0]
+        or selection_bottom > normalized_overlay[1]
+    ):
+        return TkToScreenshotMapping(
+            tk_selection=selection,
+            crop_region=None,
+            passed=False,
+            message='Tk selection 必须完全位于 overlay 边界内',
+            error_code='TK_SELECTION_OUT_OF_BOUNDS',
+        )
+
+    scale = infer_retina_scale(normalized_overlay, normalized_screenshot)
+    if not scale.passed:
+        return TkToScreenshotMapping(
+            tk_selection=selection,
+            crop_region=None,
+            passed=False,
+            message=f'无法安全映射 Tk selection：{scale.message}',
+            error_code=scale.error_code,
+        )
+
+    left = math.floor(selection.left * scale.scale_x)
+    top = math.floor(selection.top * scale.scale_y)
+    right = math.ceil(selection_right * scale.scale_x)
+    bottom = math.ceil(selection_bottom * scale.scale_y)
+    crop = ScreenshotCropRegion(
+        left=left,
+        top=top,
+        width=right - left,
+        height=bottom - top,
+    )
+    crop_validation = validate_screenshot_crop(crop, normalized_screenshot)
+    if not crop_validation.passed:
+        return TkToScreenshotMapping(
+            tk_selection=selection,
+            crop_region=crop,
+            passed=False,
+            message=crop_validation.message,
+            error_code=crop_validation.error_code,
+        )
+
+    return TkToScreenshotMapping(
+        tk_selection=selection,
+        crop_region=crop,
+        passed=True,
+        message=(
+            'Tk selection 已映射为 screenshot pixel crop；'
+            '仅表示纯坐标转换通过，不代表真实屏幕已验证'
+        ),
+    )
 
 
 def capture_screen_coordinate_diagnostics():
