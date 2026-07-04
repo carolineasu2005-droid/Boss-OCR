@@ -18,6 +18,7 @@ logs/
 *.md
 !README.md
 !Issue-Mac-2-chrome-launch-permission-baseline-acceptance-report.md
+!Issue-Mac-3-chrome-window-focus-page-identity-TID-V1.0.md
 !docs/
 !docs/*.md
 !release-notes/
