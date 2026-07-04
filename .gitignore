@@ -23,6 +23,7 @@ logs/
 !docs/*.md
 !release-notes/
 !release-notes/*.md
+!Issue-Mac-4-retina-coordinate-screenshot-tk-consistency-acceptance-report.md
 
 # Local packaging artifacts
 /build/
