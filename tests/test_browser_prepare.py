@@ -1,4 +1,5 @@
 from contextlib import ExitStack
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -286,6 +287,215 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertFalse(result.launched)
         self.assertEqual(result.error_code, "CHROME_LAUNCH_FAILED")
         self.assertIn("launch denied", result.message)
+
+    def test_run_osascript_uses_argument_list_without_shell(self):
+        with patch.object(simple_brush.subprocess, "run") as run:
+            simple_brush.run_osascript('return "ok"', timeout=1.5)
+
+        run.assert_called_once_with(
+            ["osascript", "-e", 'return "ok"'],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+
+    def test_focus_chrome_window_successfully_activates_and_confirms_frontmost(self):
+        events = []
+        activate = subprocess.CompletedProcess(
+            args=["osascript", "-e", 'tell application "Google Chrome" to activate'],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        frontmost = subprocess.CompletedProcess(
+            args=["osascript", "-e", "frontmost query"],
+            returncode=0,
+            stdout="Google Chrome\n",
+            stderr="",
+        )
+
+        def fake_run(script, timeout=3.0):
+            events.append((script, timeout))
+            if "activate" in script:
+                return activate
+            if "frontmost" in script:
+                return frontmost
+            self.fail(f"unexpected script: {script}")
+
+        with (
+            patch.object(simple_brush, "run_osascript", side_effect=fake_run),
+            patch.object(simple_brush.pyautogui, "click") as click,
+            patch.object(simple_brush.pyautogui, "moveTo") as move,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush.pyautogui, "scroll") as scroll,
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.listener, "start") as listener_start,
+        ):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertEqual(
+            events,
+            [
+                ('tell application "Google Chrome" to activate', 3.0),
+                (
+                    'tell application "System Events" '
+                    'to get name of first application process whose frontmost is true',
+                    3.0,
+                ),
+            ],
+        )
+        self.assertEqual(result.platform, "macos")
+        self.assertEqual(result.browser, "chrome")
+        self.assertTrue(result.activated)
+        self.assertTrue(result.frontmost)
+        self.assertEqual(result.error_code, "")
+        self.assertIn("已激活并确认位于前台", result.message)
+        click.assert_not_called()
+        move.assert_not_called()
+        press.assert_not_called()
+        scroll.assert_not_called()
+        hotkey.assert_not_called()
+        listener_start.assert_not_called()
+
+    def test_focus_chrome_window_activate_failure_is_fail_closed(self):
+        activate = subprocess.CompletedProcess(
+            args=["osascript", "-e", 'tell application "Google Chrome" to activate'],
+            returncode=1,
+            stdout="",
+            stderr="permission denied",
+        )
+        with patch.object(simple_brush, "run_osascript", return_value=activate) as run:
+            result = simple_brush.focus_chrome_window()
+
+        run.assert_called_once_with('tell application "Google Chrome" to activate')
+        self.assertFalse(result.activated)
+        self.assertFalse(result.frontmost)
+        self.assertEqual(result.error_code, "MACOS_CHROME_ACTIVATE_FAILED")
+        self.assertIn("permission denied", result.message)
+
+    def test_focus_chrome_window_frontmost_query_failure_is_fail_closed(self):
+        activate = subprocess.CompletedProcess(
+            args=["osascript", "-e", 'tell application "Google Chrome" to activate'],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        frontmost = subprocess.CompletedProcess(
+            args=["osascript", "-e", "frontmost query"],
+            returncode=1,
+            stdout="",
+            stderr="system events denied",
+        )
+        with patch.object(
+            simple_brush, "run_osascript", side_effect=[activate, frontmost]
+        ):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertTrue(result.activated)
+        self.assertFalse(result.frontmost)
+        self.assertEqual(
+            result.error_code, "MACOS_CHROME_FRONTMOST_QUERY_FAILED"
+        )
+        self.assertIn("system events denied", result.message)
+
+    def test_focus_chrome_window_non_chrome_frontmost_is_fail_closed(self):
+        activate = subprocess.CompletedProcess(
+            args=["osascript", "-e", 'tell application "Google Chrome" to activate'],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        frontmost = subprocess.CompletedProcess(
+            args=["osascript", "-e", "frontmost query"],
+            returncode=0,
+            stdout="Finder\n",
+            stderr="",
+        )
+        with patch.object(
+            simple_brush, "run_osascript", side_effect=[activate, frontmost]
+        ):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertTrue(result.activated)
+        self.assertFalse(result.frontmost)
+        self.assertEqual(result.error_code, "MACOS_CHROME_NOT_FRONTMOST")
+        self.assertIn("Finder", result.message)
+
+    def test_focus_chrome_window_timeout_is_fail_closed(self):
+        with patch.object(
+            simple_brush,
+            "run_osascript",
+            side_effect=subprocess.TimeoutExpired(cmd=["osascript"], timeout=3.0),
+        ):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertFalse(result.activated)
+        self.assertFalse(result.frontmost)
+        self.assertEqual(result.error_code, "MACOS_OSASCRIPT_TIMEOUT")
+
+    def test_focus_chrome_window_missing_osascript_is_fail_closed(self):
+        with patch.object(
+            simple_brush,
+            "run_osascript",
+            side_effect=FileNotFoundError("osascript not found"),
+        ):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertFalse(result.activated)
+        self.assertFalse(result.frontmost)
+        self.assertEqual(result.error_code, "MACOS_OSASCRIPT_UNAVAILABLE")
+        self.assertIn("osascript not found", result.message)
+
+    def test_focus_chrome_window_osascript_oserror_is_fail_closed(self):
+        with patch.object(
+            simple_brush,
+            "run_osascript",
+            side_effect=OSError("apple events unavailable"),
+        ):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertFalse(result.activated)
+        self.assertFalse(result.frontmost)
+        self.assertEqual(result.error_code, "MACOS_OSASCRIPT_ERROR")
+        self.assertIn("apple events unavailable", result.message)
+
+    def test_focus_chrome_window_only_runs_activate_and_frontmost_scripts(self):
+        seen_scripts = []
+        activate = subprocess.CompletedProcess(
+            args=["osascript", "-e", "activate"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        frontmost = subprocess.CompletedProcess(
+            args=["osascript", "-e", "frontmost"],
+            returncode=0,
+            stdout="Google Chrome\n",
+            stderr="",
+        )
+
+        def fake_run(script, timeout=3.0):
+            seen_scripts.append(script)
+            if script == 'tell application "Google Chrome" to activate':
+                return activate
+            if (
+                script
+                == 'tell application "System Events" '
+                'to get name of first application process whose frontmost is true'
+            ):
+                return frontmost
+            self.fail(f"unexpected script: {script}")
+
+        with patch.object(simple_brush, "run_osascript", side_effect=fake_run):
+            result = simple_brush.focus_chrome_window()
+
+        self.assertTrue(result.frontmost)
+        self.assertEqual(len(seen_scripts), 2)
+        self.assertTrue(any("Google Chrome" in script for script in seen_scripts))
+        self.assertFalse(any("active tab" in script.lower() for script in seen_scripts))
+        self.assertFalse(any("url" in script.lower() for script in seen_scripts))
+        self.assertFalse(any("title" in script.lower() for script in seen_scripts))
 
     def test_macos_successful_launch_is_started_but_not_ready(self):
         resolved = simple_brush.BrowserPrepareResult(

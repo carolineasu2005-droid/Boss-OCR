@@ -191,6 +191,18 @@ class MacOSPermissionStatus:
     message: str = ''
 
 
+@dataclass(frozen=True)
+class MacOSChromeFocusResult:
+    """Structured result for macOS Chrome activate/frontmost checks."""
+
+    platform: str
+    browser: str
+    activated: bool
+    frontmost: bool
+    message: str = ''
+    error_code: str = ''
+
+
 def region_around(x, y, radius):
     """Return the inclusive +/- radius around a point as a ScreenRegion."""
     if radius < 0:
@@ -661,6 +673,108 @@ def launch_chrome_safe_target(chrome_path):
         message='macOS Chrome 已启动 about:blank，但窗口尚未验证为可操作',
         error_code='MACOS_BROWSER_STARTED_NOT_READY',
     )
+
+
+def run_osascript(script, timeout=3.0):
+    """Run one AppleScript via osascript without invoking a shell."""
+    return subprocess.run(
+        ['osascript', '-e', script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def focus_chrome_window():
+    """Activate Chrome and verify it is the frontmost macOS application."""
+    activate_script = 'tell application "Google Chrome" to activate'
+    frontmost_script = (
+        'tell application "System Events" '
+        'to get name of first application process whose frontmost is true'
+    )
+
+    try:
+        activate_result = run_osascript(activate_script)
+        if activate_result.returncode != 0:
+            error_detail = (
+                activate_result.stderr.strip()
+                or activate_result.stdout.strip()
+                or 'unknown osascript error'
+            )
+            return MacOSChromeFocusResult(
+                platform='macos',
+                browser='chrome',
+                activated=False,
+                frontmost=False,
+                message=f'macOS Chrome activate 失败: {error_detail}',
+                error_code='MACOS_CHROME_ACTIVATE_FAILED',
+            )
+
+        frontmost_result = run_osascript(frontmost_script)
+        if frontmost_result.returncode != 0:
+            error_detail = (
+                frontmost_result.stderr.strip()
+                or frontmost_result.stdout.strip()
+                or 'unknown osascript error'
+            )
+            return MacOSChromeFocusResult(
+                platform='macos',
+                browser='chrome',
+                activated=True,
+                frontmost=False,
+                message=f'macOS frontmost application 查询失败: {error_detail}',
+                error_code='MACOS_CHROME_FRONTMOST_QUERY_FAILED',
+            )
+
+        frontmost_app = frontmost_result.stdout.strip()
+        if frontmost_app != 'Google Chrome':
+            return MacOSChromeFocusResult(
+                platform='macos',
+                browser='chrome',
+                activated=True,
+                frontmost=False,
+                message=(
+                    'macOS frontmost application 不是 Google Chrome: '
+                    f'{frontmost_app or "unknown"}'
+                ),
+                error_code='MACOS_CHROME_NOT_FRONTMOST',
+            )
+
+        return MacOSChromeFocusResult(
+            platform='macos',
+            browser='chrome',
+            activated=True,
+            frontmost=True,
+            message='macOS Chrome 已激活并确认位于前台',
+        )
+    except subprocess.TimeoutExpired as exc:
+        return MacOSChromeFocusResult(
+            platform='macos',
+            browser='chrome',
+            activated=False,
+            frontmost=False,
+            message=f'macOS osascript 调用超时: {exc}',
+            error_code='MACOS_OSASCRIPT_TIMEOUT',
+        )
+    except FileNotFoundError as exc:
+        return MacOSChromeFocusResult(
+            platform='macos',
+            browser='chrome',
+            activated=False,
+            frontmost=False,
+            message=f'macOS osascript 不可用: {exc}',
+            error_code='MACOS_OSASCRIPT_UNAVAILABLE',
+        )
+    except OSError as exc:
+        return MacOSChromeFocusResult(
+            platform='macos',
+            browser='chrome',
+            activated=False,
+            frontmost=False,
+            message=f'macOS osascript 调用失败: {exc}',
+            error_code='MACOS_OSASCRIPT_ERROR',
+        )
 
 
 def check_macos_accessibility_capability():

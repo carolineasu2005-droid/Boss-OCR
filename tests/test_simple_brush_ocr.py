@@ -138,6 +138,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
             ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value="test@example.com"),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
@@ -152,6 +153,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 call(simple_brush.forward_click_regions.forward_button),
             ],
         )
+        self.assertEqual(hotkey.call_args_list, [call("ctrl", "a"), call("ctrl", "c")])
         self.assert_focus_restored_twice(click, choose_point)
 
     def test_forward_uses_calibrated_regions_and_reuses_input_box_region(self):
@@ -175,6 +177,8 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value=""),
             patch.object(simple_brush, "type_text_human", return_value=True),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "press") as press,
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
@@ -190,6 +194,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 call(calibrated.forward_button),
             ],
         )
+        self.assertEqual(
+            hotkey.call_args_list,
+            [call("ctrl", "a"), call("ctrl", "c"), call("ctrl", "a")],
+        )
+        press.assert_called_once_with("delete")
         self.assert_focus_restored_twice(click, choose_point)
 
     def test_forward_restores_focus_at_consecutive_limit(self):
@@ -220,6 +229,8 @@ class SimpleBrushOCRTests(unittest.TestCase):
             ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value=""),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "press") as press,
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
@@ -233,6 +244,8 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 call(simple_brush.forward_click_regions.input_box),
             ],
         )
+        self.assertEqual(hotkey.call_args_list, [call("ctrl", "a"), call("ctrl", "c")])
+        press.assert_called_once_with("esc")
         self.assert_focus_restored_twice(click, choose_point)
 
     def test_forward_restores_focus_when_wait_is_interrupted(self):
