@@ -67,6 +67,26 @@ from ocr_calibration import (
 from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
 from ocr_text import parse_keyword_rules
 
+
+class MacSafeBrowseArgumentError(ValueError):
+    """Fail-closed CLI validation error for the future macOS safe mode."""
+
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _parse_mac_safe_browse_limit(raw_value, option_name):
+    """Parse one bounded CLI limit without consulting runtime state."""
+    value = str(raw_value).strip() if raw_value is not None else ''
+    if not value.isascii() or not value.isdigit():
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_LIMIT_INVALID',
+            f'{option_name} 必须是正整数',
+        )
+    return int(value)
+
+
 # ─── 命令行参数解析 ───────────────────────────────
 def parse_args():
     """解析命令行参数"""
@@ -80,6 +100,9 @@ def parse_args():
         'auto': False,
         'preflight_only': False,
         'coordinate_diagnostics_only': False,
+        'mac_safe_browse_only': False,
+        'max_candidates': None,
+        'max_runtime_minutes': None,
     }
     i = 1
     while i < len(sys.argv):
@@ -112,8 +135,43 @@ def parse_args():
         elif sys.argv[i] == '--coordinate-diagnostics-only':
             args['coordinate_diagnostics_only'] = True
             i += 1
+        elif sys.argv[i] == '--mac-safe-browse-only':
+            args['mac_safe_browse_only'] = True
+            i += 1
+        elif sys.argv[i] == '--max-candidates':
+            if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
+                raise MacSafeBrowseArgumentError(
+                    'MAC_SAFE_BROWSE_LIMIT_INVALID',
+                    '--max-candidates 缺少正整数',
+                )
+            args['max_candidates'] = _parse_mac_safe_browse_limit(
+                sys.argv[i + 1],
+                '--max-candidates',
+            )
+            i += 2
+        elif sys.argv[i] == '--max-runtime-minutes':
+            if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
+                raise MacSafeBrowseArgumentError(
+                    'MAC_SAFE_BROWSE_LIMIT_INVALID',
+                    '--max-runtime-minutes 缺少正整数',
+                )
+            args['max_runtime_minutes'] = _parse_mac_safe_browse_limit(
+                sys.argv[i + 1],
+                '--max-runtime-minutes',
+            )
+            i += 2
         else:
             i += 1
+    if args['mac_safe_browse_only'] and (
+        args['auto']
+        or args['preflight_only']
+        or args['coordinate_diagnostics_only']
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CONFLICTING_MODE',
+            '--mac-safe-browse-only 不能与 --auto、--preflight-only 或 '
+            '--coordinate-diagnostics-only 同时使用',
+        )
     if args['preflight_only'] and args['coordinate_diagnostics_only']:
         raise ValueError(
             '--coordinate-diagnostics-only 不能与 --preflight-only 同时使用'
@@ -502,6 +560,88 @@ def validate_mac_safe_browse_guard(
         message=(
             'safe browse guard 已通过；仅允许进入后续受控浏览，'
             '不代表业务 ready，且禁止转发'
+        ),
+    )
+
+
+def build_mac_safe_browse_config(
+    args: dict,
+    *,
+    platform_name: str | None = None,
+) -> MacSafeBrowseConfig:
+    """Build a side-effect-free 5C config or reject the CLI fail closed."""
+    if not isinstance(args, dict):
+        raise TypeError('args 必须是 dict')
+    if args.get('mac_safe_browse_only') is not True:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_DISABLED',
+            '未启用 --mac-safe-browse-only',
+        )
+
+    current_platform = sys.platform if platform_name is None else platform_name
+    if current_platform != 'darwin':
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_UNSUPPORTED_PLATFORM',
+            '--mac-safe-browse-only 仅支持 macOS darwin',
+        )
+    if (
+        args.get('auto')
+        or args.get('preflight_only')
+        or args.get('coordinate_diagnostics_only')
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CONFLICTING_MODE',
+            'safe browse 不能与 auto、preflight 或 coordinate diagnostics 共用',
+        )
+    if args.get('no_forward') is not True:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_NO_FORWARD_REQUIRED',
+            'safe browse 必须显式传入 --no-forward',
+        )
+    if str(args.get('email') or '').strip():
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_FORWARDING_EMAIL_PRESENT',
+            'safe browse 不接受邮箱参数',
+        )
+
+    max_candidates = args.get('max_candidates')
+    max_runtime_minutes = args.get('max_runtime_minutes')
+    valid_candidates = (
+        isinstance(max_candidates, int)
+        and not isinstance(max_candidates, bool)
+        and 1 <= max_candidates <= 5
+    )
+    valid_runtime = (
+        isinstance(max_runtime_minutes, int)
+        and not isinstance(max_runtime_minutes, bool)
+        and 1 <= max_runtime_minutes <= 15
+    )
+    if not valid_candidates:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_LIMIT_INVALID',
+            '--max-candidates 必须存在且为 1 到 5 的整数',
+        )
+    if not valid_runtime:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_LIMIT_INVALID',
+            '--max-runtime-minutes 必须存在且为 1 到 15 的整数',
+        )
+
+    return MacSafeBrowseConfig(
+        enabled=True,
+        no_forward_required=True,
+        max_candidates=max_candidates,
+        max_runtime_minutes=max_runtime_minutes,
+        require_page_allowed=True,
+        require_coordinate_validated=True,
+        require_manual_confirmation=True,
+        allow_scroll=False,
+        allow_next_candidate=False,
+        allow_refresh=False,
+        allow_filter=False,
+        message=(
+            '5C CLI 参数已验证；真实 evidence 与浏览链路尚未实施，'
+            '不得进入真实浏览'
         ),
     )
 
@@ -2100,6 +2240,31 @@ def run_coordinate_diagnostics_only(_cli_args=None):
     return 0
 
 
+def run_mac_safe_browse_only(cli_args) -> int:
+    """Validate the 5C CLI skeleton and always stop before real browsing."""
+    try:
+        config = build_mac_safe_browse_config(cli_args)
+    except MacSafeBrowseArgumentError as exc:
+        print('MAC SAFE BROWSE ONLY — FAIL CLOSED')
+        print(f'  error_code: {exc.error_code}')
+        print(f'  message: {exc}')
+        return 2
+
+    print('MAC SAFE BROWSE ONLY — NO FORWARDING ENABLED')
+    print(f'  max_candidates: {config.max_candidates}')
+    print(f'  max_runtime_minutes: {config.max_runtime_minutes}')
+    print('  allow_scroll: False')
+    print('  allow_next_candidate: False')
+    print('  allow_refresh: False')
+    print('  allow_filter: False')
+    print('  error_code: MAC_SAFE_BROWSE_NOT_IMPLEMENTED')
+    print(
+        '  message: guard wiring exists; real evidence collection and browsing '
+        'are not implemented in 5C'
+    )
+    return 2
+
+
 def safe_wait(seconds):
     """等待指定秒数，期间响应暂停/停止"""
     deadline = time.time() + seconds
@@ -2985,6 +3150,8 @@ def run():
     # ── 交互/参数输入 ──
     try:
         cli_args = parse_args()
+        if cli_args.get('mac_safe_browse_only', False):
+            return run_mac_safe_browse_only(cli_args)
         if cli_args.get('coordinate_diagnostics_only', False):
             return run_coordinate_diagnostics_only(cli_args)
         if cli_args.get('preflight_only', False):
@@ -2999,6 +3166,9 @@ def run():
             no_forward=no_forward_mode,
             no_batch_filter=cli_args.get('no_batch_filter', False),
         )
+    except MacSafeBrowseArgumentError as exc:
+        print(f'[错误][{exc.error_code}] {exc}')
+        return 2
     except ValueError as exc:
         print(f'[错误] {exc}')
         return 2

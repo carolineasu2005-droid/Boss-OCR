@@ -2655,5 +2655,222 @@ class MacSafeBrowseGuardTests(unittest.TestCase):
                 mocked.assert_not_called()
 
 
+class MacSafeBrowseCLITests(unittest.TestCase):
+    def parse(self, *args):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", *args],
+        ):
+            return simple_brush.parse_args()
+
+    def valid_args(self, **overrides):
+        values = self.parse(
+            "--mac-safe-browse-only",
+            "--no-forward",
+            "--max-candidates",
+            "1",
+            "--max-runtime-minutes",
+            "5",
+        )
+        values.update(overrides)
+        return values
+
+    def assert_argument_error(self, error_code, args, *, platform="darwin"):
+        with self.assertRaises(simple_brush.MacSafeBrowseArgumentError) as caught:
+            simple_brush.build_mac_safe_browse_config(
+                args,
+                platform_name=platform,
+            )
+        self.assertEqual(caught.exception.error_code, error_code)
+
+    def test_parse_args_recognizes_safe_browse_and_limits(self):
+        defaults = self.parse()
+        parsed = self.valid_args()
+
+        self.assertFalse(defaults["mac_safe_browse_only"])
+        self.assertIsNone(defaults["max_candidates"])
+        self.assertIsNone(defaults["max_runtime_minutes"])
+        self.assertTrue(parsed["mac_safe_browse_only"])
+        self.assertEqual(parsed["max_candidates"], 1)
+        self.assertEqual(parsed["max_runtime_minutes"], 5)
+
+    def test_parse_args_rejects_safe_browse_mode_conflicts(self):
+        for conflicting_flag in (
+            "--auto",
+            "--preflight-only",
+            "--coordinate-diagnostics-only",
+        ):
+            with self.subTest(conflicting_flag=conflicting_flag):
+                with self.assertRaises(
+                    simple_brush.MacSafeBrowseArgumentError
+                ) as caught:
+                    self.parse(
+                        "--mac-safe-browse-only",
+                        "--no-forward",
+                        "--max-candidates",
+                        "1",
+                        "--max-runtime-minutes",
+                        "5",
+                        conflicting_flag,
+                    )
+                self.assertEqual(
+                    caught.exception.error_code,
+                    "MAC_SAFE_BROWSE_CONFLICTING_MODE",
+                )
+
+    def test_build_safe_browse_config_rejects_non_macos_and_missing_no_forward(self):
+        self.assert_argument_error(
+            "MAC_SAFE_BROWSE_UNSUPPORTED_PLATFORM",
+            self.valid_args(),
+            platform="win32",
+        )
+        self.assert_argument_error(
+            "MAC_SAFE_BROWSE_NO_FORWARD_REQUIRED",
+            self.valid_args(no_forward=False),
+        )
+
+    def test_build_safe_browse_config_rejects_missing_and_invalid_limits(self):
+        cases = (
+            ("max_candidates", None),
+            ("max_candidates", 0),
+            ("max_candidates", 6),
+            ("max_runtime_minutes", None),
+            ("max_runtime_minutes", 0),
+            ("max_runtime_minutes", 16),
+        )
+        for field_name, value in cases:
+            with self.subTest(field_name=field_name, value=value):
+                self.assert_argument_error(
+                    "MAC_SAFE_BROWSE_LIMIT_INVALID",
+                    self.valid_args(**{field_name: value}),
+                )
+
+    def test_build_safe_browse_config_rejects_email(self):
+        self.assert_argument_error(
+            "MAC_SAFE_BROWSE_FORWARDING_EMAIL_PRESENT",
+            self.valid_args(email="forward@example.com"),
+        )
+
+    def test_build_safe_browse_config_keeps_all_actions_disabled(self):
+        config = simple_brush.build_mac_safe_browse_config(
+            self.valid_args(),
+            platform_name="darwin",
+        )
+
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.no_forward_required)
+        self.assertEqual(config.max_candidates, 1)
+        self.assertEqual(config.max_runtime_minutes, 5)
+        self.assertTrue(config.require_page_allowed)
+        self.assertTrue(config.require_coordinate_validated)
+        self.assertTrue(config.require_manual_confirmation)
+        self.assertFalse(config.allow_scroll)
+        self.assertFalse(config.allow_next_candidate)
+        self.assertFalse(config.allow_refresh)
+        self.assertFalse(config.allow_filter)
+
+    def test_run_dispatches_valid_safe_browse_before_normal_flow(self):
+        argv = [
+            "simple_brush.py",
+            "--mac-safe-browse-only",
+            "--no-forward",
+            "--max-candidates",
+            "1",
+            "--max-runtime-minutes",
+            "5",
+        ]
+        with (
+            patch.object(simple_brush.sys, "argv", argv),
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(
+                simple_brush,
+                "run_mac_safe_browse_only",
+                return_value=2,
+            ) as safe_browse,
+            patch.object(simple_brush, "get_user_input") as get_user_input,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "prepare_browser") as prepare_browser,
+            patch.object(simple_brush, "run_preflight_only") as preflight,
+            patch.object(
+                simple_brush,
+                "run_coordinate_diagnostics_only",
+            ) as coordinate_diagnostics,
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 2)
+        safe_browse.assert_called_once()
+        get_user_input.assert_not_called()
+        initialize_ocr.assert_not_called()
+        listener_start.assert_not_called()
+        prepare_browser.assert_not_called()
+        preflight.assert_not_called()
+        coordinate_diagnostics.assert_not_called()
+
+    def test_valid_safe_browse_skeleton_is_not_implemented_and_has_no_side_effects(self):
+        blocked_names = (
+            "get_user_input",
+            "prepare_browser",
+            "run_preflight_only",
+            "capture_screen_coordinate_diagnostics",
+            "run_coordinate_diagnostics_only",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+            "initialize_ocr",
+            "select_screen_region",
+            "save_region_preview",
+            "MSSScreenCapture",
+            "OCRKeywordDetector",
+            "forward_one_candidate",
+        )
+        pyautogui_names = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            prompt = stack.enter_context(patch("builtins.input"))
+            print_output = stack.enter_context(patch("builtins.print"))
+            result = simple_brush.run_mac_safe_browse_only(self.valid_args())
+
+        self.assertEqual(result, 2)
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertIn("NO FORWARDING ENABLED", rendered)
+        self.assertIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
+        prompt.assert_not_called()
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
