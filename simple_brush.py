@@ -115,6 +115,8 @@ def parse_args():
         'mac_safe_browse_calibrate_and_dry_run': False,
         'mac_safe_browse_real_capture_once': False,
         'mac_safe_browse_open_candidate_once': False,
+        'mac_forward_ui_smoke_only': False,
+        'allow_invalid_forward_submit_smoke': False,
         'max_candidates': None,
         'max_runtime_minutes': None,
     }
@@ -163,6 +165,12 @@ def parse_args():
             i += 1
         elif sys.argv[i] == '--mac-safe-browse-open-candidate-once':
             args['mac_safe_browse_open_candidate_once'] = True
+            i += 1
+        elif sys.argv[i] == '--mac-forward-ui-smoke-only':
+            args['mac_forward_ui_smoke_only'] = True
+            i += 1
+        elif sys.argv[i] == '--allow-invalid-forward-submit-smoke':
+            args['allow_invalid_forward_submit_smoke'] = True
             i += 1
         elif sys.argv[i] == '--max-candidates':
             if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
@@ -228,6 +236,33 @@ def parse_args():
             '--mac-safe-browse-open-candidate-once 只能与 '
             '--mac-safe-browse-calibrate-and-dry-run 同用，且不能与 '
             '--auto、--preflight-only 或 --coordinate-diagnostics-only 共用',
+        )
+    if args['mac_forward_ui_smoke_only'] and (
+        args['mac_safe_browse_only']
+        or args['mac_safe_browse_calibrate_only']
+        or args['mac_safe_browse_calibrate_and_dry_run']
+        or args['auto']
+        or args['preflight_only']
+        or args['coordinate_diagnostics_only']
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_CONFLICTING_MODE',
+            '--mac-forward-ui-smoke-only 不能与 safe browse、--auto、'
+            '--preflight-only 或 --coordinate-diagnostics-only 同时使用',
+        )
+    if args['allow_invalid_forward_submit_smoke'] and (
+        not args['mac_forward_ui_smoke_only']
+        or args['mac_safe_browse_only']
+        or args['mac_safe_browse_calibrate_only']
+        or args['mac_safe_browse_calibrate_and_dry_run']
+        or args['auto']
+        or args['preflight_only']
+        or args['coordinate_diagnostics_only']
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_SUBMIT_CONFLICTING_MODE',
+            '--allow-invalid-forward-submit-smoke 只能与 '
+            '--mac-forward-ui-smoke-only 同用',
         )
     if args['mac_safe_browse_calibrate_only'] and (
         args['mac_safe_browse_only']
@@ -542,6 +577,12 @@ class MacSafeBrowseActionBudget:
     max_focus_restore: int
     max_ocr_capture: int
     max_forward: int = 0
+    max_filter_recent_unseen: int = 0
+    max_open_forward_modal: int = 0
+    max_focus_forward_email_field: int = 0
+    max_type_invalid_forward_email: int = 0
+    max_close_forward_modal: int = 0
+    max_submit_invalid_forward: int = 0
 
 
 @dataclass(frozen=True)
@@ -557,6 +598,12 @@ class MacSafeBrowseActionState:
     focus_restore: int = 0
     ocr_capture: int = 0
     forward: int = 0
+    filter_recent_unseen: int = 0
+    open_forward_modal: int = 0
+    focus_forward_email_field: int = 0
+    type_invalid_forward_email: int = 0
+    close_forward_modal: int = 0
+    submit_invalid_forward: int = 0
     stopped: bool = False
     stop_reason: str | None = None
     error_code: str | None = None
@@ -628,6 +675,42 @@ class MacSafeBrowseRealCaptureResult:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class MacForwardUiSmokeConfig:
+    """Validated configuration for macOS forward/filter UI smoke-only mode."""
+
+    enabled: bool
+    no_forward_required: bool
+    allow_invalid_submit: bool
+    invalid_email_text: str
+    countdown_seconds: int
+    message: str
+
+
+@dataclass(frozen=True)
+class MacForwardUiSmokeActionStatus:
+    """Per-action smoke status without implying business success."""
+
+    attempted: bool
+    verified: bool
+    count: int
+    error_code: str | None = None
+    message: str = ''
+
+
+@dataclass(frozen=True)
+class MacForwardUiSmokeResult:
+    """Result for the independent macOS forward/filter smoke entry."""
+
+    completed: bool
+    state: MacSafeBrowseActionState
+    statuses: dict[str, MacForwardUiSmokeActionStatus]
+    forwarding_enabled: bool
+    invalid_submit_enabled: bool
+    message: str
+    error_code: str | None = None
+
+
 MAC_SAFE_BROWSE_ACTIONS = (
     'candidate_open',
     'scroll',
@@ -637,6 +720,12 @@ MAC_SAFE_BROWSE_ACTIONS = (
     'focus_restore',
     'ocr_capture',
     'forward',
+    'filter_recent_unseen',
+    'open_forward_modal',
+    'focus_forward_email_field',
+    'type_invalid_forward_email',
+    'close_forward_modal',
+    'submit_invalid_forward',
 )
 
 
@@ -1444,6 +1533,64 @@ def build_mac_safe_browse_calibrate_and_dry_run_config(
     )
 
 
+def build_mac_forward_ui_smoke_config(
+    args: dict,
+    *,
+    platform_name: str | None = None,
+) -> MacForwardUiSmokeConfig:
+    """Validate the independent macOS UI smoke mode fail closed."""
+    if not isinstance(args, dict):
+        raise TypeError('args 必须是 dict')
+    if args.get('mac_forward_ui_smoke_only') is not True:
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_DISABLED',
+            '未启用 --mac-forward-ui-smoke-only',
+        )
+
+    current_platform = sys.platform if platform_name is None else platform_name
+    if current_platform != 'darwin':
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_UNSUPPORTED_PLATFORM',
+            '--mac-forward-ui-smoke-only 仅支持 macOS darwin',
+        )
+    if (
+        args.get('mac_safe_browse_only')
+        or args.get('mac_safe_browse_calibrate_only')
+        or args.get('mac_safe_browse_calibrate_and_dry_run')
+        or args.get('auto')
+        or args.get('preflight_only')
+        or args.get('coordinate_diagnostics_only')
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_CONFLICTING_MODE',
+            'mac forward ui smoke 不能与其他运行模式共用',
+        )
+    if args.get('no_forward') is not True:
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_NO_FORWARD_REQUIRED',
+            'mac forward ui smoke 必须显式传入 --no-forward',
+        )
+    if str(args.get('email') or '').strip():
+        raise MacSafeBrowseArgumentError(
+            'MAC_FORWARD_UI_SMOKE_EMAIL_FORBIDDEN',
+            'mac forward ui smoke 不接受邮箱参数',
+        )
+
+    return MacForwardUiSmokeConfig(
+        enabled=True,
+        no_forward_required=True,
+        allow_invalid_submit=(
+            args.get('allow_invalid_forward_submit_smoke') is True
+        ),
+        invalid_email_text='invalid-test-address',
+        countdown_seconds=5,
+        message=(
+            'macOS forward/filter UI smoke 已验证；仅允许手工确认驱动的 '
+            '单次真实点击/输入，不允许业务循环或真实转发'
+        ),
+    )
+
+
 def validate_mac_safe_browse_calibration_args(
     args: dict,
     *,
@@ -2028,6 +2175,362 @@ def get_mac_safe_browse_candidate_open_point(
             'MAC_SAFE_BROWSE_CANDIDATE_OPEN_POINT_UNAVAILABLE',
             f'当前鼠标位置无法转换为整数坐标: {exc}',
         ) from exc
+
+
+def build_mac_forward_ui_smoke_budget(
+    config: MacForwardUiSmokeConfig,
+) -> MacSafeBrowseActionBudget:
+    """Build the bounded manual smoke budget with all non-smoke actions off."""
+    if not isinstance(config, MacForwardUiSmokeConfig):
+        raise TypeError('config 必须是 MacForwardUiSmokeConfig')
+    return MacSafeBrowseActionBudget(
+        max_candidates=1,
+        max_runtime_seconds=15 * 60,
+        max_candidate_open=0,
+        max_scroll=0,
+        max_next_candidate=0,
+        max_refresh=0,
+        max_filter_click=0,
+        max_focus_restore=0,
+        max_ocr_capture=0,
+        max_forward=0,
+        max_filter_recent_unseen=1,
+        max_open_forward_modal=1,
+        max_focus_forward_email_field=1,
+        max_type_invalid_forward_email=1,
+        max_close_forward_modal=1,
+        max_submit_invalid_forward=1 if config.allow_invalid_submit else 0,
+    )
+
+
+def get_mac_forward_ui_smoke_point(
+    *,
+    action_label: str,
+    instruction: str,
+    confirm_phrase: str = 'YES',
+    confirm_fn=input,
+    position_fn=pyautogui.position,
+    sleep_fn=time.sleep,
+    countdown_seconds=5,
+):
+    """Wait for explicit confirmation, then capture one manual smoke point."""
+    if not isinstance(action_label, str) or not action_label:
+        raise TypeError('action_label 必须是非空字符串')
+    if not isinstance(instruction, str) or not instruction:
+        raise TypeError('instruction 必须是非空字符串')
+    if not isinstance(confirm_phrase, str) or not confirm_phrase:
+        raise TypeError('confirm_phrase 必须是非空字符串')
+    if not callable(confirm_fn):
+        raise TypeError('confirm_fn 必须可调用')
+    if not callable(position_fn):
+        raise TypeError('position_fn 必须可调用')
+    if not callable(sleep_fn):
+        raise TypeError('sleep_fn 必须可调用')
+    if (
+        not isinstance(countdown_seconds, int)
+        or isinstance(countdown_seconds, bool)
+        or countdown_seconds < 0
+    ):
+        raise TypeError('countdown_seconds 必须是非负整数')
+
+    print(f'{action_label}: {instruction}')
+    print(f'{action_label}: 输入 {confirm_phrase} 继续。')
+    response = str(confirm_fn()).strip()
+    if response != confirm_phrase:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_FORWARD_UI_SMOKE_CONFIRMATION_REQUIRED',
+            f'{action_label} 需要输入 {confirm_phrase} 确认；未确认时 fail closed',
+        )
+
+    print(
+        f'{action_label}: 请在 {countdown_seconds} 秒内切回 Chrome，并把鼠标放到目标位置。'
+    )
+    sleep_fn(countdown_seconds)
+    try:
+        point = position_fn()
+    except Exception as exc:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_FORWARD_UI_SMOKE_POINT_UNAVAILABLE',
+            f'{action_label} 无法读取当前鼠标位置: {exc}',
+        ) from exc
+
+    x = getattr(point, 'x', None)
+    y = getattr(point, 'y', None)
+    if x is None or y is None:
+        try:
+            x, y = point
+        except Exception as exc:
+            raise MacSafeBrowseRuntimeError(
+                'MAC_FORWARD_UI_SMOKE_POINT_UNAVAILABLE',
+                f'{action_label} 当前鼠标位置缺少可用 x/y 坐标',
+            ) from exc
+    try:
+        return (int(x), int(y))
+    except Exception as exc:
+        raise MacSafeBrowseRuntimeError(
+            'MAC_FORWARD_UI_SMOKE_POINT_UNAVAILABLE',
+            f'{action_label} 当前鼠标位置无法转换为整数坐标: {exc}',
+        ) from exc
+
+
+def build_mac_forward_ui_smoke_plan(
+    config: MacForwardUiSmokeConfig,
+) -> tuple[MacSafeBrowseDryRunStep, ...]:
+    """Build the bounded manual UI smoke plan."""
+    if not isinstance(config, MacForwardUiSmokeConfig):
+        raise TypeError('config 必须是 MacForwardUiSmokeConfig')
+    plan = [
+        MacSafeBrowseDryRunStep(
+            action='filter_recent_unseen',
+            description='single click on the recent-unseen filter entry',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='open_forward_modal',
+            description='single click on the forward UI entry point',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='focus_forward_email_field',
+            description='single click on the forward email input field',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='type_invalid_forward_email',
+            description='single invalid test email typing action',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='close_forward_modal',
+            description='single click on a blank area to close the modal',
+        ),
+    ]
+    if config.allow_invalid_submit:
+        plan.append(
+            MacSafeBrowseDryRunStep(
+                action='submit_invalid_forward',
+                description='single invalid forward submit click',
+            )
+        )
+    return tuple(plan)
+
+
+def build_mac_forward_ui_smoke_action_fns(
+    config: MacForwardUiSmokeConfig,
+    *,
+    focus_fn=None,
+    click_fn=None,
+    typewrite_fn=None,
+    position_fn=pyautogui.position,
+    confirm_fn=input,
+    submit_confirm_fn=input,
+    sleep_fn=time.sleep,
+):
+    """Build the manual smoke actions with per-step confirmation and recheck."""
+    if not isinstance(config, MacForwardUiSmokeConfig):
+        raise TypeError('config 必须是 MacForwardUiSmokeConfig')
+
+    click_action_fn = click_fn
+    if click_action_fn is None:
+        def click_action_fn(x, y):
+            human_click(x, y, offset=0)
+    if typewrite_fn is None:
+        def typewrite_fn(text, interval=0.03):
+            pyautogui.typewrite(text, interval=interval)
+
+    statuses = {
+        step.action: MacForwardUiSmokeActionStatus(
+            attempted=False,
+            verified=False,
+            count=0,
+        )
+        for step in build_mac_forward_ui_smoke_plan(config)
+    }
+
+    def set_status(action, *, attempted=None, verified=None, error_code=None, message=None):
+        current = statuses[action]
+        statuses[action] = MacForwardUiSmokeActionStatus(
+            attempted=current.attempted if attempted is None else attempted,
+            verified=current.verified if verified is None else verified,
+            count=current.count,
+            error_code=current.error_code if error_code is None else error_code,
+            message=current.message if message is None else message,
+        )
+
+    def apply_count(state):
+        for action in statuses:
+            current = statuses[action]
+            statuses[action] = MacForwardUiSmokeActionStatus(
+                attempted=current.attempted,
+                verified=current.verified,
+                count=getattr(state, action),
+                error_code=current.error_code,
+                message=current.message,
+            )
+
+    def ensure_frontmost(action_label):
+        focus_result = focus_chrome_window() if focus_fn is None else focus_fn()
+        if isinstance(focus_result, MacOSChromeFocusResult):
+            if focus_result.frontmost is not True:
+                raise MacSafeBrowseRuntimeError(
+                    'MAC_FORWARD_UI_SMOKE_CHROME_NOT_FRONTMOST',
+                    focus_result.message,
+                )
+            return
+        if not bool(focus_result):
+            raise MacSafeBrowseRuntimeError(
+                'MAC_FORWARD_UI_SMOKE_CHROME_NOT_FRONTMOST',
+                f'{action_label} 前 Chrome frontmost 校验失败',
+            )
+
+    def make_click_action(action, instruction, *, confirm_phrase='YES'):
+        def action_fn():
+            try:
+                x, y = get_mac_forward_ui_smoke_point(
+                    action_label=action,
+                    instruction=instruction,
+                    confirm_phrase=confirm_phrase,
+                    confirm_fn=(
+                        submit_confirm_fn
+                        if confirm_phrase != 'YES'
+                        else confirm_fn
+                    ),
+                    position_fn=position_fn,
+                    sleep_fn=sleep_fn,
+                    countdown_seconds=config.countdown_seconds,
+                )
+                ensure_frontmost(action)
+                click_action_fn(x, y)
+            except Exception as exc:
+                set_status(
+                    action,
+                    attempted=False,
+                    verified=False,
+                    error_code=getattr(
+                        exc,
+                        'error_code',
+                        'MAC_FORWARD_UI_SMOKE_ACTION_FAILED',
+                    ),
+                    message=str(exc),
+                )
+                return False
+            set_status(
+                action,
+                attempted=True,
+                verified=False,
+                error_code=None,
+                message=f'{action} 点击已尝试一次；未做页面状态验证',
+            )
+            return True
+        return action_fn
+
+    def type_invalid_forward_email_action():
+        action = 'type_invalid_forward_email'
+        try:
+            print(f'{action}: 输入 YES 继续。')
+            response = str(confirm_fn()).strip()
+            if response != 'YES':
+                raise MacSafeBrowseRuntimeError(
+                    'MAC_FORWARD_UI_SMOKE_CONFIRMATION_REQUIRED',
+                    f'{action} 需要输入 YES 确认；未确认时 fail closed',
+                )
+            ensure_frontmost(action)
+            typewrite_fn(config.invalid_email_text, interval=0.03)
+        except Exception as exc:
+            set_status(
+                action,
+                attempted=False,
+                verified=False,
+                error_code=getattr(
+                    exc,
+                    'error_code',
+                    'MAC_FORWARD_UI_SMOKE_ACTION_FAILED',
+                ),
+                message=str(exc),
+            )
+            return False
+        set_status(
+            action,
+            attempted=True,
+            verified=False,
+            error_code=None,
+            message='无效测试邮箱字符串已尝试输入；不代表提交或发送',
+        )
+        return True
+
+    action_fns = {
+        'filter_recent_unseen': make_click_action(
+            'filter_recent_unseen',
+            '请切回 Chrome/BOSS，并把鼠标放到“最近没看过”筛选点击位置。',
+        ),
+        'open_forward_modal': make_click_action(
+            'open_forward_modal',
+            '请切回 Chrome/BOSS，并把鼠标放到候选人页面里的转发入口。',
+        ),
+        'focus_forward_email_field': make_click_action(
+            'focus_forward_email_field',
+            '请切回 Chrome/BOSS，并把鼠标放到转发弹窗的邮箱输入框。',
+        ),
+        'type_invalid_forward_email': type_invalid_forward_email_action,
+        'close_forward_modal': make_click_action(
+            'close_forward_modal',
+            '请切回 Chrome/BOSS，并把鼠标放到用于关闭弹窗的空白区域。',
+        ),
+    }
+    if config.allow_invalid_submit:
+        action_fns['submit_invalid_forward'] = make_click_action(
+            'submit_invalid_forward',
+            '请切回 Chrome/BOSS，并把鼠标放到最终发送/确认按钮。',
+            confirm_phrase='SEND INVALID TEST',
+        )
+    return action_fns, statuses, apply_count
+
+
+def run_mac_forward_ui_smoke_pipeline(
+    budget: MacSafeBrowseActionBudget,
+    plan: tuple[MacSafeBrowseDryRunStep, ...],
+    *,
+    started_at: float,
+    now_fn=time.time,
+    action_fns=None,
+    apply_count_fn=None,
+    statuses=None,
+) -> MacForwardUiSmokeResult:
+    """Run the manual smoke plan with the shared action executor."""
+    if not isinstance(budget, MacSafeBrowseActionBudget):
+        raise TypeError('budget 必须是 MacSafeBrowseActionBudget')
+    if not isinstance(plan, tuple):
+        raise TypeError('plan 必须是 tuple')
+    if not callable(now_fn):
+        raise TypeError('now_fn 必须可调用')
+    state = MacSafeBrowseActionState(started_at=started_at)
+    injected = action_fns or {}
+    count_updater = apply_count_fn or (lambda _state: None)
+    status_map = statuses or {}
+    for step in plan:
+        action_result = execute_mac_safe_browse_action(
+            budget,
+            state,
+            step.action,
+            injected[step.action],
+            now=now_fn(),
+        )
+        state = action_result.state
+        count_updater(state)
+        if not action_result.allowed:
+            return MacForwardUiSmokeResult(
+                completed=False,
+                state=state,
+                statuses=status_map,
+                forwarding_enabled=False,
+                invalid_submit_enabled='submit_invalid_forward' in injected,
+                message=action_result.message,
+                error_code=action_result.error_code,
+            )
+    return MacForwardUiSmokeResult(
+        completed=True,
+        state=state,
+        statuses=status_map,
+        forwarding_enabled=False,
+        invalid_submit_enabled='submit_invalid_forward' in injected,
+        message='manual UI smoke completed; real forwarding remains disabled',
+    )
 
 
 def build_mac_safe_browse_real_action_fns(
@@ -3806,6 +4309,70 @@ def run_coordinate_diagnostics_only(_cli_args=None):
     return 0
 
 
+def run_mac_forward_ui_smoke_only(
+    cli_args,
+    *,
+    focus_fn=None,
+    click_fn=None,
+    typewrite_fn=None,
+    position_fn=pyautogui.position,
+    confirm_fn=input,
+    submit_confirm_fn=input,
+    sleep_fn=time.sleep,
+    now_fn=time.time,
+) -> int:
+    """Run the manual macOS forward/filter UI smoke path fail closed."""
+    try:
+        config = build_mac_forward_ui_smoke_config(cli_args)
+    except MacSafeBrowseArgumentError as exc:
+        print('MAC FORWARD UI SMOKE ONLY — FAIL CLOSED')
+        print(f'  error_code: {exc.error_code}')
+        print(f'  message: {exc}')
+        return 2
+
+    print('MAC FORWARD UI SMOKE ONLY — NO FORWARDING ENABLED')
+    print(f'  invalid_submit_enabled: {config.allow_invalid_submit}')
+    budget = build_mac_forward_ui_smoke_budget(config)
+    plan = build_mac_forward_ui_smoke_plan(config)
+    action_fns, statuses, apply_count = build_mac_forward_ui_smoke_action_fns(
+        config,
+        focus_fn=focus_fn,
+        click_fn=click_fn,
+        typewrite_fn=typewrite_fn,
+        position_fn=position_fn,
+        confirm_fn=confirm_fn,
+        submit_confirm_fn=submit_confirm_fn,
+        sleep_fn=sleep_fn,
+    )
+    result = run_mac_forward_ui_smoke_pipeline(
+        budget,
+        plan,
+        started_at=now_fn(),
+        now_fn=now_fn,
+        action_fns=action_fns,
+        apply_count_fn=apply_count,
+        statuses=statuses,
+    )
+    for action, status in result.statuses.items():
+        print(f'  {action}_attempted: {status.attempted}')
+        print(f'  {action}_verified: {status.verified}')
+        print(f'  {action}_count: {status.count}')
+        print(f'  {action}_error_code: {status.error_code}')
+    print(f'  forwarding_enabled: {result.forwarding_enabled}')
+    print(f'  invalid_submit_enabled: {result.invalid_submit_enabled}')
+    if not result.completed:
+        print(f'  error_code: {result.error_code}')
+        print(f'  message: {result.message}')
+        return 2
+
+    print('  error_code: MAC_FORWARD_UI_SMOKE_STOPPED_AFTER_MANUAL_ACTIONS')
+    print(
+        '  message: 手工 smoke 动作已完成；未进入业务循环，'
+        '未验证真实发送，也不代表业务 ready'
+    )
+    return 2
+
+
 def run_mac_safe_browse_calibration_only(
     cli_args,
     *,
@@ -4988,6 +5555,8 @@ def run():
     # ── 交互/参数输入 ──
     try:
         cli_args = parse_args()
+        if cli_args.get('mac_forward_ui_smoke_only', False):
+            return run_mac_forward_ui_smoke_only(cli_args)
         if cli_args.get('mac_safe_browse_calibrate_and_dry_run', False):
             return run_mac_safe_browse_calibrate_and_dry_run(cli_args)
         if cli_args.get('mac_safe_browse_calibrate_only', False):
