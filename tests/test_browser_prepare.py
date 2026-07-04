@@ -3543,5 +3543,322 @@ class MacSafeBrowseDryPipelineTests(unittest.TestCase):
         action_fn.assert_not_called()
 
 
+class MacSafeBrowseCalibrationOnlyTests(unittest.TestCase):
+    def parse(self, *args):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", *args],
+        ):
+            return simple_brush.parse_args()
+
+    def args(self, **overrides):
+        values = {
+            "mac_safe_browse_calibrate_only": True,
+            "mac_safe_browse_only": False,
+            "no_forward": True,
+            "auto": False,
+            "preflight_only": False,
+            "coordinate_diagnostics_only": False,
+            "email": "",
+            "max_candidates": None,
+            "max_runtime_minutes": None,
+        }
+        values.update(overrides)
+        return values
+
+    def scale(self, passed=True):
+        return simple_brush.RetinaScaleInference(
+            request_size=(100, 80),
+            image_size=(200, 160),
+            scale_x=2.0,
+            scale_y=2.0,
+            passed=passed,
+            message="scale test evidence",
+            error_code=None if passed else "SCALE_FAILED",
+        )
+
+    def mapping(self, passed=True):
+        selection = simple_brush.TkSelectionRegion(10, 10, 40, 30)
+        crop = simple_brush.ScreenshotCropRegion(20, 20, 80, 60)
+        return simple_brush.TkToScreenshotMapping(
+            tk_selection=selection if passed else None,
+            crop_region=crop if passed else None,
+            passed=passed,
+            message="mapping test evidence",
+            error_code=None if passed else "MAPPING_FAILED",
+        )
+
+    def complete_kwargs(self, **overrides):
+        values = {
+            "display_fingerprint": "display-fingerprint",
+            "scale_inference": self.scale(),
+            "tk_to_screenshot_mapping": self.mapping(),
+            "preview_confirmed": True,
+        }
+        values.update(overrides)
+        return values
+
+    def test_parse_args_recognizes_calibration_only_without_limits(self):
+        parsed = self.parse(
+            "--mac-safe-browse-calibrate-only",
+            "--no-forward",
+        )
+
+        self.assertTrue(parsed["mac_safe_browse_calibrate_only"])
+        self.assertTrue(parsed["no_forward"])
+        self.assertIsNone(parsed["max_candidates"])
+        self.assertIsNone(parsed["max_runtime_minutes"])
+        with patch.object(simple_brush.sys, "platform", "darwin"):
+            self.assertIsNone(
+                simple_brush.validate_mac_safe_browse_calibration_args(parsed)
+            )
+
+    def test_parse_args_rejects_calibration_mode_conflicts(self):
+        for conflicting_flag in (
+            "--mac-safe-browse-only",
+            "--preflight-only",
+            "--coordinate-diagnostics-only",
+            "--auto",
+        ):
+            with self.subTest(conflicting_flag=conflicting_flag):
+                with self.assertRaises(
+                    simple_brush.MacSafeBrowseArgumentError
+                ) as caught:
+                    self.parse(
+                        "--mac-safe-browse-calibrate-only",
+                        "--no-forward",
+                        conflicting_flag,
+                    )
+                self.assertEqual(
+                    caught.exception.error_code,
+                    "MAC_SAFE_BROWSE_CALIBRATION_CONFLICTING_MODE",
+                )
+
+    def test_calibration_args_reject_platform_no_forward_and_email(self):
+        cases = (
+            (
+                self.args(),
+                "win32",
+                "MAC_SAFE_BROWSE_CALIBRATION_UNSUPPORTED_PLATFORM",
+            ),
+            (
+                self.args(no_forward=False),
+                "darwin",
+                "MAC_SAFE_BROWSE_CALIBRATION_NO_FORWARD_REQUIRED",
+            ),
+            (
+                self.args(email="forbidden@example.com"),
+                "darwin",
+                "MAC_SAFE_BROWSE_CALIBRATION_EMAIL_FORBIDDEN",
+            ),
+        )
+        for args, platform_name, error_code in cases:
+            with self.subTest(error_code=error_code):
+                with self.assertRaises(
+                    simple_brush.MacSafeBrowseArgumentError
+                ) as caught:
+                    simple_brush.validate_mac_safe_browse_calibration_args(
+                        args,
+                        platform_name=platform_name,
+                    )
+                self.assertEqual(caught.exception.error_code, error_code)
+
+    def test_real_cli_shape_fails_before_gui_when_coordinate_evidence_missing(self):
+        select_region = Mock()
+        save_preview = Mock()
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch("builtins.print") as print_output,
+        ):
+            result = simple_brush.run_mac_safe_browse_calibration_only(
+                self.args(),
+                select_region_fn=select_region,
+                save_preview_fn=save_preview,
+            )
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 2)
+        self.assertIn(
+            "MAC_SAFE_BROWSE_CALIBRATION_METADATA_INCOMPLETE",
+            rendered,
+        )
+        select_region.assert_not_called()
+        save_preview.assert_not_called()
+
+    def test_region_cancellation_fails_closed(self):
+        result = simple_brush.prepare_mac_safe_browse_calibrated_region(
+            **self.complete_kwargs(),
+            select_region_fn=Mock(
+                side_effect=simple_brush.CalibrationCancelled("cancelled")
+            ),
+        )
+
+        self.assertFalse(result.published)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_CALIBRATION_REGION_CANCELLED",
+        )
+
+    def test_preview_failure_fails_closed(self):
+        result = simple_brush.prepare_mac_safe_browse_calibrated_region(
+            **self.complete_kwargs(),
+            select_region_fn=Mock(
+                return_value=simple_brush.ScreenRegion(10, 20, 300, 200)
+            ),
+            save_preview_fn=Mock(side_effect=RuntimeError("preview failed")),
+            capture_fn=Mock(),
+        )
+
+        self.assertFalse(result.published)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_CALIBRATION_PREVIEW_FAILED",
+        )
+
+    def test_incomplete_metadata_is_not_published(self):
+        select_region = Mock(
+            return_value=simple_brush.ScreenRegion(10, 20, 300, 200)
+        )
+        save_preview = Mock(return_value="/tmp/mock-preview.png")
+        result = simple_brush.prepare_mac_safe_browse_calibrated_region(
+            **self.complete_kwargs(preview_confirmed=False),
+            select_region_fn=select_region,
+            save_preview_fn=save_preview,
+            capture_fn=Mock(),
+        )
+
+        self.assertFalse(result.published)
+        self.assertIsNone(result.calibrated_region)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_CALIBRATION_METADATA_INCOMPLETE",
+        )
+
+    def test_complete_mock_metadata_is_atomically_published_without_business_ready(self):
+        region = simple_brush.ScreenRegion(10, 20, 300, 200)
+        select_region = Mock(return_value=region)
+        capture = Mock(return_value="mock pixels")
+
+        def save_preview(selected, destination, capture_fn):
+            self.assertEqual(selected, region)
+            capture_fn(selected)
+            return destination
+
+        blocked_names = (
+            "prepare_browser",
+            "run_mac_safe_browse_dry_pipeline",
+            "initialize_ocr",
+            "ensure_ocr_region_calibrated",
+            "human_click",
+            "click_in_region",
+            "click_first_candidate",
+            "apply_batch_filter_and_open_first_candidate",
+            "human_scroll_once",
+            "next_candidate",
+            "refresh_page",
+            "forward_one_candidate",
+            "run_osascript",
+            "focus_chrome_window",
+            "get_chrome_active_tab_identity",
+        )
+        pyautogui_names = (
+            "position",
+            "click",
+            "moveTo",
+            "mouseDown",
+            "mouseUp",
+            "press",
+            "hotkey",
+            "scroll",
+            "typewrite",
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
+            stack.enter_context(
+                patch.object(simple_brush, "ocr_calibrated_region", None)
+            )
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["OCRKeywordDetector"] = stack.enter_context(
+                patch.object(simple_brush, "OCRKeywordDetector")
+            )
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            blocked.update(
+                {
+                    f"pyautogui.{name}": stack.enter_context(
+                        patch.object(simple_brush.pyautogui, name)
+                    )
+                    for name in pyautogui_names
+                }
+            )
+            print_output = stack.enter_context(patch("builtins.print"))
+            result = simple_brush.run_mac_safe_browse_calibration_only(
+                self.args(),
+                **self.complete_kwargs(),
+                select_region_fn=select_region,
+                save_preview_fn=save_preview,
+                capture_fn=capture,
+                preview_path="/tmp/mock-preview.png",
+            )
+            published = simple_brush.ocr_calibrated_region
+
+        rendered = "\n".join(
+            " ".join(str(item) for item in entry.args)
+            for entry in print_output.call_args_list
+        )
+        self.assertEqual(result, 0)
+        self.assertIsInstance(published, simple_brush.CalibratedScreenRegion)
+        self.assertEqual(published.region, region)
+        self.assertTrue(published.coordinate_metadata.validated)
+        self.assertTrue(published.coordinate_metadata.manually_confirmed)
+        self.assertFalse(published.coordinate_metadata.business_ready)
+        self.assertIn(
+            "MAC_SAFE_BROWSE_CALIBRATION_PUBLISHED_NOT_BUSINESS_READY",
+            rendered,
+        )
+        select_region.assert_called_once_with()
+        capture.assert_called_once_with(region)
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_run_dispatches_calibration_only_before_ordinary_business(self):
+        argv = [
+            "simple_brush.py",
+            "--mac-safe-browse-calibrate-only",
+            "--no-forward",
+        ]
+        with (
+            patch.object(simple_brush.sys, "argv", argv),
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(
+                simple_brush,
+                "run_mac_safe_browse_calibration_only",
+                return_value=2,
+            ) as calibration_only,
+            patch.object(simple_brush, "get_user_input") as get_user_input,
+            patch.object(simple_brush, "run_mac_safe_browse_only") as safe_browse,
+            patch.object(simple_brush, "prepare_browser") as prepare_browser,
+            patch.object(simple_brush.listener, "start") as listener_start,
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 2)
+        calibration_only.assert_called_once()
+        get_user_input.assert_not_called()
+        safe_browse.assert_not_called()
+        prepare_browser.assert_not_called()
+        listener_start.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

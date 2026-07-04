@@ -101,6 +101,7 @@ def parse_args():
         'preflight_only': False,
         'coordinate_diagnostics_only': False,
         'mac_safe_browse_only': False,
+        'mac_safe_browse_calibrate_only': False,
         'max_candidates': None,
         'max_runtime_minutes': None,
     }
@@ -138,6 +139,9 @@ def parse_args():
         elif sys.argv[i] == '--mac-safe-browse-only':
             args['mac_safe_browse_only'] = True
             i += 1
+        elif sys.argv[i] == '--mac-safe-browse-calibrate-only':
+            args['mac_safe_browse_calibrate_only'] = True
+            i += 1
         elif sys.argv[i] == '--max-candidates':
             if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
                 raise MacSafeBrowseArgumentError(
@@ -162,6 +166,17 @@ def parse_args():
             i += 2
         else:
             i += 1
+    if args['mac_safe_browse_calibrate_only'] and (
+        args['mac_safe_browse_only']
+        or args['auto']
+        or args['preflight_only']
+        or args['coordinate_diagnostics_only']
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CALIBRATION_CONFLICTING_MODE',
+            '--mac-safe-browse-calibrate-only 不能与 safe browse、--auto、'
+            '--preflight-only 或 --coordinate-diagnostics-only 同时使用',
+        )
     if args['mac_safe_browse_only'] and (
         args['auto']
         or args['preflight_only']
@@ -508,6 +523,16 @@ class MacSafeBrowseDryRunResult:
     state: MacSafeBrowseActionState
     real_browsing_enabled: bool
     forwarding_enabled: bool
+    message: str
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseCalibrationResult:
+    """Atomic calibration-only preparation result."""
+
+    published: bool
+    calibrated_region: CalibratedScreenRegion | None
     message: str
     error_code: str | None = None
 
@@ -1213,6 +1238,164 @@ def build_mac_safe_browse_config(
             '5C CLI 参数已验证；真实 evidence 与浏览链路尚未实施，'
             '不得进入真实浏览'
         ),
+    )
+
+
+def validate_mac_safe_browse_calibration_args(
+    args: dict,
+    *,
+    platform_name: str | None = None,
+) -> None:
+    """Validate the independent calibration-only CLI without business setup."""
+    if not isinstance(args, dict):
+        raise TypeError('args 必须是 dict')
+    if args.get('mac_safe_browse_calibrate_only') is not True:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_DISABLED',
+            '未启用 --mac-safe-browse-calibrate-only',
+        )
+    current_platform = sys.platform if platform_name is None else platform_name
+    if current_platform != 'darwin':
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CALIBRATION_UNSUPPORTED_PLATFORM',
+            'safe browse calibration-only 仅支持 macOS darwin',
+        )
+    if (
+        args.get('mac_safe_browse_only')
+        or args.get('auto')
+        or args.get('preflight_only')
+        or args.get('coordinate_diagnostics_only')
+    ):
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CALIBRATION_CONFLICTING_MODE',
+            'calibration-only 不能与其他运行模式共用',
+        )
+    if args.get('no_forward') is not True:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CALIBRATION_NO_FORWARD_REQUIRED',
+            'calibration-only 必须显式传入 --no-forward',
+        )
+    if str(args.get('email') or '').strip():
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_CALIBRATION_EMAIL_FORBIDDEN',
+            'calibration-only 不接受邮箱参数',
+        )
+
+
+def prepare_mac_safe_browse_calibrated_region(
+    *,
+    display_fingerprint=None,
+    scale_inference=None,
+    tk_to_screenshot_mapping=None,
+    preview_confirmed=False,
+    select_region_fn=None,
+    save_preview_fn=None,
+    capture_fn=None,
+    preview_path=None,
+) -> MacSafeBrowseCalibrationResult:
+    """Prepare calibration evidence only; never initialize or run OCR."""
+    fingerprint_valid = (
+        isinstance(display_fingerprint, str) and bool(display_fingerprint.strip())
+    )
+    scale_valid = (
+        isinstance(scale_inference, RetinaScaleInference)
+        and scale_inference.passed
+    )
+    mapping_valid = (
+        isinstance(tk_to_screenshot_mapping, TkToScreenshotMapping)
+        and tk_to_screenshot_mapping.passed
+        and tk_to_screenshot_mapping.crop_region is not None
+    )
+    if not fingerprint_valid or not scale_valid or not mapping_valid:
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message=(
+                '缺少可信 display fingerprint、scale inference 或 '
+                'Tk-to-screenshot mapping；不启动真实校准'
+            ),
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_METADATA_INCOMPLETE',
+        )
+
+    region_selector = select_region_fn or select_screen_region
+    preview_saver = save_preview_fn or save_region_preview
+    destination = OCR_PREVIEW_PATH if preview_path is None else Path(preview_path)
+    try:
+        region = region_selector()
+    except CalibrationCancelled:
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message='safe browse calibration-only 已由用户取消',
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_REGION_CANCELLED',
+        )
+    except Exception as exc:
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message=f'safe browse calibration-only 框选失败: {exc}',
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_REGION_CANCELLED',
+        )
+    if not isinstance(region, ScreenRegion):
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message='框选结果不是有效 ScreenRegion',
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_METADATA_INCOMPLETE',
+        )
+
+    try:
+        if capture_fn is None:
+            capture_fn = MSSScreenCapture().capture
+        saved_path = preview_saver(region, destination, capture_fn)
+        if saved_path is None:
+            raise RuntimeError('preview saver 未返回路径')
+    except Exception as exc:
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message=f'safe browse calibration preview 失败: {exc}',
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_PREVIEW_FAILED',
+        )
+
+    crop = tk_to_screenshot_mapping.crop_region
+    crop_preview = CropPreviewResult(
+        saved=True,
+        preview_path=str(saved_path),
+        crop_size=(crop.width, crop.height),
+        message='safe browse calibration crop preview 已保存到本地',
+    )
+    metadata = build_coordinate_calibration_metadata(
+        display_fingerprint=display_fingerprint,
+        scale_inference=scale_inference,
+        tk_to_screenshot_mapping=tk_to_screenshot_mapping,
+        crop_preview=crop_preview,
+        preview_confirmed=preview_confirmed,
+    )
+    if (
+        not metadata.validated
+        or not metadata.manually_confirmed
+        or metadata.business_ready
+    ):
+        return MacSafeBrowseCalibrationResult(
+            published=False,
+            calibrated_region=None,
+            message=(
+                'coordinate metadata 未完整验证或 preview 未人工确认；'
+                '不发布 calibration'
+            ),
+            error_code='MAC_SAFE_BROWSE_CALIBRATION_METADATA_INCOMPLETE',
+        )
+
+    calibrated = attach_coordinate_metadata_to_region(region, metadata)
+    return MacSafeBrowseCalibrationResult(
+        published=True,
+        calibrated_region=calibrated,
+        message=(
+            'safe browse calibration metadata 已准备；仍非 business ready，'
+            '未执行 OCR 或浏览'
+        ),
+        error_code='MAC_SAFE_BROWSE_CALIBRATION_PUBLISHED_NOT_BUSINESS_READY',
     )
 
 
@@ -2810,6 +2993,62 @@ def run_coordinate_diagnostics_only(_cli_args=None):
     return 0
 
 
+def run_mac_safe_browse_calibration_only(
+    cli_args,
+    *,
+    display_fingerprint=None,
+    scale_inference=None,
+    tk_to_screenshot_mapping=None,
+    preview_confirmed=False,
+    select_region_fn=None,
+    save_preview_fn=None,
+    capture_fn=None,
+    preview_path=None,
+) -> int:
+    """Prepare and atomically publish calibration metadata, then exit."""
+    global ocr_calibrated_region
+    try:
+        validate_mac_safe_browse_calibration_args(cli_args)
+    except MacSafeBrowseArgumentError as exc:
+        print('MAC SAFE BROWSE CALIBRATION ONLY — FAIL CLOSED')
+        print(f'  error_code: {exc.error_code}')
+        print(f'  message: {exc}')
+        return 2
+
+    print('MAC SAFE BROWSE CALIBRATION ONLY — NO FORWARDING ENABLED')
+    result = prepare_mac_safe_browse_calibrated_region(
+        display_fingerprint=display_fingerprint,
+        scale_inference=scale_inference,
+        tk_to_screenshot_mapping=tk_to_screenshot_mapping,
+        preview_confirmed=preview_confirmed,
+        select_region_fn=select_region_fn,
+        save_preview_fn=save_preview_fn,
+        capture_fn=capture_fn,
+        preview_path=preview_path,
+    )
+    if not result.published or result.calibrated_region is None:
+        print('  published: False')
+        print(f'  error_code: {result.error_code}')
+        print(f'  message: {result.message}')
+        return 2
+
+    ocr_calibrated_region = result.calibrated_region
+    region = result.calibrated_region.region
+    metadata = result.calibrated_region.coordinate_metadata
+    print('  published: True')
+    print(
+        f'  region: left={region.left} top={region.top} '
+        f'width={region.width} height={region.height}'
+    )
+    print(f'  coordinate_validated: {metadata.validated}')
+    print(f'  manually_confirmed: {metadata.manually_confirmed}')
+    print(f'  business_ready: {metadata.business_ready}')
+    print(f'  display_fingerprint: {metadata.display_fingerprint}')
+    print(f'  error_code: {result.error_code}')
+    print(f'  message: {result.message}')
+    return 0
+
+
 def run_mac_safe_browse_only(cli_args) -> int:
     """Validate CLI and existing OCR evidence, then stop before browsing."""
     try:
@@ -3764,6 +4003,8 @@ def run():
     # ── 交互/参数输入 ──
     try:
         cli_args = parse_args()
+        if cli_args.get('mac_safe_browse_calibrate_only', False):
+            return run_mac_safe_browse_calibration_only(cli_args)
         if cli_args.get('mac_safe_browse_only', False):
             return run_mac_safe_browse_only(cli_args)
         if cli_args.get('coordinate_diagnostics_only', False):
