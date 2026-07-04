@@ -618,6 +618,8 @@ class MacSafeBrowseRealCaptureResult:
     capture_completed: bool
     capture_size: tuple[int, int] | None
     message: str
+    candidate_open_attempted: bool = False
+    candidate_open_verified: bool = False
     candidate_opened: bool = False
     browse_loop_enabled: bool = False
     error_code: str | None = None
@@ -1892,12 +1894,22 @@ def publish_mac_safe_browse_calibration(
 def get_mac_safe_browse_candidate_open_point(
     confirm_fn=input,
     position_fn=pyautogui.position,
+    sleep_fn=time.sleep,
+    countdown_seconds=5,
 ):
     """Confirm one-shot browse intent and read the current candidate point."""
     if not callable(confirm_fn):
         raise TypeError('confirm_fn 必须可调用')
     if not callable(position_fn):
         raise TypeError('position_fn 必须可调用')
+    if not callable(sleep_fn):
+        raise TypeError('sleep_fn 必须可调用')
+    if (
+        not isinstance(countdown_seconds, int)
+        or isinstance(countdown_seconds, bool)
+        or countdown_seconds < 0
+    ):
+        raise TypeError('countdown_seconds 必须是非负整数')
 
     print('请把鼠标放到第一位候选人位置，确认只打开 1 位候选人；输入 YES 继续。')
     response = str(confirm_fn()).strip()
@@ -1906,6 +1918,11 @@ def get_mac_safe_browse_candidate_open_point(
             'MAC_SAFE_BROWSE_CANDIDATE_OPEN_CONFIRMATION_REQUIRED',
             'candidate_open 需要用户输入 YES 确认；未确认时 fail closed',
         )
+
+    print(
+        f'请在 {countdown_seconds} 秒内切回 Chrome，并把鼠标放到第一位候选人位置。'
+    )
+    sleep_fn(countdown_seconds)
 
     try:
         point = position_fn()
@@ -1944,6 +1961,8 @@ def build_mac_safe_browse_real_action_fns(
     candidate_focus_fn=None,
     candidate_open_confirm_fn=input,
     candidate_open_position_fn=pyautogui.position,
+    candidate_open_sleep_fn=time.sleep,
+    candidate_open_countdown_seconds=5,
     open_candidate_once=False,
 ):
     """Build bounded real actions without OCR, forwarding, or browse loops."""
@@ -1966,6 +1985,8 @@ def build_mac_safe_browse_real_action_fns(
         'focus_restored': False,
         'capture_completed': False,
         'capture_size': None,
+        'candidate_open_attempted': False,
+        'candidate_open_verified': False,
         'candidate_opened': False,
         'error_code': None,
         'message': 'real capture once actions prepared',
@@ -2035,6 +2056,8 @@ def build_mac_safe_browse_real_action_fns(
                 x, y = get_mac_safe_browse_candidate_open_point(
                     confirm_fn=candidate_open_confirm_fn,
                     position_fn=candidate_open_position_fn,
+                    sleep_fn=candidate_open_sleep_fn,
+                    countdown_seconds=candidate_open_countdown_seconds,
                 )
                 focus_check = (
                     focus_chrome_window()
@@ -2070,8 +2093,13 @@ def build_mac_safe_browse_real_action_fns(
             state['error_code'] = 'MAC_SAFE_BROWSE_CANDIDATE_OPEN_FAILED'
             state['message'] = 'candidate_open 执行失败'
             return False
-        state['candidate_opened'] = True
-        state['message'] = 'candidate_open 已成功执行一次；未进入浏览循环'
+        state['candidate_open_attempted'] = True
+        state['candidate_open_verified'] = False
+        state['candidate_opened'] = False
+        state['message'] = (
+            'candidate_open 点击已尝试一次；页面是否真正打开尚未验证，'
+            '未进入浏览循环'
+        )
         return True
 
     def build_result():
@@ -2079,6 +2107,8 @@ def build_mac_safe_browse_real_action_fns(
             focus_restored=state['focus_restored'],
             capture_completed=state['capture_completed'],
             capture_size=state['capture_size'],
+            candidate_open_attempted=state['candidate_open_attempted'],
+            candidate_open_verified=state['candidate_open_verified'],
             candidate_opened=state['candidate_opened'],
             browse_loop_enabled=False,
             message=state['message'],
@@ -3775,6 +3805,8 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     candidate_focus_fn=None,
     candidate_open_confirm_fn=input,
     candidate_open_position_fn=pyautogui.position,
+    candidate_open_sleep_fn=time.sleep,
+    candidate_open_countdown_seconds=5,
 ) -> int:
     """Run same-process calibration, then the bounded browse-only trial plan."""
     try:
@@ -3841,6 +3873,8 @@ def run_mac_safe_browse_calibrate_and_dry_run(
                 candidate_focus_fn=candidate_focus_fn,
                 candidate_open_confirm_fn=candidate_open_confirm_fn,
                 candidate_open_position_fn=candidate_open_position_fn,
+                candidate_open_sleep_fn=candidate_open_sleep_fn,
+                candidate_open_countdown_seconds=candidate_open_countdown_seconds,
                 open_candidate_once=open_candidate_enabled,
             )
         )
@@ -3858,6 +3892,9 @@ def run_mac_safe_browse_calibrate_and_dry_run(
             focus_restored=False,
             capture_completed=False,
             capture_size=None,
+            candidate_open_attempted=False,
+            candidate_open_verified=False,
+            candidate_opened=False,
             message='real actions 未启用；保持 noop dry pipeline',
         )
     )
@@ -3871,6 +3908,14 @@ def run_mac_safe_browse_calibrate_and_dry_run(
     print(f'  candidate_open_count: {dry_result.state.candidate_open}')
     print(f'  capture_completed: {real_capture_result.capture_completed}')
     print(f'  capture_size: {real_capture_result.capture_size}')
+    print(
+        f'  candidate_open_attempted: '
+        f'{real_capture_result.candidate_open_attempted}'
+    )
+    print(
+        f'  candidate_open_verified: '
+        f'{real_capture_result.candidate_open_verified}'
+    )
     print(f'  candidate_opened: {real_capture_result.candidate_opened}')
     print(f'  browse_loop_enabled: {real_capture_result.browse_loop_enabled}')
     if not dry_result.completed:

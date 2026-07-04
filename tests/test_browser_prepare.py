@@ -2905,15 +2905,37 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         point = simple_brush.get_mac_safe_browse_candidate_open_point(
             confirm_fn=Mock(return_value="YES"),
             position_fn=Mock(return_value=SimpleNamespace(x=123, y=456)),
+            sleep_fn=Mock(),
         )
 
         self.assertEqual(point, (123, 456))
+
+    def test_candidate_open_point_waits_before_reading_position(self):
+        order = []
+
+        def sleep_fn(seconds):
+            order.append(("sleep", seconds))
+
+        def position_fn():
+            order.append(("position", None))
+            return SimpleNamespace(x=123, y=456)
+
+        point = simple_brush.get_mac_safe_browse_candidate_open_point(
+            confirm_fn=Mock(return_value="YES"),
+            position_fn=position_fn,
+            sleep_fn=sleep_fn,
+            countdown_seconds=5,
+        )
+
+        self.assertEqual(point, (123, 456))
+        self.assertEqual(order, [("sleep", 5), ("position", None)])
 
     def test_candidate_open_point_position_failure_is_fail_closed(self):
         with self.assertRaises(simple_brush.MacSafeBrowseRuntimeError) as caught:
             simple_brush.get_mac_safe_browse_candidate_open_point(
                 confirm_fn=Mock(return_value="YES"),
                 position_fn=Mock(side_effect=RuntimeError("pos boom")),
+                sleep_fn=Mock(),
             )
         self.assertEqual(
             caught.exception.error_code,
@@ -3462,7 +3484,9 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         self.assertIn("capture_completed: True", rendered)
         self.assertIn("capture_size: (600, 400)", rendered)
         self.assertIn("candidate_open_count: 1", rendered)
-        self.assertIn("candidate_opened: True", rendered)
+        self.assertIn("candidate_open_attempted: True", rendered)
+        self.assertIn("candidate_open_verified: False", rendered)
+        self.assertIn("candidate_opened: False", rendered)
         self.assertIn("browse_loop_enabled: False", rendered)
         self.assertIn("forwarding_enabled: False", rendered)
         self.assertIn("MAC_SAFE_BROWSE_BROWSE_LOOP_NOT_IMPLEMENTED", rendered)
@@ -3520,6 +3544,7 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                 message="focus ok",
             )
         )
+        sleep_fn = Mock()
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(simple_brush.sys, "platform", "darwin"))
@@ -3579,6 +3604,8 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                 candidate_open_position_fn=Mock(
                     return_value=SimpleNamespace(x=321, y=654)
                 ),
+                candidate_open_sleep_fn=sleep_fn,
+                candidate_open_countdown_seconds=5,
             )
 
         rendered = "\n".join(
@@ -3589,8 +3616,11 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
         self.assertEqual(capture_instance.selected_region, region)
         self.assertIn("candidate_open_enabled: True", rendered)
         self.assertIn("candidate_open_count: 1", rendered)
-        self.assertIn("candidate_opened: True", rendered)
+        self.assertIn("candidate_open_attempted: True", rendered)
+        self.assertIn("candidate_open_verified: False", rendered)
+        self.assertIn("candidate_opened: False", rendered)
         self.assertIn("MAC_SAFE_BROWSE_BROWSE_LOOP_NOT_IMPLEMENTED", rendered)
+        sleep_fn.assert_called_once_with(5)
         candidate_focus_fn.assert_called_once_with()
         click_first_candidate.assert_called_once_with(321, 654)
         for name, mocked in blocked.items():
@@ -3626,6 +3656,8 @@ class MacSafeBrowseCalibrateAndDryRunTests(unittest.TestCase):
                 )()
             ),
             "candidate_open_position_fn": Mock(return_value=(50, 60)),
+            "candidate_open_sleep_fn": Mock(),
+            "candidate_open_countdown_seconds": 5,
         }
         base_kwargs["real_capture_factory"].return_value.capture_image = self.capture_image(
             width=600,
