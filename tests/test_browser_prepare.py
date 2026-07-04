@@ -4686,8 +4686,217 @@ class MacForwardUiSmokeTests(unittest.TestCase):
         self.assertEqual(result, 2)
         smoke_run.assert_called_once()
         get_user_input.assert_not_called()
-        prepare_browser.assert_not_called()
-        listener_start.assert_not_called()
+
+
+class MacForwardActionTests(unittest.TestCase):
+    def build_config(self, **overrides):
+        values = {
+            "allow_invalid_submit": False,
+            "invalid_email_text": "invalid-test-address",
+            "countdown_seconds": 5,
+        }
+        values.update(overrides)
+        return simple_brush.build_mac_forward_action_config(**values)
+
+    def test_default_forward_action_does_not_submit_and_stops_after_close(self):
+        blocked_names = (
+            "initialize_ocr",
+            "forward_one_candidate",
+            "run_mac_forward_ui_smoke_only",
+            "run_mac_safe_browse_only",
+            "run_mac_safe_browse_calibration_only",
+            "run_mac_safe_browse_calibrate_and_dry_run",
+            "prepare_browser",
+            "OCRKeywordDetector",
+        )
+        click_fn = Mock()
+        typewrite_fn = Mock()
+        focus_fn = Mock(
+            return_value=simple_brush.MacOSChromeFocusResult(
+                platform="macos",
+                browser="chrome",
+                activated=True,
+                frontmost=True,
+                message="frontmost",
+            )
+        )
+        position_fn = Mock(
+            side_effect=[
+                SimpleNamespace(x=10, y=20),
+                SimpleNamespace(x=30, y=40),
+                SimpleNamespace(x=50, y=60),
+            ]
+        )
+        confirm_fn = Mock(side_effect=["YES", "YES", "YES", "YES"])
+        sleep_fn = Mock()
+
+        with ExitStack() as stack:
+            blocked = {
+                name: stack.enter_context(patch.object(simple_brush, name))
+                for name in blocked_names
+            }
+            blocked["listener.start"] = stack.enter_context(
+                patch.object(simple_brush.listener, "start")
+            )
+            result = simple_brush.run_mac_forward_single_candidate_action(
+                self.build_config(),
+                focus_fn=focus_fn,
+                click_fn=click_fn,
+                typewrite_fn=typewrite_fn,
+                position_fn=position_fn,
+                confirm_fn=confirm_fn,
+                sleep_fn=sleep_fn,
+                now_fn=Mock(side_effect=[100.0, 101.0, 102.0, 103.0, 104.0]),
+            )
+
+        self.assertTrue(result.completed)
+        self.assertFalse(result.forwarding_enabled)
+        self.assertFalse(result.invalid_submit_enabled)
+        self.assertEqual(
+            tuple(result.statuses),
+            (
+                "open_forward_modal",
+                "focus_forward_email_field",
+                "type_forward_email",
+                "close_forward_modal",
+            ),
+        )
+        self.assertNotIn("submit_invalid_forward", result.statuses)
+        self.assertTrue(result.statuses["open_forward_modal"].attempted)
+        self.assertTrue(result.statuses["focus_forward_email_field"].attempted)
+        self.assertTrue(result.statuses["type_forward_email"].attempted)
+        self.assertTrue(result.statuses["close_forward_modal"].attempted)
+        self.assertEqual(result.state.open_forward_modal_count, 1)
+        self.assertEqual(result.state.focus_forward_email_field_count, 1)
+        self.assertEqual(result.state.type_forward_email_count, 1)
+        self.assertEqual(result.state.submit_invalid_forward_count, 0)
+        self.assertEqual(result.state.close_forward_modal_count, 1)
+        click_fn.assert_has_calls(
+            [
+                unittest.mock.call(10, 20),
+                unittest.mock.call(30, 40),
+                unittest.mock.call(50, 60),
+            ]
+        )
+        self.assertEqual(click_fn.call_count, 3)
+        typewrite_fn.assert_called_once_with("invalid-test-address", interval=0.03)
+        self.assertEqual(focus_fn.call_count, 4)
+        self.assertEqual(sleep_fn.call_count, 3)
+        for name, mocked in blocked.items():
+            with self.subTest(blocked_action=name):
+                mocked.assert_not_called()
+
+    def test_submit_requires_explicit_flag_and_full_phrase_and_closes_after_submit(self):
+        config = self.build_config(allow_invalid_submit=True)
+
+        success_click_fn = Mock()
+        success_focus_fn = Mock(return_value=True)
+        success_typewrite_fn = Mock()
+        success_result = simple_brush.run_mac_forward_single_candidate_action(
+            config,
+            focus_fn=success_focus_fn,
+            click_fn=success_click_fn,
+            typewrite_fn=success_typewrite_fn,
+            position_fn=Mock(
+                side_effect=[(10, 20), (30, 40), (50, 60), (70, 80)]
+            ),
+            confirm_fn=Mock(side_effect=["YES", "YES", "YES", "YES"]),
+            submit_confirm_fn=Mock(return_value="SEND INVALID TEST"),
+            sleep_fn=Mock(),
+            now_fn=Mock(side_effect=[100.0, 101.0, 102.0, 103.0, 104.0, 105.0]),
+        )
+
+        self.assertTrue(success_result.completed)
+        self.assertEqual(
+            tuple(success_result.statuses),
+            (
+                "open_forward_modal",
+                "focus_forward_email_field",
+                "type_forward_email",
+                "submit_invalid_forward",
+                "close_forward_modal",
+            ),
+        )
+        success_click_fn.assert_has_calls(
+            [
+                unittest.mock.call(10, 20),
+                unittest.mock.call(30, 40),
+                unittest.mock.call(50, 60),
+                unittest.mock.call(70, 80),
+            ]
+        )
+        self.assertEqual(success_click_fn.call_count, 4)
+        self.assertEqual(success_result.state.submit_invalid_forward_count, 1)
+        self.assertEqual(success_result.state.close_forward_modal_count, 1)
+
+        failed_click_fn = Mock()
+        failed_result = simple_brush.run_mac_forward_single_candidate_action(
+            config,
+            focus_fn=Mock(return_value=True),
+            click_fn=failed_click_fn,
+            typewrite_fn=Mock(),
+            position_fn=Mock(side_effect=[(10, 20), (30, 40), (50, 60)]),
+            confirm_fn=Mock(side_effect=["YES", "YES", "YES"]),
+            submit_confirm_fn=Mock(return_value="NOPE"),
+            sleep_fn=Mock(),
+            now_fn=Mock(side_effect=[100.0, 101.0, 102.0, 103.0, 104.0]),
+        )
+
+        self.assertFalse(failed_result.completed)
+        self.assertFalse(failed_result.statuses["submit_invalid_forward"].attempted)
+        self.assertEqual(
+            failed_result.statuses["submit_invalid_forward"].error_code,
+            "MAC_FORWARD_UI_SMOKE_CONFIRMATION_REQUIRED",
+        )
+        self.assertEqual(failed_result.state.submit_invalid_forward_count, 0)
+        self.assertEqual(failed_result.state.close_forward_modal_count, 0)
+        self.assertEqual(failed_click_fn.call_count, 2)
+
+    def test_forward_action_fails_closed_when_frontmost_or_point_unavailable(self):
+        base_config = self.build_config()
+
+        not_frontmost_result = simple_brush.run_mac_forward_single_candidate_action(
+            base_config,
+            focus_fn=Mock(
+                return_value=simple_brush.MacOSChromeFocusResult(
+                    platform="macos",
+                    browser="chrome",
+                    activated=True,
+                    frontmost=False,
+                    message="not frontmost",
+                )
+            ),
+            click_fn=Mock(),
+            typewrite_fn=Mock(),
+            position_fn=Mock(return_value=(10, 20)),
+            confirm_fn=Mock(side_effect=["YES"]),
+            sleep_fn=Mock(),
+            now_fn=Mock(side_effect=[100.0, 101.0]),
+        )
+        self.assertFalse(not_frontmost_result.completed)
+        self.assertEqual(
+            not_frontmost_result.statuses["open_forward_modal"].error_code,
+            "MAC_FORWARD_UI_SMOKE_CHROME_NOT_FRONTMOST",
+        )
+        self.assertEqual(not_frontmost_result.state.open_forward_modal_count, 0)
+
+        click_fn = Mock()
+        point_failure_result = simple_brush.run_mac_forward_single_candidate_action(
+            base_config,
+            focus_fn=Mock(return_value=True),
+            click_fn=click_fn,
+            typewrite_fn=Mock(),
+            position_fn=Mock(side_effect=RuntimeError("position failed")),
+            confirm_fn=Mock(side_effect=["YES"]),
+            sleep_fn=Mock(),
+            now_fn=Mock(side_effect=[100.0, 101.0]),
+        )
+        self.assertFalse(point_failure_result.completed)
+        self.assertEqual(
+            point_failure_result.statuses["open_forward_modal"].error_code,
+            "MAC_FORWARD_UI_SMOKE_POINT_UNAVAILABLE",
+        )
+        click_fn.assert_not_called()
 
 
 class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):

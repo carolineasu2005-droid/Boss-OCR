@@ -711,6 +711,40 @@ class MacForwardUiSmokeResult:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class MacForwardActionConfig:
+    """Reusable single-candidate macOS forward action configuration."""
+
+    allow_invalid_submit: bool
+    invalid_email_text: str
+    countdown_seconds: int
+    message: str
+
+
+@dataclass(frozen=True)
+class MacForwardActionState:
+    """Forward-only action counts without implying delivery success."""
+
+    open_forward_modal_count: int
+    focus_forward_email_field_count: int
+    type_forward_email_count: int
+    submit_invalid_forward_count: int
+    close_forward_modal_count: int
+
+
+@dataclass(frozen=True)
+class MacForwardActionResult:
+    """Result for a bounded single-candidate forward UI attempt."""
+
+    completed: bool
+    state: MacForwardActionState
+    statuses: dict[str, MacForwardUiSmokeActionStatus]
+    forwarding_enabled: bool
+    invalid_submit_enabled: bool
+    message: str
+    error_code: str | None = None
+
+
 MAC_SAFE_BROWSE_ACTIONS = (
     'candidate_open',
     'scroll',
@@ -1579,14 +1613,44 @@ def build_mac_forward_ui_smoke_config(
     return MacForwardUiSmokeConfig(
         enabled=True,
         no_forward_required=True,
-        allow_invalid_submit=(
-            args.get('allow_invalid_forward_submit_smoke') is True
-        ),
+        allow_invalid_submit=(args.get('allow_invalid_forward_submit_smoke') is True),
         invalid_email_text='invalid-test-address',
         countdown_seconds=5,
         message=(
             'macOS forward/filter UI smoke 已验证；仅允许手工确认驱动的 '
             '单次真实点击/输入，不允许业务循环或真实转发'
+        ),
+    )
+
+
+def build_mac_forward_action_config(
+    *,
+    allow_invalid_submit: bool = False,
+    invalid_email_text: str = 'invalid-test-address',
+    countdown_seconds: int = 5,
+) -> MacForwardActionConfig:
+    """Build a reusable bounded config for one candidate forward UI path."""
+    if not isinstance(allow_invalid_submit, bool):
+        raise TypeError('allow_invalid_submit 必须是 bool')
+    if (
+        not isinstance(invalid_email_text, str)
+        or not invalid_email_text.strip()
+    ):
+        raise TypeError('invalid_email_text 必须是非空字符串')
+    if (
+        not isinstance(countdown_seconds, int)
+        or isinstance(countdown_seconds, bool)
+        or countdown_seconds < 0
+    ):
+        raise TypeError('countdown_seconds 必须是非负整数')
+
+    return MacForwardActionConfig(
+        allow_invalid_submit=allow_invalid_submit,
+        invalid_email_text=invalid_email_text,
+        countdown_seconds=countdown_seconds,
+        message=(
+            'macOS 单次转发 UI action 已封装；仅允许无效测试邮箱与手工确认，'
+            '不代表真实发送或业务 ready'
         ),
     )
 
@@ -2203,6 +2267,32 @@ def build_mac_forward_ui_smoke_budget(
     )
 
 
+def build_mac_forward_action_budget(
+    config: MacForwardActionConfig,
+) -> MacSafeBrowseActionBudget:
+    """Build the forward-only budget with every action capped at one."""
+    if not isinstance(config, MacForwardActionConfig):
+        raise TypeError('config 必须是 MacForwardActionConfig')
+    return MacSafeBrowseActionBudget(
+        max_candidates=1,
+        max_runtime_seconds=15 * 60,
+        max_candidate_open=0,
+        max_scroll=0,
+        max_next_candidate=0,
+        max_refresh=0,
+        max_filter_click=0,
+        max_focus_restore=0,
+        max_ocr_capture=0,
+        max_forward=0,
+        max_filter_recent_unseen=0,
+        max_open_forward_modal=1,
+        max_focus_forward_email_field=1,
+        max_type_invalid_forward_email=1,
+        max_close_forward_modal=1,
+        max_submit_invalid_forward=1 if config.allow_invalid_submit else 0,
+    )
+
+
 def get_mac_forward_ui_smoke_point(
     *,
     action_label: str,
@@ -2308,6 +2398,42 @@ def build_mac_forward_ui_smoke_plan(
                 description='single invalid forward submit click',
             )
         )
+    return tuple(plan)
+
+
+def build_mac_forward_single_candidate_plan(
+    config: MacForwardActionConfig,
+) -> tuple[MacSafeBrowseDryRunStep, ...]:
+    """Build the forward-only action order for one candidate."""
+    if not isinstance(config, MacForwardActionConfig):
+        raise TypeError('config 必须是 MacForwardActionConfig')
+    plan = [
+        MacSafeBrowseDryRunStep(
+            action='open_forward_modal',
+            description='single click on the forward UI entry point',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='focus_forward_email_field',
+            description='single click on the forward email input field',
+        ),
+        MacSafeBrowseDryRunStep(
+            action='type_invalid_forward_email',
+            description='single invalid test email typing action',
+        ),
+    ]
+    if config.allow_invalid_submit:
+        plan.append(
+            MacSafeBrowseDryRunStep(
+                action='submit_invalid_forward',
+                description='single invalid forward submit click',
+            )
+        )
+    plan.append(
+        MacSafeBrowseDryRunStep(
+            action='close_forward_modal',
+            description='single click on a blank area to close the modal',
+        )
+    )
     return tuple(plan)
 
 
@@ -2530,6 +2656,98 @@ def run_mac_forward_ui_smoke_pipeline(
         forwarding_enabled=False,
         invalid_submit_enabled='submit_invalid_forward' in injected,
         message='manual UI smoke completed; real forwarding remains disabled',
+    )
+
+
+def _map_mac_forward_action_name(action: str) -> str:
+    """Map internal bounded smoke actions to forward-only public names."""
+    if action == 'type_invalid_forward_email':
+        return 'type_forward_email'
+    return action
+
+
+def _build_mac_forward_action_state(
+    state: MacSafeBrowseActionState,
+) -> MacForwardActionState:
+    """Project the shared executor state into the forward-only result shape."""
+    if not isinstance(state, MacSafeBrowseActionState):
+        raise TypeError('state 必须是 MacSafeBrowseActionState')
+    return MacForwardActionState(
+        open_forward_modal_count=state.open_forward_modal,
+        focus_forward_email_field_count=state.focus_forward_email_field,
+        type_forward_email_count=state.type_invalid_forward_email,
+        submit_invalid_forward_count=state.submit_invalid_forward,
+        close_forward_modal_count=state.close_forward_modal,
+    )
+
+
+def _project_mac_forward_action_statuses(
+    statuses: dict[str, MacForwardUiSmokeActionStatus],
+    plan: tuple[MacSafeBrowseDryRunStep, ...],
+) -> dict[str, MacForwardUiSmokeActionStatus]:
+    """Keep only forward-only plan statuses and expose stable 6B names."""
+    if not isinstance(statuses, dict):
+        raise TypeError('statuses 必须是 dict')
+    if not isinstance(plan, tuple):
+        raise TypeError('plan 必须是 tuple')
+    projected = {}
+    for step in plan:
+        projected[_map_mac_forward_action_name(step.action)] = statuses[step.action]
+    return projected
+
+
+def run_mac_forward_single_candidate_action(
+    config: MacForwardActionConfig,
+    *,
+    focus_fn=None,
+    click_fn=None,
+    typewrite_fn=None,
+    position_fn=pyautogui.position,
+    confirm_fn=input,
+    submit_confirm_fn=input,
+    sleep_fn=time.sleep,
+    now_fn=time.time,
+) -> MacForwardActionResult:
+    """Run one bounded candidate forward UI path without business looping."""
+    if not isinstance(config, MacForwardActionConfig):
+        raise TypeError('config 必须是 MacForwardActionConfig')
+    budget = build_mac_forward_action_budget(config)
+    plan = build_mac_forward_single_candidate_plan(config)
+    shared_config = MacForwardUiSmokeConfig(
+        enabled=True,
+        no_forward_required=True,
+        allow_invalid_submit=config.allow_invalid_submit,
+        invalid_email_text=config.invalid_email_text,
+        countdown_seconds=config.countdown_seconds,
+        message=config.message,
+    )
+    action_fns, statuses, apply_count = build_mac_forward_ui_smoke_action_fns(
+        shared_config,
+        focus_fn=focus_fn,
+        click_fn=click_fn,
+        typewrite_fn=typewrite_fn,
+        position_fn=position_fn,
+        confirm_fn=confirm_fn,
+        submit_confirm_fn=submit_confirm_fn,
+        sleep_fn=sleep_fn,
+    )
+    result = run_mac_forward_ui_smoke_pipeline(
+        budget,
+        plan,
+        started_at=now_fn(),
+        now_fn=now_fn,
+        action_fns=action_fns,
+        apply_count_fn=apply_count,
+        statuses=statuses,
+    )
+    return MacForwardActionResult(
+        completed=result.completed,
+        state=_build_mac_forward_action_state(result.state),
+        statuses=_project_mac_forward_action_statuses(result.statuses, plan),
+        forwarding_enabled=False,
+        invalid_submit_enabled=result.invalid_submit_enabled,
+        message=result.message,
+        error_code=result.error_code,
     )
 
 
