@@ -25,7 +25,7 @@ import math
 import logging
 import subprocess
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -446,6 +446,339 @@ class MacSafeBrowseOcrEvidence:
     display_fingerprint: str | None
     message: str
     error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseActionBudget:
+    """Hard limits for an injected safe-browse action shell."""
+
+    max_candidates: int
+    max_runtime_seconds: int
+    max_candidate_open: int
+    max_scroll: int
+    max_next_candidate: int
+    max_refresh: int
+    max_filter_click: int
+    max_focus_restore: int
+    max_ocr_capture: int
+    max_forward: int = 0
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseActionState:
+    """Immutable action counts and first hard-stop reason."""
+
+    started_at: float
+    candidate_open: int = 0
+    scroll: int = 0
+    next_candidate: int = 0
+    refresh: int = 0
+    filter_click: int = 0
+    focus_restore: int = 0
+    ocr_capture: int = 0
+    forward: int = 0
+    stopped: bool = False
+    stop_reason: str | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class MacSafeBrowseActionResult:
+    """Authorization or injected-execution result for one action."""
+
+    allowed: bool
+    state: MacSafeBrowseActionState
+    message: str
+    error_code: str | None = None
+
+
+MAC_SAFE_BROWSE_ACTIONS = (
+    'candidate_open',
+    'scroll',
+    'next_candidate',
+    'refresh',
+    'filter_click',
+    'focus_restore',
+    'ocr_capture',
+    'forward',
+)
+
+
+def build_default_mac_safe_browse_action_budget(
+    config: MacSafeBrowseConfig,
+) -> MacSafeBrowseActionBudget:
+    """Build the non-configurable 5E action budget from validated CLI limits."""
+    if not isinstance(config, MacSafeBrowseConfig):
+        raise TypeError('config 必须是 MacSafeBrowseConfig')
+    valid_candidates = (
+        isinstance(config.max_candidates, int)
+        and not isinstance(config.max_candidates, bool)
+        and 1 <= config.max_candidates <= 5
+    )
+    valid_runtime = (
+        isinstance(config.max_runtime_minutes, int)
+        and not isinstance(config.max_runtime_minutes, bool)
+        and 1 <= config.max_runtime_minutes <= 15
+    )
+    if not valid_candidates or not valid_runtime:
+        raise MacSafeBrowseArgumentError(
+            'MAC_SAFE_BROWSE_LIMIT_INVALID',
+            '无法从无效 safe browse limit 构造动作预算',
+        )
+    return MacSafeBrowseActionBudget(
+        max_candidates=config.max_candidates,
+        max_runtime_seconds=config.max_runtime_minutes * 60,
+        max_candidate_open=min(config.max_candidates, 1),
+        max_scroll=0,
+        max_next_candidate=0,
+        max_refresh=0,
+        max_filter_click=0,
+        max_focus_restore=1,
+        max_ocr_capture=1,
+        max_forward=0,
+    )
+
+
+def stop_mac_safe_browse(
+    state: MacSafeBrowseActionState,
+    reason: str,
+    error_code: str,
+) -> MacSafeBrowseActionState:
+    """Return a stopped copy while preserving the first stop reason."""
+    if not isinstance(state, MacSafeBrowseActionState):
+        raise TypeError('state 必须是 MacSafeBrowseActionState')
+    if state.stopped:
+        return state
+    return replace(
+        state,
+        stopped=True,
+        stop_reason=reason,
+        error_code=error_code,
+    )
+
+
+def can_perform_mac_safe_browse_action(
+    budget: MacSafeBrowseActionBudget,
+    state: MacSafeBrowseActionState,
+    action: str,
+    *,
+    now: float,
+) -> MacSafeBrowseActionResult:
+    """Authorize one action without incrementing its count or doing I/O."""
+    if not isinstance(budget, MacSafeBrowseActionBudget):
+        raise TypeError('budget 必须是 MacSafeBrowseActionBudget')
+    if not isinstance(state, MacSafeBrowseActionState):
+        raise TypeError('state 必须是 MacSafeBrowseActionState')
+
+    if state.stopped:
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=state,
+            message=f'safe browse 已停止: {state.stop_reason or "unknown"}',
+            error_code='MAC_SAFE_BROWSE_ALREADY_STOPPED',
+        )
+
+    if (
+        not isinstance(now, (int, float))
+        or isinstance(now, bool)
+        or not math.isfinite(now)
+        or not math.isfinite(state.started_at)
+        or now < state.started_at
+    ):
+        stopped = stop_mac_safe_browse(
+            state,
+            '运行时钟无效',
+            'MAC_SAFE_BROWSE_ACTION_FAILED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    if now - state.started_at >= budget.max_runtime_seconds:
+        stopped = stop_mac_safe_browse(
+            state,
+            'safe browse 已达到运行时限',
+            'MAC_SAFE_BROWSE_RUNTIME_LIMIT_REACHED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    if action not in MAC_SAFE_BROWSE_ACTIONS:
+        stopped = stop_mac_safe_browse(
+            state,
+            f'未知 safe browse action: {action}',
+            'MAC_SAFE_BROWSE_ACTION_UNKNOWN',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    if action == 'forward':
+        stopped = stop_mac_safe_browse(
+            state,
+            'safe browse 永久禁止 forwarding action',
+            'MAC_SAFE_BROWSE_FORWARDING_BLOCKED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    if (
+        action == 'candidate_open'
+        and state.candidate_open >= budget.max_candidates
+    ):
+        stopped = stop_mac_safe_browse(
+            state,
+            '候选人数达到 safe browse 上限',
+            'MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    action_limit = getattr(budget, f'max_{action}')
+    action_count = getattr(state, action)
+    if action_count >= action_limit:
+        stopped = stop_mac_safe_browse(
+            state,
+            f'{action} 达到动作预算上限 {action_limit}',
+            'MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    return MacSafeBrowseActionResult(
+        allowed=True,
+        state=state,
+        message=f'{action} 已预留预算，尚未提交计数',
+    )
+
+
+def reserve_mac_safe_browse_action(
+    budget: MacSafeBrowseActionBudget,
+    state: MacSafeBrowseActionState,
+    action: str,
+    *,
+    now: float,
+) -> MacSafeBrowseActionResult:
+    """Reserve authorization without changing the immutable count state."""
+    return can_perform_mac_safe_browse_action(
+        budget,
+        state,
+        action,
+        now=now,
+    )
+
+
+def commit_mac_safe_browse_action_success(
+    state: MacSafeBrowseActionState,
+    action: str,
+) -> MacSafeBrowseActionState:
+    """Increment one known, non-forward action after injected success."""
+    if not isinstance(state, MacSafeBrowseActionState):
+        raise TypeError('state 必须是 MacSafeBrowseActionState')
+    if state.stopped:
+        return state
+    if action not in MAC_SAFE_BROWSE_ACTIONS:
+        return stop_mac_safe_browse(
+            state,
+            f'无法提交未知 action: {action}',
+            'MAC_SAFE_BROWSE_ACTION_UNKNOWN',
+        )
+    if action == 'forward':
+        return stop_mac_safe_browse(
+            state,
+            'safe browse 永久禁止提交 forwarding action',
+            'MAC_SAFE_BROWSE_FORWARDING_BLOCKED',
+        )
+    return replace(state, **{action: getattr(state, action) + 1})
+
+
+def execute_mac_safe_browse_action(
+    budget: MacSafeBrowseActionBudget,
+    state: MacSafeBrowseActionState,
+    action: str,
+    action_fn,
+    *,
+    now: float,
+) -> MacSafeBrowseActionResult:
+    """Run one injected callable once; never binds to a real input function."""
+    reservation = reserve_mac_safe_browse_action(
+        budget,
+        state,
+        action,
+        now=now,
+    )
+    if not reservation.allowed:
+        return reservation
+
+    if not callable(action_fn):
+        stopped = stop_mac_safe_browse(
+            state,
+            f'{action} action_fn 不可调用',
+            'MAC_SAFE_BROWSE_ACTION_FAILED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    try:
+        succeeded = bool(action_fn())
+    except Exception as exc:
+        stopped = stop_mac_safe_browse(
+            state,
+            f'{action} 执行异常: {exc}',
+            'MAC_SAFE_BROWSE_ACTION_FAILED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    if not succeeded:
+        stopped = stop_mac_safe_browse(
+            state,
+            f'{action} 执行失败',
+            'MAC_SAFE_BROWSE_ACTION_FAILED',
+        )
+        return MacSafeBrowseActionResult(
+            allowed=False,
+            state=stopped,
+            message=stopped.stop_reason,
+            error_code=stopped.error_code,
+        )
+
+    committed = commit_mac_safe_browse_action_success(state, action)
+    return MacSafeBrowseActionResult(
+        allowed=True,
+        state=committed,
+        message=f'{action} 执行成功并提交计数',
+    )
 
 
 def collect_mac_safe_browse_ocr_evidence(
@@ -2378,10 +2711,21 @@ def run_mac_safe_browse_only(cli_args) -> int:
         print(f'  message: {ocr_evidence.message}')
         return 2
 
+    action_budget = build_default_mac_safe_browse_action_budget(config)
+    print('  action_budget_ready: True')
+    print(f'  max_runtime_seconds: {action_budget.max_runtime_seconds}')
+    print(f'  max_candidate_open: {action_budget.max_candidate_open}')
+    print(f'  max_scroll: {action_budget.max_scroll}')
+    print(f'  max_next_candidate: {action_budget.max_next_candidate}')
+    print(f'  max_refresh: {action_budget.max_refresh}')
+    print(f'  max_filter_click: {action_budget.max_filter_click}')
+    print(f'  max_focus_restore: {action_budget.max_focus_restore}')
+    print(f'  max_ocr_capture: {action_budget.max_ocr_capture}')
+    print(f'  max_forward: {action_budget.max_forward}')
     print('  error_code: MAC_SAFE_BROWSE_NOT_IMPLEMENTED')
     print(
-        '  message: OCR coordinate evidence is ready for the next implementation '
-        'step; page, Chrome, Listener, and browsing are not implemented in 5D'
+        '  message: OCR evidence and action budget are ready for the next '
+        'implementation step; no action is executed in 5E'
     )
     return 2
 

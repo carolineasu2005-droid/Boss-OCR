@@ -2824,7 +2824,13 @@ class MacSafeBrowseCLITests(unittest.TestCase):
             "save_region_preview",
             "MSSScreenCapture",
             "OCRKeywordDetector",
+            "human_click",
+            "click_in_region",
+            "human_scroll_once",
+            "next_candidate",
+            "refresh_page",
             "forward_one_candidate",
+            "execute_mac_safe_browse_action",
         )
         pyautogui_names = (
             "position",
@@ -3089,6 +3095,10 @@ class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
             ),
             patch.object(simple_brush, "prepare_browser") as prepare_browser,
             patch.object(simple_brush, "forward_one_candidate") as forward,
+            patch.object(
+                simple_brush,
+                "execute_mac_safe_browse_action",
+            ) as execute_action,
             patch.object(simple_brush.listener, "start") as listener_start,
             patch("builtins.print") as print_output,
         ):
@@ -3100,11 +3110,223 @@ class MacSafeBrowseOcrEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(result, 2)
         self.assertIn("NO FORWARDING ENABLED", rendered)
+        self.assertIn("action_budget_ready: True", rendered)
         self.assertIn("MAC_SAFE_BROWSE_NOT_IMPLEMENTED", rendered)
         self.assertIn("ready for the next implementation step", rendered)
         prepare_browser.assert_not_called()
         forward.assert_not_called()
+        execute_action.assert_not_called()
         listener_start.assert_not_called()
+
+
+class MacSafeBrowseActionBudgetTests(unittest.TestCase):
+    def make_config(self, **overrides):
+        values = {
+            "enabled": True,
+            "no_forward_required": True,
+            "max_candidates": 5,
+            "max_runtime_minutes": 15,
+            "require_page_allowed": True,
+            "require_coordinate_validated": True,
+            "require_manual_confirmation": True,
+        }
+        values.update(overrides)
+        return simple_brush.MacSafeBrowseConfig(**values)
+
+    def make_budget(self):
+        return simple_brush.build_default_mac_safe_browse_action_budget(
+            self.make_config()
+        )
+
+    def make_state(self, **overrides):
+        values = {"started_at": 100.0}
+        values.update(overrides)
+        return simple_brush.MacSafeBrowseActionState(**values)
+
+    def test_default_budget_is_conservative_and_bounded_by_config(self):
+        budget = self.make_budget()
+
+        self.assertEqual(budget.max_candidates, 5)
+        self.assertEqual(budget.max_runtime_seconds, 15 * 60)
+        self.assertEqual(budget.max_candidate_open, 1)
+        self.assertEqual(budget.max_scroll, 0)
+        self.assertEqual(budget.max_next_candidate, 0)
+        self.assertEqual(budget.max_refresh, 0)
+        self.assertEqual(budget.max_filter_click, 0)
+        self.assertEqual(budget.max_focus_restore, 1)
+        self.assertEqual(budget.max_ocr_capture, 1)
+        self.assertEqual(budget.max_forward, 0)
+
+    def test_candidate_open_cannot_exceed_initial_limit_of_one(self):
+        result = simple_brush.can_perform_mac_safe_browse_action(
+            self.make_budget(),
+            self.make_state(candidate_open=1),
+            "candidate_open",
+            now=101.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertTrue(result.state.stopped)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED",
+        )
+
+    def test_unknown_and_forward_actions_fail_closed(self):
+        cases = (
+            ("unknown", "MAC_SAFE_BROWSE_ACTION_UNKNOWN"),
+            ("forward", "MAC_SAFE_BROWSE_FORWARDING_BLOCKED"),
+        )
+        for action, error_code in cases:
+            with self.subTest(action=action):
+                result = simple_brush.can_perform_mac_safe_browse_action(
+                    self.make_budget(),
+                    self.make_state(),
+                    action,
+                    now=101.0,
+                )
+                self.assertFalse(result.allowed)
+                self.assertTrue(result.state.stopped)
+                self.assertEqual(result.error_code, error_code)
+
+    def test_already_stopped_state_rejects_every_action(self):
+        state = self.make_state(
+            stopped=True,
+            stop_reason="first failure",
+            error_code="FIRST_FAILURE",
+        )
+        result = simple_brush.can_perform_mac_safe_browse_action(
+            self.make_budget(),
+            state,
+            "ocr_capture",
+            now=101.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertIs(result.state, state)
+        self.assertEqual(result.error_code, "MAC_SAFE_BROWSE_ALREADY_STOPPED")
+        self.assertEqual(result.state.stop_reason, "first failure")
+
+    def test_runtime_limit_rejects_and_stops(self):
+        budget = simple_brush.build_default_mac_safe_browse_action_budget(
+            self.make_config(max_runtime_minutes=1)
+        )
+        result = simple_brush.can_perform_mac_safe_browse_action(
+            budget,
+            self.make_state(),
+            "ocr_capture",
+            now=160.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertTrue(result.state.stopped)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_RUNTIME_LIMIT_REACHED",
+        )
+
+    def test_zero_budget_action_rejects_and_stops(self):
+        result = simple_brush.reserve_mac_safe_browse_action(
+            self.make_budget(),
+            self.make_state(),
+            "scroll",
+            now=101.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertTrue(result.state.stopped)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED",
+        )
+
+    def test_reserve_success_does_not_increment_count(self):
+        state = self.make_state()
+        result = simple_brush.reserve_mac_safe_browse_action(
+            self.make_budget(),
+            state,
+            "ocr_capture",
+            now=101.0,
+        )
+
+        self.assertTrue(result.allowed)
+        self.assertIs(result.state, state)
+        self.assertEqual(result.state.ocr_capture, 0)
+
+    def test_commit_success_increments_only_requested_count(self):
+        state = self.make_state()
+        committed = simple_brush.commit_mac_safe_browse_action_success(
+            state,
+            "focus_restore",
+        )
+
+        self.assertEqual(state.focus_restore, 0)
+        self.assertEqual(committed.focus_restore, 1)
+        self.assertEqual(committed.ocr_capture, 0)
+        self.assertFalse(committed.stopped)
+
+    def test_executor_success_commits_once(self):
+        action_fn = Mock(return_value=True)
+        result = simple_brush.execute_mac_safe_browse_action(
+            self.make_budget(),
+            self.make_state(),
+            "ocr_capture",
+            action_fn,
+            now=101.0,
+        )
+
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.state.ocr_capture, 1)
+        action_fn.assert_called_once_with()
+
+    def test_executor_false_result_stops_without_retry(self):
+        action_fn = Mock(return_value=False)
+        result = simple_brush.execute_mac_safe_browse_action(
+            self.make_budget(),
+            self.make_state(),
+            "ocr_capture",
+            action_fn,
+            now=101.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertTrue(result.state.stopped)
+        self.assertEqual(result.state.ocr_capture, 0)
+        self.assertEqual(result.error_code, "MAC_SAFE_BROWSE_ACTION_FAILED")
+        action_fn.assert_called_once_with()
+
+    def test_executor_exception_stops_without_retry(self):
+        action_fn = Mock(side_effect=RuntimeError("injected failure"))
+        result = simple_brush.execute_mac_safe_browse_action(
+            self.make_budget(),
+            self.make_state(),
+            "focus_restore",
+            action_fn,
+            now=101.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertTrue(result.state.stopped)
+        self.assertEqual(result.state.focus_restore, 0)
+        self.assertEqual(result.error_code, "MAC_SAFE_BROWSE_ACTION_FAILED")
+        action_fn.assert_called_once_with()
+
+    def test_executor_budget_rejection_never_calls_action(self):
+        action_fn = Mock(return_value=True)
+        result = simple_brush.execute_mac_safe_browse_action(
+            self.make_budget(),
+            self.make_state(),
+            "refresh",
+            action_fn,
+            now=101.0,
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertEqual(
+            result.error_code,
+            "MAC_SAFE_BROWSE_ACTION_LIMIT_REACHED",
+        )
+        action_fn.assert_not_called()
 
 
 if __name__ == "__main__":
