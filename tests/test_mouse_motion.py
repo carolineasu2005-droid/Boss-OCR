@@ -1,7 +1,10 @@
+import importlib.util
 import math
+import sys
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
+import mouse_motion
 import simple_brush
 
 
@@ -12,10 +15,17 @@ def midpoint(low, high):
 class HumanMouseMotionTests(unittest.TestCase):
     def setUp(self):
         self.saved_simple_mouse_enabled = simple_brush.simple_mouse_enabled
+        self.saved_unavailable_warning = (
+            simple_brush._windmouse_unavailable_warning_logged
+        )
         simple_brush.simple_mouse_enabled = False
+        simple_brush._windmouse_unavailable_warning_logged = False
 
     def tearDown(self):
         simple_brush.simple_mouse_enabled = self.saved_simple_mouse_enabled
+        simple_brush._windmouse_unavailable_warning_logged = (
+            self.saved_unavailable_warning
+        )
 
     def move_patches(self, *, start=(0, 0), uniform=midpoint):
         return (
@@ -37,7 +47,7 @@ class HumanMouseMotionTests(unittest.TestCase):
             uniform_patch,
             choice_patch,
         ):
-            simple_brush.human_move_to(410.4, 220.6)
+            simple_brush.move_to_bezier_fallback(410.4, 220.6)
 
         position.assert_called_once_with()
         self.assertGreater(move.call_count, 2)
@@ -58,7 +68,7 @@ class HumanMouseMotionTests(unittest.TestCase):
             uniform_patch,
             choice_patch,
         ):
-            simple_brush.human_move_to(600, 0)
+            simple_brush.move_to_bezier_fallback(600, 0)
 
         points = [(0, 0)] + [entry.args[:2] for entry in move.call_args_list]
         distances = [
@@ -83,7 +93,7 @@ class HumanMouseMotionTests(unittest.TestCase):
             uniform_patch,
             choice_patch,
         ):
-            simple_brush.human_move_to(500, 300)
+            simple_brush.move_to_bezier_fallback(500, 300)
 
         self.assertEqual(move.call_args_list[-1], call(500, 300, duration=0))
         self.assertGreater(len(set(entry.args[:2] for entry in move.call_args_list)), 2)
@@ -99,7 +109,7 @@ class HumanMouseMotionTests(unittest.TestCase):
             uniform_patch as uniform,
             choice_patch as choice,
         ):
-            simple_brush.human_move_to(25, 30)
+            simple_brush.move_to_bezier_fallback(25, 30)
 
         move.assert_called_once_with(25, 30, duration=0)
         sleep.assert_not_called()
@@ -117,7 +127,7 @@ class HumanMouseMotionTests(unittest.TestCase):
             uniform_patch as uniform,
             choice_patch as choice,
         ):
-            simple_brush.human_move_to(13, 14)
+            simple_brush.move_to_bezier_fallback(13, 14)
 
         self.assertEqual(move.call_args_list[-1], call(13, 14, duration=0))
         uniform.assert_not_called()
@@ -138,7 +148,7 @@ class HumanMouseMotionTests(unittest.TestCase):
                     patches[3],
                     patches[4],
                 ):
-                    simple_brush.human_move_to(*target)
+                    simple_brush.move_to_bezier_fallback(*target)
                 self.assertEqual(move.call_count, expected_steps)
 
     def test_move_exception_propagates_and_stops_the_path(self):
@@ -154,10 +164,218 @@ class HumanMouseMotionTests(unittest.TestCase):
             patch.object(simple_brush.random, "choice", return_value=1.0),
         ):
             with self.assertRaisesRegex(RuntimeError, "move failed"):
-                simple_brush.human_move_to(200, 100)
+                simple_brush.move_to_bezier_fallback(200, 100)
 
         move.assert_called_once()
         sleep.assert_not_called()
+
+    def test_default_mode_uses_windmouse_branch(self):
+        with (
+            patch.object(simple_brush, "windmouse_available", return_value=True),
+            patch.object(simple_brush, "move_to_observable") as windmouse_move,
+            patch.object(simple_brush, "move_to_bezier_fallback") as fallback,
+        ):
+            simple_brush.human_move_to(20.2, 30.8)
+
+        windmouse_move.assert_called_once_with(20, 31)
+        fallback.assert_not_called()
+
+    def test_missing_windmouse_logs_once_and_uses_bezier_fallback(self):
+        with (
+            patch.object(simple_brush, "windmouse_available", return_value=False),
+            patch.object(
+                simple_brush,
+                "windmouse_unavailable_reason",
+                return_value="ImportError: missing",
+            ),
+            patch.object(simple_brush, "move_to_bezier_fallback") as fallback,
+            patch.object(simple_brush.logger, "warning") as warning,
+        ):
+            simple_brush.human_move_to(10, 11)
+            simple_brush.human_move_to(12, 13)
+
+        self.assertEqual(
+            fallback.call_args_list,
+            [call(10, 11), call(12, 13)],
+        )
+        warning.assert_called_once()
+        self.assertIn("ImportError: missing", warning.call_args.args[1])
+
+    def test_mouse_motion_module_loads_when_windmouse_is_missing(self):
+        spec = importlib.util.spec_from_file_location(
+            "mouse_motion_without_windmouse",
+            mouse_motion.__file__,
+        )
+        isolated_module = importlib.util.module_from_spec(spec)
+        with patch.dict(
+            sys.modules,
+            {
+                "windmouse": None,
+                "windmouse.pyautogui_controller": None,
+            },
+        ):
+            spec.loader.exec_module(isolated_module)
+
+        self.assertFalse(isolated_module.windmouse_available())
+        with self.assertRaises(isolated_module.WindMouseUnavailableError):
+            isolated_module.move_to_observable(10, 20)
+
+    def test_windmouse_exception_logs_warning_and_uses_bezier_fallback(self):
+        with (
+            patch.object(simple_brush, "windmouse_available", return_value=True),
+            patch.object(
+                simple_brush,
+                "move_to_observable",
+                side_effect=RuntimeError("controller failed"),
+            ),
+            patch.object(simple_brush, "move_to_bezier_fallback") as fallback,
+            patch.object(simple_brush.logger, "warning") as warning,
+        ):
+            simple_brush.human_move_to(10.4, 20.6)
+
+        fallback.assert_called_once_with(10, 21)
+        warning.assert_called_once()
+        self.assertIn("controller failed", warning.call_args.args[1].args[0])
+
+    def test_windmouse_short_distance_uses_one_stable_segment(self):
+        controller = MagicMock()
+        with (
+            patch.object(
+                mouse_motion,
+                "PyautoguiMouseController",
+                return_value=controller,
+            ) as controller_class,
+            patch.object(mouse_motion, "Coordinate", side_effect=lambda value: value),
+            patch.object(
+                mouse_motion.pyautogui,
+                "position",
+                return_value=(0, 0),
+            ) as position,
+            patch.object(mouse_motion.pyautogui, "moveTo") as final_move,
+        ):
+            mouse_motion.move_to_observable(299, 0)
+
+        position.assert_called_once_with()
+        controller_class.assert_called_once_with(
+            gravity_magnitude=10,
+            wind_magnitude=0,
+            max_step=16,
+            damped_distance=12,
+        )
+        self.assertEqual(controller.dest_position, (299, 0))
+        controller.move_to_target.assert_called_once_with(
+            tick_delay=0,
+            step_duration=0,
+        )
+        final_move.assert_called_once_with(299, 0, duration=0)
+
+    def assert_two_stage_approach(
+        self,
+        target_x,
+        expected_pre_target_x,
+        *,
+        region_width=None,
+        region_height=None,
+    ):
+        approach = MagicMock()
+        finish = MagicMock()
+        with (
+            patch.object(
+                mouse_motion,
+                "PyautoguiMouseController",
+                side_effect=[approach, finish],
+            ) as controller_class,
+            patch.object(mouse_motion, "Coordinate", side_effect=lambda value: value),
+            patch.object(mouse_motion.pyautogui, "position", return_value=(0, 0)),
+            patch.object(mouse_motion.pyautogui, "moveTo") as final_move,
+        ):
+            mouse_motion.move_to_observable(
+                target_x,
+                0,
+                region_width=region_width,
+                region_height=region_height,
+            )
+
+        self.assertEqual(
+            controller_class.call_args_list,
+            [
+                call(
+                    gravity_magnitude=20,
+                    wind_magnitude=3,
+                    max_step=45,
+                    damped_distance=24,
+                ),
+                call(
+                    gravity_magnitude=10,
+                    wind_magnitude=0,
+                    max_step=18,
+                    damped_distance=18,
+                ),
+            ],
+        )
+        self.assertEqual(approach.dest_position, (expected_pre_target_x, 0))
+        self.assertEqual(finish.dest_position, (target_x, 0))
+        approach.move_to_target.assert_called_once_with(
+            tick_delay=0,
+            step_duration=0,
+        )
+        finish.move_to_target.assert_called_once_with(
+            tick_delay=0,
+            step_duration=0,
+        )
+        final_move.assert_called_once_with(target_x, 0, duration=0)
+
+    def test_normal_far_distance_uses_60_to_120_pixel_approach(self):
+        for target_x, expected_pre_target_x in ((300, 240), (2000, 1880)):
+            with self.subTest(target_x=target_x):
+                self.assert_two_stage_approach(target_x, expected_pre_target_x)
+
+    def test_small_region_far_distance_uses_80_to_140_pixel_approach(self):
+        for target_x, expected_pre_target_x in ((300, 220), (2000, 1860)):
+            with self.subTest(target_x=target_x):
+                self.assert_two_stage_approach(
+                    target_x,
+                    expected_pre_target_x,
+                    region_width=80,
+                    region_height=100,
+                )
+
+    def assert_windmouse_segment_failure_falls_back(self, failing_segment):
+        approach = MagicMock()
+        finish = MagicMock()
+        failed_controller = approach if failing_segment == 1 else finish
+        failed_controller.move_to_target.side_effect = RuntimeError(
+            f"segment {failing_segment} failed"
+        )
+        with (
+            patch.object(simple_brush, "windmouse_available", return_value=True),
+            patch.object(
+                mouse_motion,
+                "PyautoguiMouseController",
+                side_effect=[approach, finish],
+            ) as controller_class,
+            patch.object(mouse_motion, "Coordinate", side_effect=lambda value: value),
+            patch.object(mouse_motion.pyautogui, "position", return_value=(0, 0)),
+            patch.object(mouse_motion.pyautogui, "moveTo") as final_move,
+            patch.object(simple_brush, "move_to_bezier_fallback") as fallback,
+            patch.object(simple_brush.logger, "warning") as warning,
+        ):
+            simple_brush.human_move_to(1000, 0)
+
+        self.assertEqual(controller_class.call_count, failing_segment)
+        fallback.assert_called_once_with(1000, 0)
+        final_move.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn(
+            f"segment {failing_segment} failed",
+            str(warning.call_args.args[1]),
+        )
+
+    def test_first_windmouse_segment_failure_uses_bezier_fallback(self):
+        self.assert_windmouse_segment_failure_falls_back(1)
+
+    def test_second_windmouse_segment_failure_uses_bezier_fallback(self):
+        self.assert_windmouse_segment_failure_falls_back(2)
 
     def test_simple_argument_keeps_single_legacy_move_available(self):
         with (
@@ -166,14 +384,22 @@ class HumanMouseMotionTests(unittest.TestCase):
             patch.object(simple_brush.time, "sleep") as sleep,
             patch.object(simple_brush.random, "uniform", return_value=0.25) as uniform,
             patch.object(simple_brush.random, "choice") as choice,
+            patch.object(simple_brush, "move_to_observable") as windmouse_move,
         ):
-            simple_brush.human_move_to(20.2, 30.8, simple=True)
+            simple_brush.human_move_to(
+                20.2,
+                30.8,
+                simple=True,
+                region_width=10,
+                region_height=10,
+            )
 
         move.assert_called_once_with(20, 31, duration=0.25)
         uniform.assert_called_once_with(0.15, 0.35)
         position.assert_not_called()
         sleep.assert_not_called()
         choice.assert_not_called()
+        windmouse_move.assert_not_called()
 
     def test_default_mode_reads_simple_mouse_runtime_state(self):
         simple_brush.simple_mouse_enabled = True
@@ -183,6 +409,7 @@ class HumanMouseMotionTests(unittest.TestCase):
             patch.object(simple_brush.time, "sleep") as sleep,
             patch.object(simple_brush.random, "uniform", return_value=0.20),
             patch.object(simple_brush.random, "choice") as choice,
+            patch.object(simple_brush, "move_to_observable") as windmouse_move,
         ):
             simple_brush.human_move_to(80, 90)
 
@@ -190,6 +417,7 @@ class HumanMouseMotionTests(unittest.TestCase):
         position.assert_not_called()
         sleep.assert_not_called()
         choice.assert_not_called()
+        windmouse_move.assert_not_called()
 
     def test_human_click_reuses_move_target_for_press_and_release(self):
         with (
@@ -216,12 +444,38 @@ class HumanMouseMotionTests(unittest.TestCase):
             patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
             patch.object(simple_brush.time, "sleep"),
         ):
-            simple_brush.human_click(12, 24, offset=0)
+            simple_brush.human_click(
+                12,
+                24,
+                offset=0,
+                region_width=30,
+                region_height=40,
+            )
 
         self.assertEqual(randint.call_args_list, [call(0, 0), call(0, 0)])
-        move.assert_called_once_with(12, 24)
+        move.assert_called_once_with(
+            12,
+            24,
+            region_width=30,
+            region_height=40,
+        )
         mouse_down.assert_called_once_with(12, 24)
         mouse_up.assert_called_once_with(12, 24)
+
+    def test_human_click_rounds_once_and_clicks_one_integer_target(self):
+        with (
+            patch.object(simple_brush.random, "randint", return_value=0),
+            patch.object(simple_brush.random, "uniform", return_value=0.05),
+            patch.object(simple_brush, "human_move_to") as move,
+            patch.object(simple_brush.pyautogui, "mouseDown") as mouse_down,
+            patch.object(simple_brush.pyautogui, "mouseUp") as mouse_up,
+            patch.object(simple_brush.time, "sleep"),
+        ):
+            simple_brush.human_click(12.4, 24.6, offset=0)
+
+        move.assert_called_once_with(12, 25)
+        mouse_down.assert_called_once_with(12, 25)
+        mouse_up.assert_called_once_with(12, 25)
 
     def test_human_click_does_not_press_when_movement_fails(self):
         with (
@@ -283,7 +537,13 @@ class HumanMouseMotionTests(unittest.TestCase):
             simple_brush.click_in_region(region)
 
         choose_point.assert_called_once_with(region)
-        click.assert_called_once_with(22, 35, offset=0)
+        click.assert_called_once_with(
+            22,
+            35,
+            offset=0,
+            region_width=30,
+            region_height=40,
+        )
         direct_click.assert_not_called()
 
     def test_batch_filter_region_path_reaches_human_click_in_order(self):
@@ -323,10 +583,10 @@ class HumanMouseMotionTests(unittest.TestCase):
         self.assertEqual(
             click.call_args_list,
             [
-                call(21, 21, offset=0),
-                call(31, 31, offset=0),
-                call(41, 41, offset=0),
-                call(11, 11, offset=0),
+                call(21, 21, offset=0, region_width=10, region_height=10),
+                call(31, 31, offset=0, region_width=10, region_height=10),
+                call(41, 41, offset=0, region_width=10, region_height=10),
+                call(11, 11, offset=0, region_width=10, region_height=10),
             ],
         )
         direct_click.assert_not_called()

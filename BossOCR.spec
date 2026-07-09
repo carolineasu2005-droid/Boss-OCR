@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 
 datas = []
 binaries = []
 hiddenimports = []
+
+# Keep the GPL license and package metadata in the Windows one-dir release.
+datas += copy_metadata("windmouse")
+
+# Only the PyAutoGUI backend is used. Do not collect the optional AHK backend.
+hiddenimports += [
+    "windmouse.core",
+    "windmouse.pyautogui_controller",
+]
 
 # RapidOCR ships ONNX models as package data. The remaining packages include
 # dynamic backends/plugins that need explicit collection in a frozen build.

@@ -17,6 +17,8 @@ logs/
 # Local project documentation
 *.md
 !README.md
+!Issue-Next-7-windmouse-observable-motion-acceptance-report.md
+!docs/TID-Windows-WindMouse-Observable-Motion.md
 !release-notes/
 !release-notes/*.md
 

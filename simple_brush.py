@@ -40,6 +40,11 @@ from ocr_calibration import (
 )
 from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
 from ocr_text import parse_keyword_rules
+from mouse_motion import (
+    move_to_observable,
+    windmouse_available,
+    windmouse_unavailable_reason,
+)
 
 # ─── 命令行参数解析 ───────────────────────────────
 def parse_args():
@@ -52,6 +57,7 @@ def parse_args():
         'no_batch_filter': False,
         'simple_mouse': False,
         'auto': False,
+        'action_mode': None,
     }
     i = 1
     while i < len(sys.argv):
@@ -78,6 +84,14 @@ def parse_args():
         elif sys.argv[i] == '--auto':
             args['auto'] = True  # 跳过所有交互
             i += 1
+        elif sys.argv[i] == '--action-mode':
+            if i + 1 >= len(sys.argv):
+                raise ValueError('--action-mode 缺少 favorite 或 forward')
+            mode = sys.argv[i + 1].strip().lower()
+            if mode not in (ACTION_MODE_FAVORITE, ACTION_MODE_FORWARD):
+                raise ValueError('--action-mode 只能是 favorite 或 forward')
+            args['action_mode'] = mode
+            i += 2
         else:
             i += 1
     return args
@@ -90,6 +104,9 @@ except Exception:
     pass  # PyInstaller 打包后可能无 buffer，静默忽略
 
 # ─── 配置 ───────────────────────────────────────────
+ACTION_MODE_FAVORITE = "favorite"
+ACTION_MODE_FORWARD = "forward"
+
 MIN_STAY_SECONDS = 12
 MAX_STAY_SECONDS = 18
 BATCH_SIZE = 100
@@ -230,6 +247,7 @@ stop_event = False
 paused = False
 run_duration_seconds = 0
 simple_mouse_enabled = False
+_windmouse_unavailable_warning_logged = False
 
 # 转发状态（全局）
 forward_keywords = []       # 启动时解析完成的关键词规则列表
@@ -237,6 +255,7 @@ backup_email = ""           # 备选邮箱
 forward_enabled = False     # 是否启用转发
 forward_consecutive = 0     # 连续转发计数
 no_forward_mode = False     # 只检测，不执行真实邮件转发
+action_mode = ACTION_MODE_FORWARD  # 候选人命中后的处理模式
 
 # 转发关键点击区域（仅在当前运行期间有效）
 forward_click_regions = DEFAULT_FORWARD_CLICK_REGIONS
@@ -256,6 +275,9 @@ focus_restore_region = DEFAULT_FOCUS_RESTORE_REGION
 focus_restore_calibration_requested = False
 focus_restore_calibration_attempted = False
 focus_restore_calibration_in_progress = False
+
+# 收藏按钮区域状态（仅在当前运行期间有效）
+favorite_button_region = None
 
 # OCR 状态（每次运行只初始化、校准一次）
 ocr_backend = None
@@ -304,6 +326,31 @@ def parse_duration_seconds(raw_value):
     return int(value)
 
 
+def parse_action_mode_choice(raw):
+    """Parse the interactive action-mode choice into an internal mode value."""
+    value = '' if raw is None else str(raw).strip()
+    if value == '1':
+        return ACTION_MODE_FAVORITE
+    if value == '2':
+        return ACTION_MODE_FORWARD
+    raise ValueError('请输入 1 或 2')
+
+
+def prompt_action_mode():
+    """Prompt until the user explicitly chooses favorite or forward mode."""
+    while True:
+        raw = input(
+            '请选择候选人处理模式：\n'
+            '1 = 收藏模式：点击收藏，不转发邮箱\n'
+            '2 = 转发模式：执行原邮箱转发流程\n'
+            '请输入 1 或 2：\n> '
+        )
+        try:
+            return parse_action_mode_choice(raw)
+        except ValueError:
+            print('  输入无效，请输入 1 或 2。')
+
+
 def keyword_rule_sources():
     """Return stable display strings for the configured keyword rules."""
     return [rule.source for rule in forward_keywords]
@@ -316,18 +363,21 @@ def get_user_input(
     auto=False,
     no_forward=False,
     no_batch_filter=False,
+    action_mode_value=None,
 ):
     """
     获取关键词、备选邮箱和本次运行时间。
     auto=True 或 keywords 已传入时跳过交互。
     """
     global forward_keywords, backup_email, forward_enabled, run_duration_seconds
+    global action_mode
     global focus_restore_calibration_requested
     global forward_click_calibration_requested
     global batch_filter_calibration_requested
 
     # ── 非交互模式（命令行传参或 --auto） ──
     if auto or keywords_str:
+        action_mode = action_mode_value or ACTION_MODE_FORWARD
         focus_restore_calibration_requested = False
         forward_click_calibration_requested = False
         batch_filter_calibration_requested = False
@@ -348,6 +398,7 @@ def get_user_input(
 
     # ── 交互模式 ──
     print()
+    action_mode = prompt_action_mode()
     while True:
         raw = input(
             '请输入触发转发的关键词规则（关键词用英文双引号包裹，'
@@ -367,13 +418,13 @@ def get_user_input(
             print(f'  关键词规则格式错误：{exc}')
             print('  格式示例："Python"; "短剧" and not "销售"')
 
-    if forward_enabled and not no_forward:
+    if forward_enabled and action_mode == ACTION_MODE_FORWARD and not no_forward:
         backup_email = input('\n请输入备选邮箱（最近联系中无邮箱时兜底）:\n> ').strip()
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
     else:
         backup_email = ""
 
-    if forward_enabled:
+    if forward_enabled and action_mode == ACTION_MODE_FORWARD:
         calibrate_forward = input(
             '\n是否校准完整邮件转发点击区域（包含焦点恢复区域）？[y/N]\n> '
         ).strip().lower()
@@ -514,21 +565,10 @@ def human_delay(min_s=FORWARD_MIN_DELAY, max_s=FORWARD_MAX_DELAY):
     return safe_wait(delay)
 
 
-def human_move_to(x, y, *, simple=None):
-    """Move the pointer to an exact target along one observable path."""
+def move_to_bezier_fallback(x, y):
+    """Move to an exact target with the pre-WindMouse Bezier implementation."""
     target_x = int(round(x))
     target_y = int(round(y))
-
-    if simple is None:
-        simple = simple_mouse_enabled
-    if simple:
-        pyautogui.moveTo(
-            target_x,
-            target_y,
-            duration=random.uniform(0.15, 0.35),
-        )
-        return
-
     start = pyautogui.position()
     start_x = float(start[0])
     start_y = float(start[1])
@@ -628,15 +668,81 @@ def human_move_to(x, y, *, simple=None):
     pyautogui.moveTo(target_x, target_y, duration=0)
 
 
-def human_click(x, y, offset=FORWARD_CLICK_OFFSET):
+def human_move_to(
+    x,
+    y,
+    *,
+    simple=None,
+    region_width=None,
+    region_height=None,
+):
+    """Move to an exact target using simple, WindMouse, or Bezier fallback."""
+    global _windmouse_unavailable_warning_logged
+
+    target_x = int(round(x))
+    target_y = int(round(y))
+    if simple is None:
+        simple = simple_mouse_enabled
+    if simple:
+        pyautogui.moveTo(
+            target_x,
+            target_y,
+            duration=random.uniform(0.15, 0.35),
+        )
+        return
+
+    if not windmouse_available():
+        if not _windmouse_unavailable_warning_logged:
+            logger.warning(
+                'WindMouse 不可用（%s），已回退到现有贝塞尔鼠标轨迹',
+                windmouse_unavailable_reason(),
+            )
+            _windmouse_unavailable_warning_logged = True
+        move_to_bezier_fallback(target_x, target_y)
+        return
+
+    try:
+        if region_width is None and region_height is None:
+            move_to_observable(target_x, target_y)
+        else:
+            move_to_observable(
+                target_x,
+                target_y,
+                region_width=region_width,
+                region_height=region_height,
+            )
+    except Exception as exc:
+        logger.warning(
+            'WindMouse 移动异常，已回退到现有贝塞尔鼠标轨迹：%s',
+            exc,
+        )
+        move_to_bezier_fallback(target_x, target_y)
+
+
+def human_click(
+    x,
+    y,
+    offset=FORWARD_CLICK_OFFSET,
+    *,
+    region_width=None,
+    region_height=None,
+):
     """
     带随机偏移的人类化点击。
     点击位置在目标坐标的 ±offset 范围内随机抖动。
     按下时长随机 50-150ms，模拟人类手指停留。
     """
-    tx = x + random.randint(-offset, offset)
-    ty = y + random.randint(-offset, offset)
-    human_move_to(tx, ty)
+    tx = int(round(x + random.randint(-offset, offset)))
+    ty = int(round(y + random.randint(-offset, offset)))
+    if region_width is None and region_height is None:
+        human_move_to(tx, ty)
+    else:
+        human_move_to(
+            tx,
+            ty,
+            region_width=region_width,
+            region_height=region_height,
+        )
     time.sleep(random.uniform(0.03, 0.08))
     pyautogui.mouseDown(tx, ty)
     time.sleep(random.uniform(0.05, 0.15))
@@ -653,10 +759,73 @@ def random_point_in_region(region):
     )
 
 
+def random_point_in_inner_region(region, ratio=0.6):
+    """Return one random point inside the centered portion of a screen region."""
+    if region.width <= 0 or region.height <= 0:
+        raise ValueError('点击区域尺寸必须为正数')
+    if ratio <= 0 or ratio > 1:
+        raise ValueError('内部区域比例必须大于 0 且不超过 1')
+
+    margin_ratio = (1 - ratio) / 2
+    inner_x_min = region.left + region.width * margin_ratio
+    inner_x_max = region.left + region.width * (1 - margin_ratio)
+    inner_y_min = region.top + region.height * margin_ratio
+    inner_y_max = region.top + region.height * (1 - margin_ratio)
+    return (
+        random.uniform(inner_x_min, inner_x_max),
+        random.uniform(inner_y_min, inner_y_max),
+    )
+
+
 def click_in_region(region):
     """Click one random point inside a region without adding a second offset."""
     x, y = random_point_in_region(region)
-    human_click(x, y, offset=0)
+    human_click(
+        x,
+        y,
+        offset=0,
+        region_width=region.width,
+        region_height=region.height,
+    )
+
+
+def perform_favorite_action():
+    """Click the calibrated favorite button once, or fail safely if missing."""
+    if favorite_button_region is None:
+        logger.warning('收藏按钮区域未校准，跳过收藏点击以避免盲点')
+        return False
+
+    x, y = random_point_in_inner_region(favorite_button_region)
+    human_click(
+        x,
+        y,
+        offset=0,
+        region_width=favorite_button_region.width,
+        region_height=favorite_button_region.height,
+    )
+    time.sleep(0.5)
+    restore_candidate_page_focus_after_favorite()
+    return True
+
+
+def restore_candidate_page_focus_after_favorite():
+    """Restore detail-page focus by clicking inside the calibrated OCR body region."""
+    if ocr_detector is None:
+        logger.warning('OCR 正文区域未就绪，跳过收藏后的详情页焦点恢复')
+        return False
+
+    region = ocr_detector.region
+    for _ in range(2):
+        x, y = random_point_in_inner_region(region)
+        human_click(
+            x,
+            y,
+            offset=0,
+            region_width=region.width,
+            region_height=region.height,
+        )
+        time.sleep(0.15)
+    return True
 
 
 def get_clipboard_text():
@@ -1040,6 +1209,38 @@ def ensure_focus_restore_region_calibrated():
 
     return focus_restore_region
 
+
+def ensure_favorite_button_region_calibrated():
+    """Calibrate the favorite button region for the current process only."""
+    global favorite_button_region
+
+    if favorite_button_region is not None:
+        return favorite_button_region
+
+    try:
+        favorite_button_region = select_screen_region(
+            min_size=12,
+            instruction='框选“收藏”按钮内部安全区域 · Esc 取消收藏区域校准',
+            subtitle='调用校准模板前，请确保 Boss 页面窗口位置、大小、缩放状态与校准时基本一致',
+        )
+        logger.info(
+            '✅ 收藏按钮区域校准完成: left=%s top=%s width=%s height=%s',
+            favorite_button_region.left,
+            favorite_button_region.top,
+            favorite_button_region.width,
+            favorite_button_region.height,
+        )
+        return favorite_button_region
+    except CalibrationCancelled:
+        favorite_button_region = None
+        logger.warning('收藏按钮区域校准已取消，本次不会盲点收藏按钮')
+        return None
+    except Exception as exc:
+        favorite_button_region = None
+        logger.exception(f'收藏按钮区域校准失败，本次不会盲点收藏按钮: {exc}')
+        return None
+
+
 def detect_keywords():
     """
     截取已校准的屏幕区域并执行最多 8 屏 OCR 精确匹配。
@@ -1181,7 +1382,13 @@ def forward_one_candidate():
         for attempt in range(1, 3):
             try:
                 focus_x, focus_y = random_point_in_region(focus_restore_region)
-                human_click(focus_x, focus_y, offset=0)
+                human_click(
+                    focus_x,
+                    focus_y,
+                    offset=0,
+                    region_width=focus_restore_region.width,
+                    region_height=focus_restore_region.height,
+                )
                 human_delay(0.3, 0.5)
             except Exception as exc:
                 logger.error(f'❌ 转发流程第 {attempt} 次焦点恢复点击失败: {exc}')
@@ -1287,10 +1494,16 @@ def view_candidate(index_in_batch):
         if stop_event:
             return False
 
-        if keyword_hit and no_forward_mode:
-            logger.info('🛡 --no-forward 已启用：保留 OCR 命中记录，禁止真实邮件转发')
-        elif keyword_hit:
-            forward_one_candidate()
+        if keyword_hit:
+            if action_mode == ACTION_MODE_FAVORITE:
+                perform_favorite_action()
+            elif action_mode == ACTION_MODE_FORWARD:
+                if no_forward_mode:
+                    logger.info('🛡 --no-forward 已启用：保留 OCR 命中记录，禁止真实邮件转发')
+                else:
+                    forward_one_candidate()
+            else:
+                raise ValueError(f'未知候选人处理模式: {action_mode}')
         else:
             # 未命中关键词，重置连续转发计数
             forward_consecutive = 0
@@ -1343,9 +1556,10 @@ def refresh_page():
 # ─── 主循环 ─────────────────────────────────────────
 
 def run():
-    global stop_event, forward_consecutive, no_forward_mode, simple_mouse_enabled
+    global stop_event, forward_consecutive, no_forward_mode, simple_mouse_enabled, action_mode
     stop_event = False
     simple_mouse_enabled = False
+    action_mode = ACTION_MODE_FORWARD
     reset_focus_restore_calibration()
     reset_forward_click_calibration()
     reset_batch_filter_calibration()
@@ -1362,6 +1576,7 @@ def run():
             auto=cli_args['auto'],
             no_forward=no_forward_mode,
             no_batch_filter=cli_args.get('no_batch_filter', False),
+            action_mode_value=cli_args.get('action_mode'),
         )
     except ValueError as exc:
         print(f'[错误] {exc}')
@@ -1422,6 +1637,9 @@ def run():
             ensure_focus_restore_region_calibrated()
         if forward_click_calibration_requested:
             ensure_forward_click_regions_calibrated()
+        if action_mode == ACTION_MODE_FAVORITE:
+            if ensure_favorite_button_region_calibrated() is None:
+                return 0
         if forward_enabled and forward_keywords:
             ensure_ocr_region_calibrated()
 

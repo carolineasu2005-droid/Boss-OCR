@@ -15,6 +15,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "forward_consecutive",
                 "backup_email",
                 "no_forward_mode",
+                "action_mode",
                 "forward_click_regions",
                 "forward_click_calibration_requested",
                 "forward_click_calibration_attempted",
@@ -28,6 +29,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "focus_restore_calibration_requested",
                 "focus_restore_calibration_attempted",
                 "focus_restore_calibration_in_progress",
+                "favorite_button_region",
                 "ocr_backend",
                 "ocr_capture",
                 "ocr_detector",
@@ -45,9 +47,11 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.forward_consecutive = 0
         simple_brush.backup_email = ""
         simple_brush.no_forward_mode = False
+        simple_brush.action_mode = simple_brush.ACTION_MODE_FORWARD
         simple_brush.reset_forward_click_calibration()
         simple_brush.reset_batch_filter_calibration()
         simple_brush.reset_focus_restore_calibration()
+        simple_brush.favorite_button_region = None
         simple_brush.stop_event = False
         simple_brush.paused = False
         simple_brush.run_duration_seconds = 0
@@ -92,25 +96,72 @@ class SimpleBrushOCRTests(unittest.TestCase):
 
     def test_no_forward_mode_never_calls_real_forward(self):
         simple_brush.no_forward_mode = True
+        simple_brush.action_mode = simple_brush.ACTION_MODE_FORWARD
         with (
             patch.object(simple_brush, "detect_keywords", return_value=True),
             patch.object(simple_brush, "forward_one_candidate") as forward,
+            patch.object(simple_brush, "perform_favorite_action") as favorite,
             patch.object(simple_brush.random, "uniform", return_value=0.0),
         ):
             self.assertTrue(simple_brush.view_candidate(0))
         forward.assert_not_called()
+        favorite.assert_not_called()
+
+    def test_forward_mode_keyword_hit_calls_forward_action(self):
+        simple_brush.action_mode = simple_brush.ACTION_MODE_FORWARD
+        with (
+            patch.object(simple_brush, "detect_keywords", return_value=True),
+            patch.object(simple_brush, "forward_one_candidate") as forward,
+            patch.object(simple_brush, "perform_favorite_action") as favorite,
+            patch.object(simple_brush.random, "uniform", return_value=0.0),
+        ):
+            self.assertTrue(simple_brush.view_candidate(0))
+        forward.assert_called_once_with()
+        favorite.assert_not_called()
+
+    def test_favorite_mode_keyword_hit_calls_favorite_action_only(self):
+        simple_brush.action_mode = simple_brush.ACTION_MODE_FAVORITE
+        simple_brush.no_forward_mode = True
+        with (
+            patch.object(simple_brush, "detect_keywords", return_value=True),
+            patch.object(simple_brush, "perform_favorite_action") as favorite,
+            patch.object(simple_brush, "forward_one_candidate") as forward,
+            patch.object(simple_brush, "ensure_forward_click_regions_calibrated") as forward_calibrate,
+            patch.object(simple_brush.random, "uniform", return_value=0.0),
+        ):
+            self.assertTrue(simple_brush.view_candidate(0))
+        favorite.assert_called_once_with()
+        forward.assert_not_called()
+        forward_calibrate.assert_not_called()
 
     def test_ocr_failure_never_calls_real_forward(self):
         with (
             patch.object(simple_brush, "detect_keywords", return_value=False),
             patch.object(simple_brush, "forward_one_candidate") as forward,
+            patch.object(simple_brush, "perform_favorite_action") as favorite,
             patch.object(simple_brush.random, "uniform", return_value=0.0),
         ):
             self.assertTrue(simple_brush.view_candidate(0))
         forward.assert_not_called()
+        favorite.assert_not_called()
+
+    def test_invalid_action_mode_fails_when_keyword_hits(self):
+        simple_brush.action_mode = "invalid"
+        with (
+            patch.object(simple_brush, "detect_keywords", return_value=True),
+            patch.object(simple_brush.random, "uniform", return_value=0.0),
+        ):
+            with self.assertRaisesRegex(ValueError, "未知候选人处理模式"):
+                simple_brush.view_candidate(0)
 
     def assert_focus_restored_twice(self, click, choose_point):
-        focus_call = call(500, 400, offset=0)
+        focus_call = call(
+            500,
+            400,
+            offset=0,
+            region_width=simple_brush.focus_restore_region.width,
+            region_height=simple_brush.focus_restore_region.height,
+        )
         self.assertEqual(
             choose_point.call_args_list,
             [
@@ -131,6 +182,8 @@ class SimpleBrushOCRTests(unittest.TestCase):
             ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value="test@example.com"),
+            patch.object(simple_brush.pyautogui, "hotkey"),
+            patch.object(simple_brush.pyautogui, "press"),
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
@@ -168,6 +221,8 @@ class SimpleBrushOCRTests(unittest.TestCase):
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value=""),
             patch.object(simple_brush, "type_text_human", return_value=True),
+            patch.object(simple_brush.pyautogui, "hotkey"),
+            patch.object(simple_brush.pyautogui, "press"),
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertTrue(simple_brush.forward_one_candidate())
@@ -213,6 +268,8 @@ class SimpleBrushOCRTests(unittest.TestCase):
             ) as choose_point,
             patch.object(simple_brush, "human_delay", return_value=True),
             patch.object(simple_brush, "get_clipboard_text", return_value=""),
+            patch.object(simple_brush.pyautogui, "hotkey"),
+            patch.object(simple_brush.pyautogui, "press"),
             patch.object(simple_brush.time, "sleep"),
         ):
             self.assertFalse(simple_brush.forward_one_candidate())
@@ -302,7 +359,13 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 call(simple_brush.focus_restore_region),
             ],
         )
-        focus_call = call(650, 330, offset=0)
+        focus_call = call(
+            650,
+            330,
+            offset=0,
+            region_width=120,
+            region_height=60,
+        )
         self.assertEqual(click.call_args_list, [focus_call, focus_call])
 
     def test_second_focus_restore_is_attempted_when_first_click_raises(self):
@@ -332,7 +395,22 @@ class SimpleBrushOCRTests(unittest.TestCase):
         )
         self.assertEqual(
             click.call_args_list,
-            [call(500, 400, offset=0), call(501, 401, offset=0)],
+            [
+                call(
+                    500,
+                    400,
+                    offset=0,
+                    region_width=simple_brush.focus_restore_region.width,
+                    region_height=simple_brush.focus_restore_region.height,
+                ),
+                call(
+                    501,
+                    401,
+                    offset=0,
+                    region_width=simple_brush.focus_restore_region.width,
+                    region_height=simple_brush.focus_restore_region.height,
+                ),
+            ],
         )
         delay.assert_called_once_with(0.3, 0.5)
         log_error.assert_called_once()
@@ -389,7 +467,13 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             simple_brush.click_in_region(region)
         choose_point.assert_called_once_with(region)
-        click.assert_called_once_with(12, 24, offset=0)
+        click.assert_called_once_with(
+            12,
+            24,
+            offset=0,
+            region_width=5,
+            region_height=6,
+        )
 
     def test_reset_forward_click_calibration_restores_defaults(self):
         simple_brush.forward_click_regions = simple_brush.ForwardClickRegions(
@@ -848,6 +932,135 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 simple_brush.ScreenRegion(left=400, top=350, width=0, height=51)
             )
 
+    def test_random_inner_region_point_uses_center_sixty_percent(self):
+        region = simple_brush.ScreenRegion(left=100, top=200, width=300, height=100)
+        with patch.object(simple_brush.random, "uniform", side_effect=[160.0, 240.0]) as uniform:
+            point = simple_brush.random_point_in_inner_region(region)
+        self.assertEqual(point, (160.0, 240.0))
+        self.assertEqual(
+            uniform.call_args_list,
+            [
+                call(160.0, 340.0),
+                call(220.0, 280.0),
+            ],
+        )
+
+    def test_random_inner_region_point_rejects_empty_region(self):
+        with self.assertRaisesRegex(ValueError, "尺寸必须为正数"):
+            simple_brush.random_point_in_inner_region(
+                simple_brush.ScreenRegion(left=100, top=200, width=0, height=100)
+            )
+
+    def test_perform_favorite_action_clicks_inner_region_and_waits(self):
+        region = simple_brush.ScreenRegion(left=100, top=200, width=300, height=100)
+        simple_brush.favorite_button_region = region
+        with (
+            patch.object(
+                simple_brush,
+                "random_point_in_inner_region",
+                return_value=(180.5, 240.5),
+            ) as random_point,
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush.time, "sleep") as sleep,
+            patch.object(
+                simple_brush,
+                "restore_candidate_page_focus_after_favorite",
+            ) as restore_focus,
+        ):
+            self.assertTrue(simple_brush.perform_favorite_action())
+        random_point.assert_called_once_with(region)
+        click.assert_called_once_with(
+            180.5,
+            240.5,
+            offset=0,
+            region_width=300,
+            region_height=100,
+        )
+        sleep.assert_called_once_with(0.5)
+        restore_focus.assert_called_once_with()
+
+    def test_restore_candidate_page_focus_after_favorite_clicks_ocr_inner_region_twice(self):
+        region = simple_brush.ScreenRegion(left=100, top=200, width=300, height=100)
+        simple_brush.ocr_detector = Mock(region=region)
+        with (
+            patch.object(
+                simple_brush,
+                "random_point_in_inner_region",
+                side_effect=[(180.0, 240.0), (260.0, 250.0)],
+            ) as random_point,
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush.time, "sleep") as sleep,
+            patch.object(simple_brush, "select_screen_region") as select,
+            patch.object(
+                simple_brush,
+                "ensure_focus_restore_region_calibrated",
+            ) as forward_focus_calibrate,
+        ):
+            self.assertTrue(simple_brush.restore_candidate_page_focus_after_favorite())
+
+        self.assertEqual(random_point.call_args_list, [call(region), call(region)])
+        self.assertEqual(
+            click.call_args_list,
+            [
+                call(180.0, 240.0, offset=0, region_width=300, region_height=100),
+                call(260.0, 250.0, offset=0, region_width=300, region_height=100),
+            ],
+        )
+        self.assertEqual(sleep.call_args_list, [call(0.15), call(0.15)])
+        select.assert_not_called()
+        forward_focus_calibrate.assert_not_called()
+
+    def test_perform_favorite_action_restores_focus_after_favorite_click(self):
+        region = simple_brush.ScreenRegion(left=100, top=200, width=300, height=100)
+        simple_brush.favorite_button_region = region
+        events = []
+
+        def choose_point(_region):
+            events.append("choose_favorite")
+            return (180.0, 240.0)
+
+        def click(*_args, **_kwargs):
+            events.append("click_favorite")
+
+        def wait(_seconds):
+            events.append("favorite_wait")
+
+        def restore_focus():
+            events.append("restore_focus")
+            return True
+
+        with (
+            patch.object(simple_brush, "random_point_in_inner_region", side_effect=choose_point),
+            patch.object(simple_brush, "human_click", side_effect=click),
+            patch.object(simple_brush.time, "sleep", side_effect=wait),
+            patch.object(
+                simple_brush,
+                "restore_candidate_page_focus_after_favorite",
+                side_effect=restore_focus,
+            ),
+        ):
+            self.assertTrue(simple_brush.perform_favorite_action())
+
+        self.assertEqual(
+            events,
+            ["choose_favorite", "click_favorite", "favorite_wait", "restore_focus"],
+        )
+
+    def test_perform_favorite_action_without_region_fails_without_clicking(self):
+        simple_brush.favorite_button_region = None
+        with (
+            patch.object(simple_brush, "human_click") as click,
+            patch.object(simple_brush.time, "sleep") as sleep,
+            patch.object(
+                simple_brush,
+                "restore_candidate_page_focus_after_favorite",
+            ) as restore_focus,
+        ):
+            self.assertFalse(simple_brush.perform_favorite_action())
+        click.assert_not_called()
+        sleep.assert_not_called()
+        restore_focus.assert_not_called()
+
     def test_focus_restore_calibration_is_skipped_when_not_requested(self):
         with patch.object(simple_brush, "select_screen_region") as select:
             region = simple_brush.ensure_focus_restore_region_calibrated()
@@ -911,6 +1124,66 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertTrue(simple_brush.focus_restore_calibration_attempted)
         self.assertFalse(simple_brush.focus_restore_calibration_in_progress)
         log_exception.assert_called_once()
+
+    def test_favorite_button_calibration_selects_when_missing(self):
+        calibrated = simple_brush.ScreenRegion(left=1200, top=240, width=80, height=32)
+        with patch.object(
+            simple_brush,
+            "select_screen_region",
+            return_value=calibrated,
+        ) as select:
+            region = simple_brush.ensure_favorite_button_region_calibrated()
+        self.assertEqual(region, calibrated)
+        self.assertEqual(simple_brush.favorite_button_region, calibrated)
+        select.assert_called_once_with(
+            min_size=12,
+            instruction='框选“收藏”按钮内部安全区域 · Esc 取消收藏区域校准',
+            subtitle='调用校准模板前，请确保 Boss 页面窗口位置、大小、缩放状态与校准时基本一致',
+        )
+
+    def test_favorite_button_calibration_reuses_current_process_region(self):
+        calibrated = simple_brush.ScreenRegion(left=1200, top=240, width=80, height=32)
+        simple_brush.favorite_button_region = calibrated
+        with patch.object(simple_brush, "select_screen_region") as select:
+            region = simple_brush.ensure_favorite_button_region_calibrated()
+        self.assertEqual(region, calibrated)
+        select.assert_not_called()
+
+    def test_cancelled_favorite_button_calibration_fails_safely(self):
+        with patch.object(
+            simple_brush,
+            "select_screen_region",
+            side_effect=simple_brush.CalibrationCancelled,
+        ) as select:
+            region = simple_brush.ensure_favorite_button_region_calibrated()
+        self.assertIsNone(region)
+        self.assertIsNone(simple_brush.favorite_button_region)
+        select.assert_called_once()
+        self.assertFalse(simple_brush.stop_event)
+
+    def test_failed_favorite_button_calibration_fails_safely(self):
+        with (
+            patch.object(
+                simple_brush,
+                "select_screen_region",
+                side_effect=RuntimeError("overlay failed"),
+            ),
+            patch.object(simple_brush.logger, "exception") as log_exception,
+        ):
+            region = simple_brush.ensure_favorite_button_region_calibrated()
+        self.assertIsNone(region)
+        self.assertIsNone(simple_brush.favorite_button_region)
+        log_exception.assert_called_once()
+
+    def test_favorite_button_calibration_does_not_call_forward_calibration(self):
+        calibrated = simple_brush.ScreenRegion(left=1200, top=240, width=80, height=32)
+        with (
+            patch.object(simple_brush, "select_screen_region", return_value=calibrated),
+            patch.object(simple_brush, "ensure_forward_click_regions_calibrated") as forward_calibrate,
+        ):
+            region = simple_brush.ensure_favorite_button_region_calibrated()
+        self.assertEqual(region, calibrated)
+        forward_calibrate.assert_not_called()
 
     def test_run_resets_focus_restore_calibration_state(self):
         simple_brush.forward_click_regions = simple_brush.ForwardClickRegions(
@@ -1005,6 +1278,33 @@ class SimpleBrushOCRTests(unittest.TestCase):
             args = simple_brush.parse_args()
         self.assertTrue(args["no_batch_filter"])
 
+    def test_action_mode_argument_parses_favorite(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--action-mode", "favorite"],
+        ):
+            args = simple_brush.parse_args()
+        self.assertEqual(args["action_mode"], simple_brush.ACTION_MODE_FAVORITE)
+
+    def test_action_mode_argument_parses_forward(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--action-mode", "forward"],
+        ):
+            args = simple_brush.parse_args()
+        self.assertEqual(args["action_mode"], simple_brush.ACTION_MODE_FORWARD)
+
+    def test_action_mode_argument_rejects_invalid_value(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--action-mode", "invalid"],
+        ):
+            with self.assertRaisesRegex(ValueError, "favorite 或 forward"):
+                simple_brush.parse_args()
+
     def test_duration_argument_is_parsed(self):
         with patch.object(
             simple_brush.sys,
@@ -1034,8 +1334,98 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     simple_brush.parse_duration_seconds(value)
 
+    def test_action_mode_choice_parses_favorite(self):
+        self.assertEqual(
+            simple_brush.parse_action_mode_choice("1"),
+            simple_brush.ACTION_MODE_FAVORITE,
+        )
+
+    def test_action_mode_choice_parses_forward(self):
+        self.assertEqual(
+            simple_brush.parse_action_mode_choice("2"),
+            simple_brush.ACTION_MODE_FORWARD,
+        )
+
+    def test_action_mode_choice_strips_whitespace(self):
+        self.assertEqual(
+            simple_brush.parse_action_mode_choice(" 1 "),
+            simple_brush.ACTION_MODE_FAVORITE,
+        )
+
+    def test_action_mode_choice_rejects_invalid_input(self):
+        for value in ("", "0", "3", "favorite", "forward", "１", None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    simple_brush.parse_action_mode_choice(value)
+
+    def test_prompt_action_mode_retries_invalid_input(self):
+        with patch("builtins.input", side_effect=["bad", "2"]), patch(
+            "builtins.print"
+        ) as mocked_print:
+            mode = simple_brush.prompt_action_mode()
+        self.assertEqual(mode, simple_brush.ACTION_MODE_FORWARD)
+        mocked_print.assert_called_once_with('  输入无效，请输入 1 或 2。')
+
+    def test_noninteractive_mode_defaults_action_mode_to_forward(self):
+        simple_brush.action_mode = simple_brush.ACTION_MODE_FAVORITE
+        simple_brush.get_user_input(
+            keywords_str='"Python"',
+            auto=True,
+            action_mode_value=None,
+        )
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FORWARD)
+
+    def test_noninteractive_mode_uses_explicit_action_mode(self):
+        simple_brush.get_user_input(
+            keywords_str='"Python"',
+            auto=True,
+            action_mode_value=simple_brush.ACTION_MODE_FAVORITE,
+        )
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
+
+    def test_interactive_mode_prompts_for_action_mode_before_keywords(self):
+        events = []
+        responses = iter(["", "n", ""])
+
+        def choose_mode():
+            events.append("mode")
+            return simple_brush.ACTION_MODE_FAVORITE
+
+        def user_input(_prompt):
+            events.append("keyword" if len(events) == 1 else "input")
+            return next(responses)
+
+        with patch.object(
+            simple_brush,
+            "prompt_action_mode",
+            side_effect=choose_mode,
+        ), patch("builtins.input", side_effect=user_input):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(events[:2], ["mode", "keyword"])
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
+
+    def test_interactive_choice_one_sets_action_mode_to_favorite(self):
+        with patch("builtins.input", side_effect=["1", "", "n", ""]):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
+
+    def test_interactive_choice_two_sets_action_mode_to_forward(self):
+        simple_brush.action_mode = simple_brush.ACTION_MODE_FAVORITE
+        with patch("builtins.input", side_effect=["2", "", "n", ""]):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FORWARD)
+
+    def test_interactive_favorite_mode_skips_email_and_forward_calibration(self):
+        with patch("builtins.input", side_effect=["1", '"Python"', "n", ""]) as user_input:
+            simple_brush.get_user_input()
+        self.assertEqual(user_input.call_count, 4)
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
+        self.assertEqual(simple_brush.backup_email, "")
+        self.assertFalse(simple_brush.focus_restore_calibration_requested)
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
+
     def test_interactive_duration_retries_invalid_input(self):
-        with patch("builtins.input", side_effect=["", "n", "invalid", "3"]):
+        with patch("builtins.input", side_effect=["2", "", "n", "invalid", "3"]):
             simple_brush.get_user_input()
         self.assertEqual(simple_brush.run_duration_seconds, 3)
 
@@ -1047,6 +1437,35 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ), patch.object(simple_brush, "bring_edge_foreground") as bring_edge:
             self.assertEqual(simple_brush.run(), 2)
         bring_edge.assert_not_called()
+
+    def test_run_passes_cli_action_mode_to_user_input(self):
+        def configure_input(**kwargs):
+            simple_brush.action_mode = kwargs["action_mode_value"]
+            simple_brush.forward_keywords = []
+            simple_brush.forward_enabled = False
+            simple_brush.run_duration_seconds = 0
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": '"Python"',
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": False,
+                "no_batch_filter": False,
+                "simple_mouse": False,
+                "auto": True,
+                "action_mode": simple_brush.ACTION_MODE_FAVORITE,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input) as user_input,
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+        self.assertEqual(
+            user_input.call_args.kwargs["action_mode_value"],
+            simple_brush.ACTION_MODE_FAVORITE,
+        )
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
 
     def test_auto_mode_parses_quoted_keyword_rules(self):
         simple_brush.get_user_input(
@@ -1091,7 +1510,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_keyword_rules_retry_invalid_input(self):
         with patch(
             "builtins.input",
-            side_effect=["Python", '"Python" or "短剧"', "n", "n", ""],
+            side_effect=["2", "Python", '"Python" or "短剧"', "n", "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertEqual(
@@ -1103,6 +1522,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         with patch(
             "builtins.input",
             side_effect=[
+                "2",
                 'not "销售"',
                 '"短剧" and not "销售"',
                 "n",
@@ -1119,7 +1539,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_mode_can_request_focus_restore_calibration(self):
         with patch(
             "builtins.input",
-            side_effect=['"Python"', "y", "n", ""],
+            side_effect=["2", '"Python"', "y", "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertTrue(simple_brush.focus_restore_calibration_requested)
@@ -1128,7 +1548,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
     def test_interactive_mode_defaults_to_focus_restore_region_fallback(self):
         with patch(
             "builtins.input",
-            side_effect=['"Python"', "", "n", ""],
+            side_effect=["2", '"Python"', "", "n", ""],
         ):
             simple_brush.get_user_input(no_forward=True)
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
@@ -1146,24 +1566,24 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertFalse(simple_brush.batch_filter_calibration_requested)
 
     def test_interactive_mode_without_keywords_does_not_offer_forward_calibration(self):
-        with patch("builtins.input", side_effect=["", "n", ""]) as user_input:
+        with patch("builtins.input", side_effect=["2", "", "n", ""]) as user_input:
             simple_brush.get_user_input(no_forward=True)
-        self.assertEqual(user_input.call_count, 3)
+        self.assertEqual(user_input.call_count, 4)
         self.assertFalse(simple_brush.forward_click_calibration_requested)
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
 
     def test_no_keywords_and_no_forward_can_request_batch_filter_calibration(self):
-        with patch("builtins.input", side_effect=["", "y", ""]):
+        with patch("builtins.input", side_effect=["2", "", "y", ""]):
             simple_brush.get_user_input(no_forward=True)
         self.assertTrue(simple_brush.batch_filter_calibration_requested)
 
     def test_no_batch_filter_skips_prompt_in_interactive_mode(self):
-        with patch("builtins.input", side_effect=["", ""]) as user_input:
+        with patch("builtins.input", side_effect=["2", "", ""]) as user_input:
             simple_brush.get_user_input(
                 no_forward=True,
                 no_batch_filter=True,
             )
-        self.assertEqual(user_input.call_count, 2)
+        self.assertEqual(user_input.call_count, 3)
         self.assertFalse(simple_brush.batch_filter_calibration_requested)
 
     def test_cli_keywords_noninteractive_mode_never_prompts_for_batch_filter(self):
@@ -1253,6 +1673,221 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ensure.assert_called_once_with()
         ensure_forward.assert_called_once_with()
         ensure_ocr.assert_called_once_with()
+
+    def test_run_interactive_favorite_calibrates_before_viewing(self):
+        events = []
+
+        def configure_input(**_kwargs):
+            simple_brush.action_mode = simple_brush.ACTION_MODE_FAVORITE
+            simple_brush.forward_enabled = True
+            simple_brush.forward_keywords = [Mock(source='"Python"')]
+
+        def record(name, result=True):
+            def action(*_args, **_kwargs):
+                events.append(name)
+                return result
+            return action
+
+        favorite_region = simple_brush.ScreenRegion(left=1200, top=240, width=80, height=32)
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+                "action_mode": None,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", side_effect=record("detail")),
+            patch.object(
+                simple_brush,
+                "ensure_favorite_button_region_calibrated",
+                side_effect=record("favorite_calibrate", favorite_region),
+            ) as favorite_calibrate,
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+                side_effect=record("ocr_calibrate"),
+            ),
+            patch.object(simple_brush, "start_run_timer", side_effect=record("timer_start", None)),
+            patch.object(simple_brush, "view_candidate", side_effect=record("view", False)),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(
+            events,
+            ["detail", "favorite_calibrate", "ocr_calibrate", "timer_start", "view"],
+        )
+        favorite_calibrate.assert_called_once_with()
+
+    def test_run_cli_favorite_calibrates_before_viewing(self):
+        events = []
+
+        def record(name, result=True):
+            def action(*_args, **_kwargs):
+                events.append(name)
+                return result
+            return action
+
+        favorite_region = simple_brush.ScreenRegion(left=1200, top=240, width=80, height=32)
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": '"Python"',
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": False,
+                "no_batch_filter": False,
+                "simple_mouse": False,
+                "auto": True,
+                "action_mode": simple_brush.ACTION_MODE_FAVORITE,
+            }),
+            patch.object(
+                simple_brush,
+                "get_user_input",
+                wraps=simple_brush.get_user_input,
+            ),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", side_effect=record("detail")),
+            patch.object(
+                simple_brush,
+                "ensure_favorite_button_region_calibrated",
+                side_effect=record("favorite_calibrate", favorite_region),
+            ) as favorite_calibrate,
+            patch.object(
+                simple_brush,
+                "ensure_ocr_region_calibrated",
+                side_effect=record("ocr_calibrate"),
+            ),
+            patch.object(simple_brush, "start_run_timer", side_effect=record("timer_start", None)),
+            patch.object(simple_brush, "view_candidate", side_effect=record("view", False)),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
+        self.assertEqual(
+            events,
+            ["detail", "favorite_calibrate", "ocr_calibrate", "timer_start", "view"],
+        )
+        favorite_calibrate.assert_called_once_with()
+
+    def test_run_stops_when_favorite_calibration_fails(self):
+        events = []
+
+        def configure_input(**_kwargs):
+            simple_brush.action_mode = simple_brush.ACTION_MODE_FAVORITE
+            simple_brush.forward_enabled = True
+            simple_brush.forward_keywords = [Mock(source='"Python"')]
+
+        def open_detail(_x, _y):
+            events.append("detail")
+            return True
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+                "action_mode": None,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", side_effect=open_detail),
+            patch.object(
+                simple_brush,
+                "ensure_favorite_button_region_calibrated",
+                return_value=None,
+            ) as favorite_calibrate,
+            patch.object(simple_brush, "ensure_ocr_region_calibrated") as ocr_calibrate,
+            patch.object(simple_brush, "start_run_timer") as start_timer,
+            patch.object(simple_brush, "view_candidate") as view,
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(events, ["detail"])
+        favorite_calibrate.assert_called_once_with()
+        ocr_calibrate.assert_not_called()
+        start_timer.assert_not_called()
+        view.assert_not_called()
+
+    def test_run_forward_mode_does_not_calibrate_favorite_button(self):
+        def configure_input(**_kwargs):
+            simple_brush.action_mode = simple_brush.ACTION_MODE_FORWARD
+            simple_brush.forward_enabled = True
+            simple_brush.forward_keywords = [Mock(source='"Python"')]
+
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": "",
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "auto": False,
+                "action_mode": None,
+            }),
+            patch.object(simple_brush, "get_user_input", side_effect=configure_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", return_value=True),
+            patch.object(simple_brush, "ensure_favorite_button_region_calibrated") as favorite_calibrate,
+            patch.object(simple_brush, "ensure_ocr_region_calibrated", return_value=True),
+            patch.object(simple_brush, "start_run_timer", return_value=None),
+            patch.object(simple_brush, "view_candidate", return_value=False),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        favorite_calibrate.assert_not_called()
+
+    def test_run_noninteractive_default_forward_does_not_calibrate_favorite_button(self):
+        with (
+            patch.object(simple_brush, "parse_args", return_value={
+                "keywords": '"Python"',
+                "email": "",
+                "duration_seconds": "",
+                "no_forward": True,
+                "no_batch_filter": False,
+                "simple_mouse": False,
+                "auto": True,
+                "action_mode": None,
+            }),
+            patch.object(simple_brush, "get_user_input", wraps=simple_brush.get_user_input),
+            patch.object(simple_brush, "initialize_ocr"),
+            patch.object(simple_brush.listener, "start"),
+            patch.object(simple_brush, "bring_edge_foreground", return_value=True),
+            patch.object(simple_brush, "safe_wait", return_value=True),
+            patch.object(simple_brush.pyautogui, "position", return_value=(10, 20)),
+            patch.object(simple_brush, "click_first_candidate", return_value=True),
+            patch.object(simple_brush, "ensure_favorite_button_region_calibrated") as favorite_calibrate,
+            patch.object(simple_brush, "ensure_ocr_region_calibrated", return_value=True),
+            patch.object(simple_brush, "start_run_timer", return_value=None),
+            patch.object(simple_brush, "view_candidate", return_value=False),
+            patch.object(simple_brush, "refresh_page", return_value=False),
+        ):
+            self.assertEqual(simple_brush.run(), 0)
+
+        self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FORWARD)
+        favorite_calibrate.assert_not_called()
 
     def test_run_does_not_calibrate_when_first_detail_fails_to_open(self):
         def configure_input(**_kwargs):
