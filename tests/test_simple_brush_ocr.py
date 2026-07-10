@@ -1,8 +1,38 @@
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import simple_brush
+from calibration_profiles import CalibrationProfileError, REQUIRED_AREA_FIELDS
 from ocr_detector import DetectionResult, ScanObservation
+
+
+def sample_profile_areas():
+    return {
+        field_name: simple_brush.ScreenRegion(
+            left=10 + index,
+            top=20 + index,
+            width=30 + index,
+            height=40 + index,
+        )
+        for index, field_name in enumerate(REQUIRED_AREA_FIELDS)
+    }
+
+
+def sample_profile(*, missing=()):
+    areas = sample_profile_areas()
+    for field_name in missing:
+        areas.pop(field_name, None)
+    return Mock(
+        profile_name="main",
+        areas=areas,
+        system_info={
+            "os": "Windows",
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "dpi_scale": 1.25,
+        },
+    )
 
 
 class SimpleBrushOCRTests(unittest.TestCase):
@@ -30,6 +60,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "focus_restore_calibration_attempted",
                 "focus_restore_calibration_in_progress",
                 "favorite_button_region",
+                "selected_calibration_profile",
                 "ocr_backend",
                 "ocr_capture",
                 "ocr_detector",
@@ -52,6 +83,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.reset_batch_filter_calibration()
         simple_brush.reset_focus_restore_calibration()
         simple_brush.favorite_button_region = None
+        simple_brush.selected_calibration_profile = None
         simple_brush.stop_event = False
         simple_brush.paused = False
         simple_brush.run_duration_seconds = 0
@@ -634,6 +666,118 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertFalse(simple_brush.batch_filter_calibration_attempted)
         self.assertFalse(simple_brush.batch_filter_calibration_in_progress)
         self.assertFalse(simple_brush.batch_filter_enabled)
+
+    def test_load_calibration_profile_into_runtime_loads_all_regions(self):
+        profile = sample_profile()
+
+        self.assertTrue(simple_brush.load_calibration_profile_into_runtime(profile))
+
+        areas = profile.areas
+        self.assertEqual(
+            simple_brush.forward_click_regions,
+            simple_brush.ForwardClickRegions(
+                forward_icon=areas["forward_icon"],
+                email_tab=areas["email_tab"],
+                input_box=areas["input_box"],
+                recent_email=areas["recent_email"],
+                forward_button=areas["forward_button"],
+            ),
+        )
+        self.assertEqual(
+            simple_brush.batch_filter_regions,
+            simple_brush.BatchFilterRegions(
+                first_candidate=areas["first_candidate"],
+                open_filter=areas["open_filter"],
+                unseen_filter=areas["unseen_filter"],
+                confirm_filter=areas["confirm_filter"],
+            ),
+        )
+        self.assertTrue(simple_brush.batch_filter_enabled)
+        self.assertEqual(simple_brush.focus_restore_region, areas["focus_restore_region"])
+        self.assertEqual(simple_brush.favorite_button_region, areas["favorite_button_region"])
+        self.assertFalse(simple_brush.forward_click_calibration_requested)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+        self.assertFalse(simple_brush.focus_restore_calibration_requested)
+
+    def test_load_calibration_profile_accepts_dict_regions(self):
+        profile = sample_profile()
+        profile.areas["favorite_button_region"] = {
+            "left": 1,
+            "top": 2,
+            "width": 3,
+            "height": 4,
+        }
+
+        simple_brush.load_calibration_profile_into_runtime(profile)
+
+        self.assertEqual(
+            simple_brush.favorite_button_region,
+            simple_brush.ScreenRegion(left=1, top=2, width=3, height=4),
+        )
+
+    def test_load_calibration_profile_missing_forward_field_rejects_forward_mode(self):
+        original_forward = simple_brush.forward_click_regions
+        profile = sample_profile(missing=("forward_icon",))
+
+        with self.assertRaisesRegex(
+            simple_brush.CalibrationProfileRuntimeLoadError,
+            "forward_icon",
+        ):
+            simple_brush.load_calibration_profile_into_runtime(
+                profile,
+                action_mode_value=simple_brush.ACTION_MODE_FORWARD,
+            )
+
+        self.assertEqual(simple_brush.forward_click_regions, original_forward)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertIsNone(simple_brush.favorite_button_region)
+
+    def test_load_calibration_profile_missing_favorite_field_rejects_favorite_mode(self):
+        profile = sample_profile(missing=("favorite_button_region",))
+
+        with self.assertRaisesRegex(
+            simple_brush.CalibrationProfileRuntimeLoadError,
+            "favorite_button_region",
+        ):
+            simple_brush.load_calibration_profile_into_runtime(
+                profile,
+                action_mode_value=simple_brush.ACTION_MODE_FAVORITE,
+            )
+
+        self.assertIsNone(simple_brush.favorite_button_region)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+
+    def test_load_calibration_profile_respects_no_batch_filter(self):
+        profile = sample_profile()
+
+        simple_brush.load_calibration_profile_into_runtime(
+            profile,
+            no_batch_filter=True,
+        )
+
+        self.assertIsNotNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+
+    def test_load_calibration_profile_rejects_non_positive_region_size(self):
+        profile = sample_profile()
+        profile.areas["forward_icon"] = simple_brush.ScreenRegion(
+            left=1,
+            top=2,
+            width=0,
+            height=4,
+        )
+
+        with self.assertRaisesRegex(
+            simple_brush.CalibrationProfileRuntimeLoadError,
+            "forward_icon",
+        ):
+            simple_brush.load_calibration_profile_into_runtime(profile)
+
+        self.assertEqual(
+            simple_brush.forward_click_regions,
+            simple_brush.DEFAULT_FORWARD_CLICK_REGIONS,
+        )
+        self.assertIsNone(simple_brush.batch_filter_regions)
 
     def test_batch_filter_calibration_selects_in_order_and_publishes_atomically(self):
         regions = [
@@ -1296,6 +1440,24 @@ class SimpleBrushOCRTests(unittest.TestCase):
             args = simple_brush.parse_args()
         self.assertEqual(args["action_mode"], simple_brush.ACTION_MODE_FORWARD)
 
+    def test_calibration_profile_argument_is_parsed(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--auto", "--calibration-profile", "main"],
+        ):
+            args = simple_brush.parse_args()
+        self.assertEqual(args["calibration_profile"], "main")
+
+    def test_calibration_profile_argument_requires_value(self):
+        with patch.object(
+            simple_brush.sys,
+            "argv",
+            ["simple_brush.py", "--calibration-profile"],
+        ):
+            with self.assertRaisesRegex(ValueError, "缺少模板名称"):
+                simple_brush.parse_args()
+
     def test_action_mode_argument_rejects_invalid_value(self):
         with patch.object(
             simple_brush.sys,
@@ -1383,6 +1545,148 @@ class SimpleBrushOCRTests(unittest.TestCase):
         )
         self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
 
+    def test_noninteractive_mode_without_profile_does_not_load_templates(self):
+        with (
+            patch.object(simple_brush, "load_profile") as load_profile,
+            patch.object(simple_brush, "scan_profiles") as scan_profiles,
+            patch("builtins.input") as user_input,
+        ):
+            simple_brush.get_user_input(keywords_str='"Python"', auto=True)
+
+        load_profile.assert_not_called()
+        scan_profiles.assert_not_called()
+        user_input.assert_not_called()
+        self.assertIsNone(simple_brush.selected_calibration_profile)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+
+    def test_noninteractive_mode_loads_explicit_calibration_profile(self):
+        profile = sample_profile()
+        match = Mock(matches=True, mismatches={})
+
+        with (
+            patch.object(simple_brush, "load_profile", return_value=profile) as load_profile,
+            patch.object(simple_brush, "compare_system_info", return_value=match) as compare,
+            patch("builtins.input") as user_input,
+        ):
+            simple_brush.get_user_input(
+                keywords_str='"Python"',
+                auto=True,
+                calibration_profile_name="main",
+            )
+
+        load_profile.assert_called_once_with("main")
+        compare.assert_called_once_with(profile.system_info)
+        user_input.assert_not_called()
+        self.assertIs(simple_brush.selected_calibration_profile, profile)
+        self.assertEqual(
+            simple_brush.forward_click_regions.forward_icon,
+            profile.areas["forward_icon"],
+        )
+        self.assertEqual(
+            simple_brush.batch_filter_regions.first_candidate,
+            profile.areas["first_candidate"],
+        )
+        self.assertTrue(simple_brush.batch_filter_enabled)
+
+    def test_noninteractive_profile_respects_no_batch_filter(self):
+        profile = sample_profile()
+        with (
+            patch.object(simple_brush, "load_profile", return_value=profile),
+            patch.object(
+                simple_brush,
+                "compare_system_info",
+                return_value=Mock(matches=True, mismatches={}),
+            ),
+        ):
+            simple_brush.get_user_input(
+                keywords_str='"Python"',
+                auto=True,
+                no_batch_filter=True,
+                calibration_profile_name="main",
+            )
+
+        self.assertIsNotNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+
+    def test_noninteractive_profile_missing_file_fails_before_prompting(self):
+        with (
+            patch.object(
+                simple_brush,
+                "load_profile",
+                side_effect=CalibrationProfileError("cannot read profile: missing"),
+            ),
+            patch("builtins.input") as user_input,
+        ):
+            with self.assertRaisesRegex(ValueError, "校准模板加载失败"):
+                simple_brush.get_user_input(
+                    keywords_str='"Python"',
+                    auto=True,
+                    calibration_profile_name="missing",
+                )
+
+        user_input.assert_not_called()
+        self.assertIsNone(simple_brush.batch_filter_regions)
+
+    def test_noninteractive_profile_damaged_json_fails_before_prompting(self):
+        with (
+            patch.object(
+                simple_brush,
+                "load_profile",
+                side_effect=CalibrationProfileError("invalid JSON"),
+            ),
+            patch("builtins.input") as user_input,
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                simple_brush.get_user_input(
+                    keywords_str='"Python"',
+                    auto=True,
+                    calibration_profile_name="broken",
+                )
+
+        user_input.assert_not_called()
+
+    def test_noninteractive_profile_system_mismatch_fails_closed(self):
+        profile = sample_profile()
+        mismatch = Mock(
+            matches=False,
+            mismatches={"screen_width": (1920, 2560), "dpi_scale": (1.25, 1.5)},
+        )
+
+        with (
+            patch.object(simple_brush, "load_profile", return_value=profile),
+            patch.object(simple_brush, "compare_system_info", return_value=mismatch),
+        ):
+            with self.assertRaisesRegex(ValueError, "系统信息不匹配"):
+                simple_brush.get_user_input(
+                    keywords_str='"Python"',
+                    auto=True,
+                    calibration_profile_name="main",
+                )
+
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertIsNone(simple_brush.favorite_button_region)
+
+    def test_noninteractive_profile_missing_field_fails_closed(self):
+        profile = sample_profile(missing=("forward_icon",))
+
+        with (
+            patch.object(simple_brush, "load_profile", return_value=profile),
+            patch.object(
+                simple_brush,
+                "compare_system_info",
+                return_value=Mock(matches=True, mismatches={}),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "forward_icon"):
+                simple_brush.get_user_input(
+                    keywords_str='"Python"',
+                    auto=True,
+                    calibration_profile_name="main",
+                )
+
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertIsNone(simple_brush.favorite_button_region)
+
     def test_interactive_mode_prompts_for_action_mode_before_keywords(self):
         events = []
         responses = iter(["", "n", ""])
@@ -1415,6 +1719,210 @@ class SimpleBrushOCRTests(unittest.TestCase):
             simple_brush.get_user_input(no_forward=True)
         self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FORWARD)
 
+    def test_interactive_profile_empty_list_keeps_legacy_prompt_path(self):
+        scan = Mock(profiles=[], invalid_profiles=[])
+        with patch.object(simple_brush, "scan_profiles", return_value=scan), patch(
+            "builtins.input",
+            side_effect=["2", "", "n", ""],
+        ) as user_input:
+            simple_brush.get_user_input(no_forward=True)
+        self.assertEqual(user_input.call_count, 4)
+        self.assertIsNone(simple_brush.selected_calibration_profile)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+
+    def test_interactive_profile_selection_can_decline_template(self):
+        summary = Mock(
+            profile_name="main",
+            path=Path("calibration_profiles/main.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        scan = Mock(profiles=[summary], invalid_profiles=[])
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(simple_brush, "load_calibration_profile_into_runtime") as load_runtime,
+            patch("builtins.input", side_effect=["2", "", "0", "n", ""]),
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        load_runtime.assert_not_called()
+        self.assertIsNone(simple_brush.selected_calibration_profile)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+
+    def test_interactive_profile_selection_loads_template_and_skips_legacy_prompts(self):
+        summary = Mock(
+            profile_name="main",
+            path=Path("calibration_profiles/main.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        loaded_profile = sample_profile()
+        scan = Mock(profiles=[summary], invalid_profiles=[])
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(simple_brush, "load_profile_file", return_value=loaded_profile) as load_profile,
+            patch.object(
+                simple_brush,
+                "compare_system_info",
+                return_value=Mock(matches=True, mismatches={}),
+            ),
+            patch("builtins.input", side_effect=["2", "", "1", ""]),
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        load_profile.assert_called_once_with(summary.path)
+        self.assertIs(simple_brush.selected_calibration_profile, loaded_profile)
+        self.assertEqual(
+            simple_brush.forward_click_regions.forward_icon,
+            loaded_profile.areas["forward_icon"],
+        )
+        self.assertEqual(
+            simple_brush.batch_filter_regions.first_candidate,
+            loaded_profile.areas["first_candidate"],
+        )
+        self.assertEqual(
+            simple_brush.focus_restore_region,
+            loaded_profile.areas["focus_restore_region"],
+        )
+        self.assertEqual(
+            simple_brush.favorite_button_region,
+            loaded_profile.areas["favorite_button_region"],
+        )
+        self.assertTrue(simple_brush.batch_filter_enabled)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+
+    def test_interactive_profile_selection_respects_no_batch_filter(self):
+        summary = Mock(
+            profile_name="main",
+            path=Path("calibration_profiles/main.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        loaded_profile = sample_profile()
+        scan = Mock(profiles=[summary], invalid_profiles=[])
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(simple_brush, "load_profile_file", return_value=loaded_profile),
+            patch.object(
+                simple_brush,
+                "compare_system_info",
+                return_value=Mock(matches=True, mismatches={}),
+            ),
+            patch("builtins.input", side_effect=["2", "", "1", ""]),
+        ):
+            simple_brush.get_user_input(no_forward=True, no_batch_filter=True)
+        self.assertIsNotNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_enabled)
+
+    def test_interactive_profile_missing_field_falls_back_to_legacy_path(self):
+        summary = Mock(
+            profile_name="main",
+            path=Path("calibration_profiles/main.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        loaded_profile = sample_profile(missing=("forward_icon",))
+        scan = Mock(profiles=[summary], invalid_profiles=[])
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(simple_brush, "load_profile_file", return_value=loaded_profile),
+            patch.object(
+                simple_brush,
+                "compare_system_info",
+                return_value=Mock(matches=True, mismatches={}),
+            ),
+            patch("builtins.input", side_effect=["2", "", "1", "n", ""]),
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertIsNone(simple_brush.selected_calibration_profile)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+
+    def test_interactive_profile_system_mismatch_can_fallback_to_legacy_path(self):
+        summary = Mock(
+            profile_name="main",
+            path=Path("calibration_profiles/main.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        loaded_profile = sample_profile()
+        mismatch = Mock(
+            matches=False,
+            mismatches={"screen_width": (1920, 2560), "dpi_scale": (1.25, 1.5)},
+        )
+        scan = Mock(profiles=[summary], invalid_profiles=[])
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(simple_brush, "load_profile_file", return_value=loaded_profile),
+            patch.object(simple_brush, "compare_system_info", return_value=mismatch),
+            patch("builtins.input", side_effect=["2", "", "1", "0", "n", ""]),
+            patch("builtins.print") as printed,
+        ):
+            simple_brush.get_user_input(no_forward=True)
+
+        output = "\n".join(
+            str(call_args.args[0])
+            for call_args in printed.call_args_list
+            if call_args.args
+        )
+        self.assertIn("当前环境与模板环境不一致", output)
+        self.assertIn("调用校准模板前，请确保 Boss 页面窗口位置、大小、缩放状态与校准时基本一致", output)
+        self.assertIn("旧模板中的点击区域可能发生偏移", output)
+        self.assertIsNone(simple_brush.selected_calibration_profile)
+        self.assertIsNone(simple_brush.batch_filter_regions)
+
+    def test_interactive_profile_system_mismatch_can_reselect_template(self):
+        first = Mock(
+            profile_name="old",
+            path=Path("calibration_profiles/old.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        second = Mock(
+            profile_name="main",
+            path=Path("calibration_profiles/main.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        old_profile = sample_profile()
+        old_profile.profile_name = "old"
+        main_profile = sample_profile()
+        scan = Mock(profiles=[first, second], invalid_profiles=[])
+        mismatch = Mock(matches=False, mismatches={"screen_height": (1080, 900)})
+        match = Mock(matches=True, mismatches={})
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(
+                simple_brush,
+                "load_profile_file",
+                side_effect=[old_profile, main_profile],
+            ),
+            patch.object(
+                simple_brush,
+                "compare_system_info",
+                side_effect=[mismatch, match],
+            ),
+            patch("builtins.input", side_effect=["2", "", "1", "r", "2", ""]),
+        ):
+            simple_brush.get_user_input(no_forward=True)
+
+        self.assertIs(simple_brush.selected_calibration_profile, main_profile)
+        self.assertEqual(
+            simple_brush.forward_click_regions.forward_icon,
+            main_profile.areas["forward_icon"],
+        )
+
+    def test_interactive_profile_read_failure_falls_back_to_legacy_path(self):
+        summary = Mock(
+            profile_name="broken",
+            path=Path("calibration_profiles/broken.json"),
+            created_at="2026-07-10T00:00:00",
+        )
+        scan = Mock(profiles=[summary], invalid_profiles=[])
+        with (
+            patch.object(simple_brush, "scan_profiles", return_value=scan),
+            patch.object(
+                simple_brush,
+                "load_profile_file",
+                side_effect=CalibrationProfileError("bad template"),
+            ),
+            patch("builtins.input", side_effect=["2", "", "1", "n", ""]),
+        ):
+            simple_brush.get_user_input(no_forward=True)
+        self.assertIsNone(simple_brush.selected_calibration_profile)
+        self.assertFalse(simple_brush.batch_filter_calibration_requested)
+
     def test_interactive_favorite_mode_skips_email_and_forward_calibration(self):
         with patch("builtins.input", side_effect=["1", '"Python"', "n", ""]) as user_input:
             simple_brush.get_user_input()
@@ -1438,6 +1946,30 @@ class SimpleBrushOCRTests(unittest.TestCase):
             self.assertEqual(simple_brush.run(), 2)
         bring_edge.assert_not_called()
 
+    def test_run_noninteractive_bad_calibration_profile_returns_error(self):
+        with (
+            patch.object(
+                simple_brush.sys,
+                "argv",
+                [
+                    "simple_brush.py",
+                    "--keywords",
+                    '"Python"',
+                    "--auto",
+                    "--calibration-profile",
+                    "missing",
+                ],
+            ),
+            patch.object(
+                simple_brush,
+                "load_profile",
+                side_effect=CalibrationProfileError("cannot read profile: missing"),
+            ),
+            patch.object(simple_brush, "bring_edge_foreground") as bring_edge,
+        ):
+            self.assertEqual(simple_brush.run(), 2)
+        bring_edge.assert_not_called()
+
     def test_run_passes_cli_action_mode_to_user_input(self):
         def configure_input(**kwargs):
             simple_brush.action_mode = kwargs["action_mode_value"]
@@ -1455,6 +1987,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "simple_mouse": False,
                 "auto": True,
                 "action_mode": simple_brush.ACTION_MODE_FAVORITE,
+                "calibration_profile": "main",
             }),
             patch.object(simple_brush, "get_user_input", side_effect=configure_input) as user_input,
             patch.object(simple_brush.listener, "start"),
@@ -1465,6 +1998,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
             user_input.call_args.kwargs["action_mode_value"],
             simple_brush.ACTION_MODE_FAVORITE,
         )
+        self.assertEqual(user_input.call_args.kwargs["calibration_profile_name"], "main")
         self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FAVORITE)
 
     def test_auto_mode_parses_quoted_keyword_rules(self):
@@ -1558,12 +2092,17 @@ class SimpleBrushOCRTests(unittest.TestCase):
         simple_brush.focus_restore_calibration_requested = True
         simple_brush.forward_click_calibration_requested = True
         simple_brush.batch_filter_calibration_requested = True
-        with patch("builtins.input") as user_input:
+        with patch("builtins.input") as user_input, patch.object(
+            simple_brush,
+            "scan_profiles",
+        ) as scan_profiles:
             simple_brush.get_user_input(keywords_str='"Python"', auto=True)
         user_input.assert_not_called()
+        scan_profiles.assert_not_called()
         self.assertFalse(simple_brush.focus_restore_calibration_requested)
         self.assertFalse(simple_brush.forward_click_calibration_requested)
         self.assertFalse(simple_brush.batch_filter_calibration_requested)
+        self.assertIsNone(simple_brush.selected_calibration_profile)
 
     def test_interactive_mode_without_keywords_does_not_offer_forward_calibration(self):
         with patch("builtins.input", side_effect=["2", "", "n", ""]) as user_input:

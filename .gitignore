@@ -8,6 +8,7 @@ venv/
 
 # Runtime data (may contain candidate information)
 logs/
+calibration_profiles/*.json
 
 # Editors and operating systems
 .idea/
@@ -18,7 +19,9 @@ logs/
 *.md
 !README.md
 !Issue-Next-7-windmouse-observable-motion-acceptance-report.md
+!Issue-calibration-template-module-acceptance-report.md
 !docs/TID-Windows-WindMouse-Observable-Motion.md
+!docs/calibration-template-smoke-test.md
 !release-notes/
 !release-notes/*.md
 

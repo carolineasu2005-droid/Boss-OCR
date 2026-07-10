@@ -38,6 +38,14 @@ from ocr_calibration import (
     save_region_preview,
     select_screen_region,
 )
+from calibration_profiles import (
+    CalibrationProfileError,
+    compare_system_info,
+    load_profile,
+    load_profile_file,
+    scan_profiles,
+    screen_region_from_dict,
+)
 from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
 from ocr_text import parse_keyword_rules
 from mouse_motion import (
@@ -58,6 +66,7 @@ def parse_args():
         'simple_mouse': False,
         'auto': False,
         'action_mode': None,
+        'calibration_profile': '',
     }
     i = 1
     while i < len(sys.argv):
@@ -84,6 +93,11 @@ def parse_args():
         elif sys.argv[i] == '--auto':
             args['auto'] = True  # 跳过所有交互
             i += 1
+        elif sys.argv[i] == '--calibration-profile':
+            if i + 1 >= len(sys.argv):
+                raise ValueError('--calibration-profile 缺少模板名称')
+            args['calibration_profile'] = sys.argv[i + 1]
+            i += 2
         elif sys.argv[i] == '--action-mode':
             if i + 1 >= len(sys.argv):
                 raise ValueError('--action-mode 缺少 favorite 或 forward')
@@ -119,6 +133,13 @@ FILTER_OPTION_DELAY_MIN = 0.3
 FILTER_OPTION_DELAY_MAX = 0.7
 FILTER_RESULTS_DELAY_MIN = 2.0
 FILTER_RESULTS_DELAY_MAX = 3.0
+
+CALIBRATION_PROFILE_USAGE_NOTICE = (
+    '调用校准模板前，请确保 Boss 页面窗口位置、大小、缩放状态与校准时基本一致。'
+)
+CALIBRATION_PROFILE_OFFSET_RISK_NOTICE = (
+    '如果窗口位置、窗口大小或页面缩放发生变化，旧模板中的点击区域可能发生偏移，建议重新校准。'
+)
 
 # OCR 关键词检测
 OCR_MAX_SCANS = 8
@@ -279,6 +300,9 @@ focus_restore_calibration_in_progress = False
 # 收藏按钮区域状态（仅在当前运行期间有效）
 favorite_button_region = None
 
+# 校准模板选择状态（模板区域注入后供现有流程读取）
+selected_calibration_profile = None
+
 # OCR 状态（每次运行只初始化、校准一次）
 ocr_backend = None
 ocr_capture = None
@@ -351,6 +375,238 @@ def prompt_action_mode():
             print('  输入无效，请输入 1 或 2。')
 
 
+def prompt_calibration_profile_selection():
+    """Let interactive users pick an existing calibration profile without loading it into flows."""
+    global selected_calibration_profile
+    selected_calibration_profile = None
+
+    try:
+        scan = scan_profiles()
+    except Exception as exc:
+        print(f'\n校准模板列表读取失败：{exc}')
+        print('  将继续使用旧手动校准流程')
+        return None
+
+    for invalid in scan.invalid_profiles:
+        print(f'\n跳过不可用校准模板：{invalid.path.name}')
+        print(f'  原因：{invalid.error}')
+
+    if not scan.profiles:
+        print('  未发现可用校准模板，将继续使用旧手动校准流程')
+        return None
+
+    print('\n发现可用校准模板：')
+    print(f'  {CALIBRATION_PROFILE_USAGE_NOTICE}')
+    print(f'  {CALIBRATION_PROFILE_OFFSET_RISK_NOTICE}')
+    for index, profile in enumerate(scan.profiles, start=1):
+        print(
+            f'  {index}. {profile.profile_name} '
+            f'({profile.path.name}, 创建时间: {profile.created_at})'
+        )
+    print('  0. 不使用模板，走旧手动校准流程')
+    print('  c. 查看如何新建或更新校准模板')
+
+    while True:
+        raw = input('请选择校准模板编号：\n> ').strip().lower()
+        if raw in ('', '0'):
+            print('  不使用校准模板，本次继续旧手动校准流程')
+            return None
+        if raw in ('c', 'create', 'new'):
+            print('  可独立运行校准模板生成入口：python calibration_template.py')
+            print('  本次继续旧手动校准流程')
+            return None
+        if raw.isascii() and raw.isdigit():
+            index = int(raw)
+            if 1 <= index <= len(scan.profiles):
+                summary = scan.profiles[index - 1]
+                try:
+                    selected_calibration_profile = load_profile_file(summary.path)
+                except CalibrationProfileError as exc:
+                    print(f'  校准模板读取失败：{exc}')
+                    print('  将继续使用旧手动校准流程')
+                    selected_calibration_profile = None
+                    return None
+                decision = prompt_interactive_profile_system_match(
+                    selected_calibration_profile
+                )
+                if decision == 'retry':
+                    selected_calibration_profile = None
+                    continue
+                if decision == 'fallback':
+                    selected_calibration_profile = None
+                    return None
+                print(f'  已选择校准模板：{selected_calibration_profile.profile_name}')
+                return selected_calibration_profile
+        print('  输入无效，请输入模板编号、0 或 c。')
+
+
+def prompt_interactive_profile_system_match(profile):
+    """Return use/retry/fallback after interactive system-info risk handling."""
+    try:
+        system_match = compare_system_info(profile.system_info)
+    except Exception as exc:
+        print(f'  校准模板系统信息校验失败：{exc}')
+        print('  将继续使用旧手动校准流程')
+        return 'fallback'
+
+    if system_match.matches:
+        return 'use'
+
+    print('  当前环境与模板环境不一致。')
+    print(f'  {CALIBRATION_PROFILE_USAGE_NOTICE}')
+    print(f'  {CALIBRATION_PROFILE_OFFSET_RISK_NOTICE}')
+    details = _format_system_info_mismatches(system_match.mismatches)
+    if details:
+        print(f'  不一致项：{details}')
+
+    while True:
+        raw = input(
+            '请选择：\n'
+            '1 = 继续使用该模板\n'
+            'r = 重新选择模板\n'
+            '0 = 不使用模板，走旧手动校准流程\n> '
+        ).strip().lower()
+        if raw == '1':
+            return 'use'
+        if raw in ('r', 'retry'):
+            return 'retry'
+        if raw in ('', '0'):
+            return 'fallback'
+        print('  输入无效，请输入 1、r 或 0。')
+
+
+class CalibrationProfileRuntimeLoadError(ValueError):
+    """Raised when a selected calibration profile cannot be applied safely."""
+
+
+def _profile_region(profile, field_name):
+    areas = getattr(profile, 'areas', None)
+    if not isinstance(areas, dict):
+        raise CalibrationProfileRuntimeLoadError('模板 areas 缺失或格式错误')
+    if field_name not in areas:
+        raise CalibrationProfileRuntimeLoadError(f'模板缺少必填区域字段：{field_name}')
+
+    value = areas[field_name]
+    if isinstance(value, ScreenRegion):
+        if value.width <= 0 or value.height <= 0:
+            raise CalibrationProfileRuntimeLoadError(
+                f'模板区域尺寸非法：{field_name}'
+            )
+        return value
+
+    try:
+        return screen_region_from_dict(value)
+    except Exception as exc:
+        raise CalibrationProfileRuntimeLoadError(
+            f'模板区域格式错误：{field_name}: {exc}'
+        ) from exc
+
+
+def load_calibration_profile_into_runtime(
+    profile,
+    *,
+    no_batch_filter=False,
+    action_mode_value=None,
+):
+    """Apply profile areas to existing runtime region structures atomically."""
+    global forward_click_regions
+    global batch_filter_regions
+    global batch_filter_enabled
+    global focus_restore_region
+    global favorite_button_region
+    global focus_restore_calibration_requested
+    global forward_click_calibration_requested
+    global batch_filter_calibration_requested
+
+    mode = action_mode_value or action_mode
+
+    loaded_forward_regions = ForwardClickRegions(
+        forward_icon=_profile_region(profile, 'forward_icon'),
+        email_tab=_profile_region(profile, 'email_tab'),
+        input_box=_profile_region(profile, 'input_box'),
+        recent_email=_profile_region(profile, 'recent_email'),
+        forward_button=_profile_region(profile, 'forward_button'),
+    )
+    loaded_batch_regions = BatchFilterRegions(
+        first_candidate=_profile_region(profile, 'first_candidate'),
+        open_filter=_profile_region(profile, 'open_filter'),
+        unseen_filter=_profile_region(profile, 'unseen_filter'),
+        confirm_filter=_profile_region(profile, 'confirm_filter'),
+    )
+    loaded_focus_restore_region = _profile_region(profile, 'focus_restore_region')
+    loaded_favorite_button_region = _profile_region(profile, 'favorite_button_region')
+
+    if mode == ACTION_MODE_FORWARD and loaded_forward_regions is None:
+        raise CalibrationProfileRuntimeLoadError('转发模式缺少转发点击区域')
+    if mode == ACTION_MODE_FAVORITE and loaded_favorite_button_region is None:
+        raise CalibrationProfileRuntimeLoadError('收藏模式缺少收藏按钮区域')
+
+    forward_click_regions = loaded_forward_regions
+    batch_filter_regions = loaded_batch_regions
+    batch_filter_enabled = not no_batch_filter
+    focus_restore_region = loaded_focus_restore_region
+    favorite_button_region = loaded_favorite_button_region
+    focus_restore_calibration_requested = False
+    forward_click_calibration_requested = False
+    batch_filter_calibration_requested = False
+
+    logger.info(
+        '✅ 已加载校准模板区域: %s',
+        getattr(profile, 'profile_name', '(未命名模板)'),
+    )
+    if no_batch_filter:
+        logger.info('--no-batch-filter 已启用：模板筛选区域已读取，但不会启用自动筛选归位')
+    return True
+
+
+def _format_system_info_mismatches(mismatches):
+    details = []
+    for key, values in mismatches.items():
+        saved_value, current_value = values
+        details.append(f'{key}: 模板={saved_value!r}, 当前={current_value!r}')
+    return '; '.join(details)
+
+
+def load_calibration_profile_for_noninteractive(
+    profile_name,
+    *,
+    no_batch_filter=False,
+    action_mode_value=None,
+):
+    """Load an explicitly named profile for non-interactive runs, failing closed."""
+    global selected_calibration_profile
+
+    name = '' if profile_name is None else str(profile_name).strip()
+    if not name:
+        return None
+
+    try:
+        profile = load_profile(name)
+    except CalibrationProfileError as exc:
+        raise ValueError(f'校准模板加载失败：{exc}') from exc
+
+    try:
+        system_match = compare_system_info(profile.system_info)
+    except Exception as exc:
+        raise ValueError(f'校准模板系统信息校验失败：{exc}') from exc
+
+    if not system_match.matches:
+        details = _format_system_info_mismatches(system_match.mismatches)
+        raise ValueError(f'校准模板系统信息不匹配：{details}')
+
+    try:
+        load_calibration_profile_into_runtime(
+            profile,
+            no_batch_filter=no_batch_filter,
+            action_mode_value=action_mode_value,
+        )
+    except Exception as exc:
+        raise ValueError(f'校准模板加载失败：{exc}') from exc
+
+    selected_calibration_profile = profile
+    return profile
+
+
 def keyword_rule_sources():
     """Return stable display strings for the configured keyword rules."""
     return [rule.source for rule in forward_keywords]
@@ -364,6 +620,7 @@ def get_user_input(
     no_forward=False,
     no_batch_filter=False,
     action_mode_value=None,
+    calibration_profile_name='',
 ):
     """
     获取关键词、备选邮箱和本次运行时间。
@@ -374,10 +631,12 @@ def get_user_input(
     global focus_restore_calibration_requested
     global forward_click_calibration_requested
     global batch_filter_calibration_requested
+    global selected_calibration_profile
 
     # ── 非交互模式（命令行传参或 --auto） ──
     if auto or keywords_str:
         action_mode = action_mode_value or ACTION_MODE_FORWARD
+        selected_calibration_profile = None
         focus_restore_calibration_requested = False
         forward_click_calibration_requested = False
         batch_filter_calibration_requested = False
@@ -389,9 +648,16 @@ def get_user_input(
             forward_keywords = []
             forward_enabled = False
         backup_email = email_str
+        loaded_profile = load_calibration_profile_for_noninteractive(
+            calibration_profile_name,
+            no_batch_filter=no_batch_filter,
+            action_mode_value=action_mode,
+        )
         print()
         print(f'  关键词规则: {keyword_rule_sources() if forward_keywords else "(无，转发已禁用)"}')
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
+        if loaded_profile is not None:
+            print(f'  校准模板: {loaded_profile.profile_name}')
         print(f'  运行时间: {run_duration_seconds or "持续运行"}')
         print()
         return
@@ -423,6 +689,37 @@ def get_user_input(
         print(f'  备选邮箱: {backup_email if backup_email else "(未设置)"}')
     else:
         backup_email = ""
+
+    template_loaded = False
+    selected_profile = prompt_calibration_profile_selection()
+    if selected_profile is not None:
+        try:
+            template_loaded = load_calibration_profile_into_runtime(
+                selected_profile,
+                no_batch_filter=no_batch_filter,
+                action_mode_value=action_mode,
+            )
+            print('  校准模板区域已加载，本次将使用模板参数')
+            if no_batch_filter:
+                print('  自动筛选归位已禁用，模板筛选区域不会启用')
+        except Exception as exc:
+            print(f'  校准模板加载失败：{exc}')
+            print('  将继续使用旧手动校准流程')
+            selected_calibration_profile = None
+            template_loaded = False
+
+    if template_loaded:
+        while True:
+            duration_raw = input('\n请输入本次运行时间（秒，留空或 0 表示持续运行）:\n> ')
+            try:
+                run_duration_seconds = parse_duration_seconds(duration_raw)
+                break
+            except ValueError as exc:
+                print(f'  输入错误：{exc}')
+
+        print(f'  运行时间: {run_duration_seconds or "持续运行"}')
+        print()
+        return
 
     if forward_enabled and action_mode == ACTION_MODE_FORWARD:
         calibrate_forward = input(
@@ -1577,6 +1874,7 @@ def run():
             no_forward=no_forward_mode,
             no_batch_filter=cli_args.get('no_batch_filter', False),
             action_mode_value=cli_args.get('action_mode'),
+            calibration_profile_name=cli_args.get('calibration_profile', ''),
         )
     except ValueError as exc:
         print(f'[错误] {exc}')
