@@ -17,17 +17,20 @@ class BrowserPrepareTests(unittest.TestCase):
         argv = ["simple_brush.py", "--preflight-only", *extra_args]
         module_actions = (
             "get_user_input",
+            "prompt_action_mode",
             "initialize_ocr",
             "click_first_candidate",
             "apply_batch_filter_and_open_first_candidate",
             "ensure_batch_filter_regions_calibrated",
             "ensure_focus_restore_region_calibrated",
             "ensure_forward_click_regions_calibrated",
+            "ensure_favorite_button_region_calibrated",
             "ensure_ocr_region_calibrated",
             "view_candidate",
             "next_candidate",
             "refresh_page",
             "forward_one_candidate",
+            "perform_favorite_action",
             "select_screen_region",
             "save_region_preview",
             "MSSScreenCapture",
@@ -148,6 +151,8 @@ class BrowserPrepareTests(unittest.TestCase):
                 "--no-forward",
                 "--no-batch-filter",
                 "--simple-mouse",
+                "--action-mode",
+                "favorite",
             ),
         )
         rendered = "\n".join(
@@ -201,6 +206,47 @@ class BrowserPrepareTests(unittest.TestCase):
 
         coordinate.assert_not_called()
 
+    def test_special_mac_modes_bypass_action_mode_business_actions(self):
+        special_modes = (
+            ("preflight_only", "run_preflight_only"),
+            ("coordinate_diagnostics_only", "run_coordinate_diagnostics_only"),
+            ("mac_safe_browse_only", "run_mac_safe_browse_only"),
+            ("mac_forward_ui_smoke_only", "run_mac_forward_ui_smoke_only"),
+        )
+        for flag, handler_name in special_modes:
+            with self.subTest(flag=flag), ExitStack() as stack:
+                cli_args = {flag: True, "action_mode": "favorite"}
+                stack.enter_context(
+                    patch.object(simple_brush, "parse_args", return_value=cli_args)
+                )
+                handler = stack.enter_context(
+                    patch.object(simple_brush, handler_name, return_value=0)
+                )
+                blocked = {
+                    name: stack.enter_context(patch.object(simple_brush, name))
+                    for name in (
+                        "get_user_input",
+                        "prompt_action_mode",
+                        "initialize_ocr",
+                        "ensure_favorite_button_region_calibrated",
+                        "perform_favorite_action",
+                        "forward_one_candidate",
+                        "view_candidate",
+                        "prepare_browser",
+                    )
+                }
+                listener_start = stack.enter_context(
+                    patch.object(simple_brush.listener, "start")
+                )
+
+                self.assertEqual(simple_brush.run(), 0)
+
+            handler.assert_called_once_with(cli_args)
+            for name, mocked in blocked.items():
+                with self.subTest(flag=flag, blocked_action=name):
+                    mocked.assert_not_called()
+            listener_start.assert_not_called()
+
     def test_preflight_only_prints_page_diagnostics_and_still_exits(self):
         result = simple_brush.BrowserPrepareResult(
             ready=False,
@@ -235,17 +281,20 @@ class BrowserPrepareTests(unittest.TestCase):
             "prepare_browser",
             "run_preflight_only",
             "get_user_input",
+            "prompt_action_mode",
             "initialize_ocr",
             "click_first_candidate",
             "apply_batch_filter_and_open_first_candidate",
             "ensure_batch_filter_regions_calibrated",
             "ensure_focus_restore_region_calibrated",
             "ensure_forward_click_regions_calibrated",
+            "ensure_favorite_button_region_calibrated",
             "ensure_ocr_region_calibrated",
             "view_candidate",
             "next_candidate",
             "refresh_page",
             "forward_one_candidate",
+            "perform_favorite_action",
             "select_screen_region",
             "save_region_preview",
             "MSSScreenCapture",

@@ -6,7 +6,57 @@ BossOCR 是一个面向 Windows 的 BOSS 直聘候选人简历辅助浏览工具
 
 > 使用前请确认你的操作符合 BOSS 直聘服务条款、招聘合规要求和个人信息保护规定。程序包含真实鼠标/键盘自动化，必须先在 `--no-forward` 安全模式下验证。
 
-macOS Chrome 目前仅提供浏览器启动与权限诊断 baseline，**不是完整业务可用版**。请参阅 [macOS Chrome preflight 与人工验收指南](docs/macos-chrome-preflight.md)。
+macOS Chrome 的 `action_mode favorite/forward` 已完成代码层与 mock 回归，但完整 BOSS 页面业务链路仍须完成 Mac 人工冒烟，尚不等同于发布可用。权限诊断请参阅 [macOS Chrome preflight 与人工验收指南](docs/macos-chrome-preflight.md)。
+
+## macOS Chrome：收藏 / 转发 action_mode（代码层通过，待人工冒烟）
+
+### 交互模式
+
+进入普通交互流程后，程序会在输入关键词规则之前要求选择候选人处理模式：
+
+```text
+1 = 收藏模式
+2 = 转发模式
+```
+
+交互模式没有默认值，必须输入 `1` 或 `2`；非法输入会要求重新输入。
+
+- 收藏模式：关键词二次确认命中后点击收藏按钮，不询问邮箱，也不走邮件转发流程。
+- 转发模式：保留原有邮箱输入、转发区域校准和邮件转发流程，不点击收藏按钮。
+
+### CLI / 非交互模式
+
+可显式指定处理模式：
+
+```bash
+python simple_brush.py --keywords '"Python"' --action-mode favorite --auto
+python simple_brush.py --keywords '"Python"' --action-mode forward --no-forward --auto
+```
+
+- `--action-mode favorite`：关键词命中后执行收藏。
+- `--action-mode forward`：关键词命中后执行原有转发流程。
+- 旧的非交互脚本未传 `--action-mode` 时默认 `forward`，以兼容原有行为。
+- `--no-forward` 只影响 `forward` 模式：它会保留 OCR 检测但安全跳过邮件转发；不会阻止 `favorite` 模式收藏。
+- `--auto` 会跳过普通交互输入；但 favorite 仍会在首位详情页打开后要求校准收藏按钮区域，取消或失败会安全退出而不会盲点。
+
+### 收藏模式的 Mac 行为
+
+```text
+选择 favorite
+→ 输入关键词
+→ 打开首位候选人详情页
+→ 校准收藏按钮区域
+→ 关键词命中后点击收藏
+→ sleep 0.5 秒
+→ 候选人详情页安全区点击两次恢复焦点
+→ 继续下一位
+```
+
+收藏按钮区域仅为运行期校准，不写入 JSON 或其他配置文件；重启程序、移动 Chrome 窗口、改变窗口大小、显示器或浏览器缩放后，都需要重新校准。macOS Retina 与多显示器坐标仍需在目标机器上实机确认。
+
+运行前请确认 macOS 已向终端或打包应用授予辅助功能、屏幕录制和输入监控权限（如系统要求），Chrome 已打开 BOSS 页面，并在运行期间保持 Chrome 窗口位置、大小和缩放稳定。
+
+本功能不删除转发模式，不重构 `forward_one_candidate()`；也不包含收藏按钮 OCR 自动识别、收藏状态识别、JSON 持久化、DOM / JavaScript / 浏览器注入、OCR 主流程调整、“最近没看过”筛选调整，或 WindMouse / HumanMouseMotion 参数调整。
 
 ## 下载与运行
 
@@ -271,14 +321,15 @@ BossOCR.exe --keywords 'any("Python","剪映") and not any("销售","投放")' -
 | --- | --- |
 | `--keywords` | 关键词规则；支持 `any(...)`、`not`、`and`、`or`，多条规则用英文分号分隔 |
 | `--email` | 最近联系人没有邮箱时使用的备用邮箱 |
-| `--no-forward` | 完整执行 OCR，但禁止真实邮件转发 |
+| `--action-mode favorite\|forward` | 非交互候选人动作模式；省略时默认 `forward` |
+| `--no-forward` | 仅在 `forward` 模式下完整执行 OCR 但禁止真实邮件转发；不阻止 `favorite` 模式收藏 |
 | `--no-batch-filter` | 禁用“最近没看过”自动筛选归位，不询问或框选，使用旧首位坐标流程 |
 | `--simple-mouse` | 区域点击使用旧版简单直线鼠标移动；不改变点击目标和业务流程 |
 | `--duration-seconds` | 本次运行秒数；省略或设为 `0` 表示持续运行 |
 | `--auto` | 跳过交互输入、自动筛选归位校准和全部转发区域校准，不执行校准导航，使用命令行参数及旧首位/默认区域 |
 
-不提供关键词时，OCR 和自动转发均禁用，只执行候选人浏览。
-普通交互模式无论是否提供关键词，都可选择校准自动筛选归位；有关键词时还会询问是否校准完整转发点击区域，无关键词时不询问转发校准。使用 `--auto` 时可通过 `--duration-seconds 3600` 设置自动停止时间；非法值会阻止程序启动。
+不提供关键词时，OCR、收藏和自动转发均禁用，只执行候选人浏览。
+普通交互模式无论是否提供关键词，都可选择校准自动筛选归位；有关键词且选择转发模式时，还会询问是否校准完整转发点击区域。收藏模式不询问邮箱或转发区域校准。使用 `--auto` 时可通过 `--duration-seconds 3600` 设置自动停止时间；非法值会阻止程序启动。
 
 关键词规则示例：
 
@@ -381,7 +432,7 @@ logs/ocr_hits/
 - 自动筛选不读取按钮文字、不检测筛选是否生效，也不判断列表或详情页是否加载完成；慢网络、空列表、骨架屏或页面布局异常可能导致安全停止或误点。
 - 校准结束时通过 Esc 最佳努力关闭筛选面板；Esc 能否在当前 BOSS 页面稳定关闭面板，以及筛选确定后首位卡片是否仍位于校准区域，需要在实际页面人工确认。
 - 跳过、取消或校准失败时会回退到现有默认坐标区域；默认值基于 1920×1080 Windows Edge 布局，其他布局必须先人工验证。
-- 完整业务流程仍仅支持 Windows + Microsoft Edge；macOS Chrome 当前仅支持 [preflight baseline](docs/macos-chrome-preflight.md)，不会进入业务循环。
+- macOS Chrome 的 action_mode 代码路径已完成 mock 回归，但真实 BOSS 页面业务链路仍必须完成本 README 所列人工冒烟；在此之前不应视为发布就绪。Windows + Microsoft Edge 仍是已发布的完整业务流程。
 - EXE 当前未进行商业代码签名。
 - 自动化工具不能替代人工招聘判断；正式启用前应使用 `--no-forward` 人工核对足够样本。
 
