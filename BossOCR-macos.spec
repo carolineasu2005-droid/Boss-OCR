@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 
 datas = []
@@ -11,7 +11,12 @@ hiddenimports = [
     "tkinter.filedialog",
     "pynput.keyboard._darwin",
     "pynput.mouse._darwin",
+    "windmouse.core",
+    "windmouse.pyautogui_controller",
 ]
+
+# Preserve GPL-3.0-only metadata/license without collecting the unused AHK backend.
+datas += copy_metadata("windmouse")
 
 # RapidOCR includes ONNX model data, while several runtime dependencies load
 # platform backends or plugins dynamically. Keep this list macOS-specific so
@@ -81,4 +86,3 @@ coll = COLLECT(
     upx_exclude=[],
     name="BossOCR",
 )
-

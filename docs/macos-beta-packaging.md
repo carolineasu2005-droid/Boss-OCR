@@ -26,6 +26,12 @@ source .venv/bin/activate
 等 OCR/截图运行依赖。打包脚本只检查依赖，不会静默安装，也不会修改全局
 Python 环境。
 
+`requirements.txt` 固定包含 `windmouse==1.0.2`。Mac beta 仅使用其 PyAutoGUI
+backend；不安装或显式收集 AutoHotkey backend。打包会保留
+`windmouse-1.0.2.dist-info` 及 `licenses/LICENSE`（GPL-3.0-only）。WindMouse
+项目为 <https://github.com/AsfhtgkDavid/windmouse>；本仓库仅通过 PyPI 引用，
+不复制或修改其源码。正式分发前须确认发布方式满足 GPL-3.0-only 的义务。
+
 ## 构建 onedir beta
 
 在仓库根目录运行：
@@ -87,4 +93,3 @@ xattr -dr com.apple.quarantine dist/BossOCR
 Mac 上运行时，应先检查权限和显示器环境，再执行单候选人或很小批量验收。
 不要直接用于生产批量运行；如出现页面、坐标、截图、OCR 或权限状态异常，应
 立即停止，而不是继续尝试输入动作。
-

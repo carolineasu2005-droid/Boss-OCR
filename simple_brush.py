@@ -56,6 +56,7 @@ else:
 
 import pyautogui
 from pynput import keyboard
+import mouse_motion
 
 from ocr_calibration import (
     CalibrationCancelled,
@@ -5416,21 +5417,8 @@ def human_delay(min_s=FORWARD_MIN_DELAY, max_s=FORWARD_MAX_DELAY):
     return safe_wait(delay)
 
 
-def human_move_to(x, y, *, simple=None):
-    """Move the pointer to an exact target along one observable path."""
-    target_x = int(round(x))
-    target_y = int(round(y))
-
-    if simple is None:
-        simple = simple_mouse_enabled
-    if simple:
-        pyautogui.moveTo(
-            target_x,
-            target_y,
-            duration=random.uniform(0.15, 0.35),
-        )
-        return
-
+def _bezier_human_move_to(target_x, target_y):
+    """Existing observable path, retained as the WindMouse failure fallback."""
     start = pyautogui.position()
     start_x = float(start[0])
     start_y = float(start[1])
@@ -5530,7 +5518,23 @@ def human_move_to(x, y, *, simple=None):
     pyautogui.moveTo(target_x, target_y, duration=0)
 
 
-def human_click(x, y, offset=FORWARD_CLICK_OFFSET):
+def human_move_to(x, y, *, simple=None, region_size=None):
+    """Move to an exact target using simple, WindMouse, or fallback movement."""
+    target_x = int(round(x))
+    target_y = int(round(y))
+    if simple is None:
+        simple = simple_mouse_enabled
+    # This is intentionally before any WindMouse import or availability check.
+    if simple:
+        pyautogui.moveTo(target_x, target_y, duration=random.uniform(0.15, 0.35))
+        return
+    mouse_motion.move_to_target(
+        pyautogui, target_x, target_y, region_size=region_size,
+        fallback=lambda: _bezier_human_move_to(target_x, target_y), logger=logger,
+    )
+
+
+def human_click(x, y, offset=FORWARD_CLICK_OFFSET, *, region_size=None):
     """
     带随机偏移的人类化点击。
     点击位置在目标坐标的 ±offset 范围内随机抖动。
@@ -5538,11 +5542,13 @@ def human_click(x, y, offset=FORWARD_CLICK_OFFSET):
     """
     tx = x + random.randint(-offset, offset)
     ty = y + random.randint(-offset, offset)
-    human_move_to(tx, ty)
+    target_x = int(round(tx))
+    target_y = int(round(ty))
+    human_move_to(target_x, target_y, region_size=region_size)
     time.sleep(random.uniform(0.03, 0.08))
-    pyautogui.mouseDown(tx, ty)
+    pyautogui.mouseDown(target_x, target_y)
     time.sleep(random.uniform(0.05, 0.15))
-    pyautogui.mouseUp(tx, ty)
+    pyautogui.mouseUp(target_x, target_y)
 
 
 def random_point_in_region(region):
@@ -5558,7 +5564,7 @@ def random_point_in_region(region):
 def click_in_region(region):
     """Click one random point inside a region without adding a second offset."""
     x, y = random_point_in_region(region)
-    human_click(x, y, offset=0)
+    human_click(x, y, offset=0, region_size=(region.width, region.height))
 
 
 def get_clipboard_text():
@@ -6246,12 +6252,20 @@ def next_candidate():
     return safe_wait(0.5)
 
 
+def refresh_browser_shortcut():
+    """使用当前平台浏览器的刷新快捷键。"""
+    if sys.platform == 'darwin':
+        pyautogui.hotkey('command', 'r')
+    else:
+        pyautogui.press('f5')
+
+
 def refresh_page():
-    """按 F5 刷新页面"""
+    """刷新页面并保留原有等待/返回语义。"""
     if stop_event:
         return False
-    logger.info('🔄 已查看 100 位，按 F5 刷新页面')
-    pyautogui.press('f5')
+    logger.info('🔄 已查看 100 位，刷新页面')
+    refresh_browser_shortcut()
     return safe_wait(REFRESH_WAIT_SECONDS)
 
 

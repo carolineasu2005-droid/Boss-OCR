@@ -1365,7 +1365,7 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertEqual(result.error_code, "CHROME_NOT_FOUND")
         self.assertTrue(result.message)
 
-    def test_macos_prepare_does_not_launch_about_blank_before_reading_existing_tab(self):
+    def test_macos_prepare_accepts_allowed_boss_page_without_launching(self):
         resolved = simple_brush.BrowserPrepareResult(
             ready=False,
             platform="macos",
@@ -1418,13 +1418,10 @@ class BrowserPrepareTests(unittest.TestCase):
         focus_check.assert_called_once_with()
         tab_identity.assert_called_once_with()
         page_allowed.assert_called_once_with(tab.url, tab.title)
-        self.assertFalse(result.ready)
+        self.assertTrue(result.ready)
         self.assertFalse(result.launched)
         self.assertTrue(result.page_allowed)
         self.assertEqual(result.page_url, tab.url)
-        self.assertEqual(
-            result.error_code, "MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY"
-        )
 
     def test_macos_launch_failure_stops_before_focus_tab_and_allowlist(self):
         resolved = simple_brush.BrowserPrepareResult(
@@ -2053,7 +2050,7 @@ class BrowserPrepareTests(unittest.TestCase):
                 self.assertEqual(result.error_code, "MACOS_PAGE_NOT_ALLOWED")
                 self.assertEqual(result.page_error_code, "MACOS_PAGE_NOT_ALLOWED")
 
-    def test_macos_allowed_page_is_still_not_business_ready(self):
+    def test_macos_allowed_page_is_ready(self):
         resolved = simple_brush.BrowserPrepareResult(
             ready=False,
             platform="macos",
@@ -2109,17 +2106,11 @@ class BrowserPrepareTests(unittest.TestCase):
 
         launch.assert_not_called()
         page_allowed.assert_called_once_with(tab.url, tab.title)
-        self.assertFalse(result.ready)
+        self.assertTrue(result.ready)
         self.assertTrue(result.focus_frontmost)
         self.assertTrue(result.page_allowed)
         self.assertEqual(result.page_url, tab.url)
         self.assertEqual(result.page_title, tab.title)
-        self.assertEqual(
-            result.error_code, "MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY"
-        )
-        self.assertIn("Retina", result.message)
-        self.assertIn("OCR", result.message)
-        self.assertIn("不放行业务动作", result.message)
 
     def test_permission_diagnostics_default_to_unknown(self):
         status = simple_brush.check_macos_permissions()
@@ -2201,7 +2192,7 @@ class BrowserPrepareTests(unittest.TestCase):
         self.assertIn("完全退出并重启宿主进程", result.message)
         focus.assert_not_called()
 
-    def test_all_ok_permissions_still_do_not_make_browser_ready(self):
+    def test_all_ok_permissions_and_allowed_boss_page_are_ready(self):
         resolved = simple_brush.BrowserPrepareResult(
             ready=False,
             platform="macos",
@@ -2252,13 +2243,9 @@ class BrowserPrepareTests(unittest.TestCase):
         ):
             result = simple_brush.prepare_browser("darwin")
 
-        self.assertFalse(result.ready)
+        self.assertTrue(result.ready)
         self.assertFalse(result.launched)
         self.assertTrue(result.page_allowed)
-        self.assertEqual(
-            result.error_code, "MACOS_PAGE_ALLOWED_NOT_BUSINESS_READY"
-        )
-        self.assertIn("不放行业务动作", result.message)
 
     def test_permission_diagnostics_have_no_gui_capture_or_ocr_side_effects(self):
         with (

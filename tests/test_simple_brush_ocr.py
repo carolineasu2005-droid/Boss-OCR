@@ -155,7 +155,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 call(simple_brush.forward_click_regions.forward_button),
             ],
         )
-        self.assertEqual(hotkey.call_args_list, [call("ctrl", "a"), call("ctrl", "c")])
+        self.assertEqual(hotkey.call_args_list, [call("command", "a"), call("command", "c")])
         self.assert_focus_restored_twice(click, choose_point)
 
     def test_forward_uses_calibrated_regions_and_reuses_input_box_region(self):
@@ -198,7 +198,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         )
         self.assertEqual(
             hotkey.call_args_list,
-            [call("ctrl", "a"), call("ctrl", "c"), call("ctrl", "a")],
+            [call("command", "a"), call("command", "c"), call("command", "a")],
         )
         press.assert_called_once_with("delete")
         self.assert_focus_restored_twice(click, choose_point)
@@ -246,7 +246,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 call(simple_brush.forward_click_regions.input_box),
             ],
         )
-        self.assertEqual(hotkey.call_args_list, [call("ctrl", "a"), call("ctrl", "c")])
+        self.assertEqual(hotkey.call_args_list, [call("command", "a"), call("command", "c")])
         press.assert_called_once_with("esc")
         self.assert_focus_restored_twice(click, choose_point)
 
@@ -315,7 +315,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertEqual(region_click.call_count, 5)
         self.assertEqual(
             hotkey.call_args_list,
-            [call("ctrl", "a"), call("ctrl", "c")],
+            [call("command", "a"), call("command", "c")],
         )
         self.assertEqual(
             choose_point.call_args_list,
@@ -411,7 +411,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         ):
             simple_brush.click_in_region(region)
         choose_point.assert_called_once_with(region)
-        click.assert_called_once_with(12, 24, offset=0)
+        click.assert_called_once_with(12, 24, offset=0, region_size=(5, 6))
 
     def test_reset_forward_click_calibration_restores_defaults(self):
         simple_brush.forward_click_regions = simple_brush.ForwardClickRegions(
@@ -2098,6 +2098,58 @@ class SimpleBrushOCRTests(unittest.TestCase):
         click.assert_not_called()
         press.assert_not_called()
         scroll.assert_not_called()
+
+    def test_refresh_page_uses_command_r_on_macos(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush, "safe_wait", return_value=True) as wait,
+        ):
+            self.assertTrue(simple_brush.refresh_page())
+
+        hotkey.assert_called_once_with("command", "r")
+        press.assert_not_called()
+        wait.assert_called_once_with(simple_brush.REFRESH_WAIT_SECONDS)
+
+    def test_refresh_page_does_not_press_f5_on_macos(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "darwin"),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush, "safe_wait", return_value=False) as wait,
+        ):
+            self.assertFalse(simple_brush.refresh_page())
+
+        hotkey.assert_called_once_with("command", "r")
+        press.assert_not_called()
+        wait.assert_called_once_with(simple_brush.REFRESH_WAIT_SECONDS)
+
+    def test_refresh_page_keeps_f5_on_windows(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "win32"),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush, "safe_wait", return_value=True) as wait,
+        ):
+            self.assertTrue(simple_brush.refresh_page())
+
+        press.assert_called_once_with("f5")
+        hotkey.assert_not_called()
+        wait.assert_called_once_with(simple_brush.REFRESH_WAIT_SECONDS)
+
+    def test_refresh_page_does_not_use_command_r_on_windows(self):
+        with (
+            patch.object(simple_brush.sys, "platform", "win32"),
+            patch.object(simple_brush.pyautogui, "hotkey") as hotkey,
+            patch.object(simple_brush.pyautogui, "press") as press,
+            patch.object(simple_brush, "safe_wait", return_value=False) as wait,
+        ):
+            self.assertFalse(simple_brush.refresh_page())
+
+        press.assert_called_once_with("f5")
+        hotkey.assert_not_called()
+        wait.assert_called_once_with(simple_brush.REFRESH_WAIT_SECONDS)
 
     def test_ocr_time_is_deducted_from_stay_budget(self):
         self.assertEqual(simple_brush.remaining_stay_seconds(12.0, 100.0, 107.5), 4.5)

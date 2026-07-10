@@ -57,6 +57,7 @@ REQUIRED_MODULES=(
     cv2
     numpy
     PIL
+    windmouse
 )
 
 MISSING_MODULES=()
@@ -105,4 +106,3 @@ echo "  辅助功能、屏幕录制、输入监控"
 echo
 echo "本产物未签名、未公证。GitHub 下载后可能需要右键打开，"
 echo "或在确认来源可信后解除 quarantine 属性。"
-
