@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 from pathlib import Path
 import unittest
@@ -178,6 +179,21 @@ class CalibrationProfileTests(unittest.TestCase):
             )
             self.assertEqual(overwritten, path)
 
+    def test_default_profile_dir_remains_cwd_relative_and_creatable(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                self.assertEqual(
+                    calibration_profiles.profile_path("main"),
+                    Path("calibration_profiles/main.json"),
+                )
+                directory = calibration_profiles.ensure_profile_dir()
+                self.assertEqual(directory, Path("calibration_profiles"))
+                self.assertTrue((Path(tmp) / directory).is_dir())
+            finally:
+                os.chdir(original_cwd)
+
     def test_load_profile_reads_saved_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -273,6 +289,23 @@ class CalibrationProfileTests(unittest.TestCase):
         self.assertTrue(match.matches)
         self.assertIn("dpi_scale", match.warnings[0])
 
+    def test_compare_system_info_rejects_missing_dpi_on_only_one_side(self):
+        match = calibration_profiles.compare_system_info(
+            sample_system_info(os="Darwin", dpi_scale=None),
+            sample_system_info(os="Darwin", dpi_scale=2.0),
+        )
+        self.assertFalse(match.matches)
+        self.assertEqual(match.mismatches["dpi_scale"], (None, 2.0))
+
+    def test_compare_system_info_rejects_os_and_resolution_mismatches(self):
+        match = calibration_profiles.compare_system_info(
+            sample_system_info(os="Darwin", screen_width=1728),
+            sample_system_info(os="Windows", screen_width=1920),
+        )
+        self.assertFalse(match.matches)
+        self.assertEqual(match.mismatches["os"], ("Darwin", "Windows"))
+        self.assertEqual(match.mismatches["screen_width"], (1728, 1920))
+
     def test_get_system_info_uses_primary_monitor_and_platform(self):
         with (
             patch.object(calibration_profiles.platform, "system", return_value="Windows"),
@@ -292,6 +325,37 @@ class CalibrationProfileTests(unittest.TestCase):
                     "dpi_scale": 1.25,
                 },
             )
+
+    def test_get_system_info_on_darwin_keeps_monitor_size_and_null_dpi(self):
+        with (
+            patch.object(calibration_profiles.platform, "system", return_value="Darwin"),
+            patch.object(
+                calibration_profiles,
+                "primary_monitor_region",
+                return_value=ScreenRegion(left=0, top=0, width=1728, height=1117),
+            ),
+        ):
+            self.assertEqual(
+                calibration_profiles.get_system_info(),
+                {
+                    "os": "Darwin",
+                    "screen_width": 1728,
+                    "screen_height": 1117,
+                    "dpi_scale": None,
+                },
+            )
+
+    def test_profile_json_serializes_missing_dpi_as_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = calibration_profiles.build_profile(
+                "darwin",
+                sample_areas(),
+                system_info=sample_system_info(os="Darwin", dpi_scale=None),
+                created_at="2026-07-10T00:00:00",
+            )
+            path = calibration_profiles.save_profile(profile, base_dir=Path(tmp))
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIsNone(saved["system_info"]["dpi_scale"])
 
 
 if __name__ == "__main__":
