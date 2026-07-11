@@ -62,6 +62,49 @@ dist/BossOCR/BossOCR
 分发时必须保留整个 `dist/BossOCR` 目录，不能只复制同名可执行文件；onedir
 目录中的 Python、OCR 模型、动态库和其他依赖都是运行所需内容。
 
+无参数启动唯一入口后会显示：
+
+```text
+1. 开始运行 BossOCR
+2. 创建/更新校准模板
+3. 退出
+```
+
+模板创建继续复用主程序静态导入的 `calibration_template.py`，不会启动第二个
+程序。构建脚本会在 PyInstaller 完成后验证：
+
+- `calibration_profiles`、`calibration_steps`、`calibration_template` 均已进入
+  PYZ 模块清单；
+- onedir 顶层只有 `dist/BossOCR/BossOCR` 一个可执行入口；
+- 没有生成 `.app`；
+- 没有把 `calibration_profiles/*.json` 用户模板打入产物。
+
+## 校准模板路径验证
+
+当前模板目录合同仍是：
+
+```python
+PROFILE_DIR = Path("calibration_profiles")
+```
+
+因此模板目录相对于进程启动时的当前工作目录，而不是相对于源码或可执行文件。
+本次 onedir 验证得到：
+
+| 启动方式 | 实际模板目录 |
+| --- | --- |
+| 仓库根目录启动源码 | `$PROJECT_ROOT/calibration_profiles` |
+| 其他 CWD 启动源码 | `$OTHER_CWD/calibration_profiles` |
+| 在 onedir 目录内启动 | `$PROJECT_ROOT/dist/BossOCR/calibration_profiles` |
+| 从其他 CWD 启动 onedir | `$OTHER_CWD/calibration_profiles` |
+
+这证明移动 CWD 会改变模板读写位置。本次不切换到 Application Support，不添加
+双路径搜索或迁移层，也不改变 Windows 当前相对路径合同。
+
+待人工确认的最小方案是：只在 macOS frozen 运行时，让单一模板目录解析函数把
+相对目录锚定到 `Path(sys.executable).resolve().parent / "calibration_profiles"`；
+源码运行和 Windows 默认值继续保持当前合同。该方案会让 onedir 内模板位置稳定，
+但目标目录是否始终可写仍需确认，因此本 Change 不实施。
+
 ## 另一台 Mac 的首次运行与权限
 
 macOS 隐私权限不会随打包产物复制。另一台 Mac 必须给实际运行主体重新授予：

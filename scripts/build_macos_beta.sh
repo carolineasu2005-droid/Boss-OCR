@@ -9,6 +9,7 @@ BUILD_DIR="${PROJECT_ROOT}/build/macos"
 DIST_DIR="${PROJECT_ROOT}/dist"
 OUTPUT_DIR="${DIST_DIR}/BossOCR"
 OUTPUT_BIN="${OUTPUT_DIR}/BossOCR"
+PYZ_TOC="${BUILD_DIR}/BossOCR-macos/PYZ-00.toc"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "ERROR: macOS beta packaging 只能在 macOS (Darwin) 上运行。" >&2
@@ -96,8 +97,50 @@ if [[ ! -x "${OUTPUT_BIN}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${PYZ_TOC}" ]]; then
+    echo "ERROR: 找不到 PyInstaller PYZ 清单: ${PYZ_TOC}" >&2
+    exit 1
+fi
+
+REQUIRED_TEMPLATE_MODULES=(
+    calibration_profiles
+    calibration_steps
+    calibration_template
+)
+for module_name in "${REQUIRED_TEMPLATE_MODULES[@]}"; do
+    if ! grep -Fq "('${module_name}'," "${PYZ_TOC}"; then
+        echo "ERROR: onedir 未收集模板模块: ${module_name}" >&2
+        exit 1
+    fi
+done
+
+TOP_LEVEL_EXECUTABLES=()
+while IFS= read -r executable_path; do
+    TOP_LEVEL_EXECUTABLES+=("${executable_path}")
+done < <(find "${OUTPUT_DIR}" -maxdepth 1 -type f -perm -111 -print)
+
+if (( ${#TOP_LEVEL_EXECUTABLES[@]} != 1 )) || \
+   [[ "${TOP_LEVEL_EXECUTABLES[0]:-}" != "${OUTPUT_BIN}" ]]; then
+    echo "ERROR: onedir 顶层正式入口必须且只能是 ${OUTPUT_BIN}" >&2
+    printf '检测到的顶层可执行文件: %s\n' "${TOP_LEVEL_EXECUTABLES[*]:-(无)}" >&2
+    exit 1
+fi
+
+if find "${OUTPUT_DIR}" -type d -name '*.app' -print -quit | grep -q .; then
+    echo "ERROR: onedir 中不应生成第二个 .app 入口。" >&2
+    exit 1
+fi
+
+if find "${OUTPUT_DIR}" -path '*/calibration_profiles/*.json' -print -quit | grep -q .; then
+    echo "ERROR: onedir 中不应包含用户校准模板 JSON。" >&2
+    exit 1
+fi
+
 echo
 echo "macOS beta onedir build completed."
+echo "Verified template modules: ${REQUIRED_TEMPLATE_MODULES[*]}"
+echo "Verified single entry: ${OUTPUT_BIN}"
+echo "Verified no .app and no calibration profile JSON in onedir."
 echo "Run from Terminal:"
 echo "  dist/BossOCR/BossOCR"
 echo
