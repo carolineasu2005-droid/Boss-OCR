@@ -8,6 +8,7 @@ venv/
 
 # Runtime data (may contain candidate information)
 logs/
+calibration_profiles/*.json
 
 # Editors and operating systems
 .idea/
@@ -21,6 +22,10 @@ logs/
 !Issue-Mac-3-chrome-window-focus-page-identity-TID-V1.0.md
 !docs/
 !docs/*.md
+!Issue-Next-7-windmouse-observable-motion-acceptance-report.md
+!Issue-calibration-template-module-acceptance-report.md
+!docs/TID-Windows-WindMouse-Observable-Motion.md
+!docs/calibration-template-smoke-test.md
 !release-notes/
 !release-notes/*.md
 !Issue-Mac-4-retina-coordinate-screenshot-tk-consistency-acceptance-report.md
