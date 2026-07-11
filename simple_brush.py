@@ -59,6 +59,7 @@ else:
 import pyautogui
 from pynput import keyboard
 import mouse_motion
+import calibration_template
 
 from ocr_calibration import (
     CalibrationCancelled,
@@ -364,6 +365,113 @@ def parse_args():
             '--coordinate-diagnostics-only 不能与 --preflight-only 同时使用'
         )
     return args
+
+
+STARTUP_MENU_RUN = 'run'
+STARTUP_MENU_EXIT = 'exit'
+
+MAC_STARTUP_MENU_BYPASS_FLAGS = (
+    'preflight_only',
+    'coordinate_diagnostics_only',
+    'mac_safe_browse_only',
+    'mac_safe_browse_calibrate_only',
+    'mac_safe_browse_calibrate_and_dry_run',
+    'mac_safe_browse_real_capture_once',
+    'mac_safe_browse_open_candidate_once',
+    'mac_forward_ui_smoke_only',
+    'mac_single_candidate_forward_smoke',
+    'allow_invalid_forward_submit_smoke',
+    'allow_test_forward_submit',
+)
+
+
+def _has_mac_startup_menu_bypass_argument(args):
+    """Return whether any existing Mac-specific CLI argument was supplied."""
+    if any(bool(args.get(name, False)) for name in MAC_STARTUP_MENU_BYPASS_FLAGS):
+        return True
+    if str(args.get('forwarding_email', '') or '').strip():
+        return True
+    return any(
+        args.get(name) is not None
+        for name in ('max_candidates', 'max_runtime_minutes')
+    )
+
+
+def should_show_startup_menu(args):
+    """Return whether this invocation should show the interactive main menu."""
+    if _has_mac_startup_menu_bypass_argument(args):
+        return False
+    if bool(args.get('auto', False)):
+        return False
+    if str(args.get('keywords', '') or '').strip():
+        return False
+    if str(args.get('calibration_profile', '') or '').strip():
+        return False
+    return True
+
+
+def is_fully_noninteractive(args):
+    """Preserve the existing rule for skipping all ordinary input prompts."""
+    return bool(
+        args.get('auto', False)
+        or str(args.get('keywords', '') or '').strip()
+    )
+
+
+def run_calibration_template_from_menu(*, input_func=None, output=None):
+    """Run the reusable template creator and contain every result in the menu."""
+    if input_func is None:
+        input_func = input
+    if output is None:
+        output = sys.stdout
+
+    try:
+        result = calibration_template.create_calibration_profile_interactive(
+            input_func=input_func,
+            output=output,
+        )
+    except Exception as exc:
+        print(f'校准模板创建失败：{exc}', file=output)
+        print('已返回 BossOCR 主菜单。', file=output)
+        return calibration_template.EXIT_ERROR
+
+    if result == calibration_template.EXIT_SUCCESS:
+        print('校准模板创建/更新完成，已返回 BossOCR 主菜单。', file=output)
+    elif result in (
+        calibration_template.EXIT_CANCELLED,
+        calibration_template.EXIT_NOT_OVERWRITTEN,
+    ):
+        print('校准模板创建已取消或未保存，已返回 BossOCR 主菜单。', file=output)
+    else:
+        print('校准模板创建失败，已返回 BossOCR 主菜单。', file=output)
+    return result
+
+
+def prompt_startup_menu(*, input_func=None, output=None):
+    """Show the only BossOCR startup menu until run or exit is selected."""
+    if input_func is None:
+        input_func = input
+    if output is None:
+        output = sys.stdout
+
+    while True:
+        print('', file=output)
+        print('1. 开始运行 BossOCR', file=output)
+        print('2. 创建/更新校准模板', file=output)
+        print('3. 退出', file=output)
+        choice = input_func('请选择操作：\n> ').strip()
+
+        if choice == '1':
+            return STARTUP_MENU_RUN
+        if choice == '2':
+            run_calibration_template_from_menu(
+                input_func=input_func,
+                output=output,
+            )
+            continue
+        if choice == '3':
+            return STARTUP_MENU_EXIT
+        print('输入无效，请输入 1、2 或 3。', file=output)
 
 # 修复 Windows 终端 UTF-8 输出
 try:
@@ -4007,22 +4115,33 @@ def get_user_input(
         backup_email = ""
 
     template_loaded = False
-    selected_profile = prompt_calibration_profile_selection()
-    if selected_profile is not None:
-        try:
-            template_loaded = load_calibration_profile_into_runtime(
-                selected_profile,
-                no_batch_filter=no_batch_filter,
-                action_mode_value=action_mode,
-            )
-            print('  校准模板区域已加载，本次将使用模板参数')
-            if no_batch_filter:
-                print('  自动筛选归位已禁用，模板筛选区域不会启用')
-        except Exception as exc:
-            print(f'  校准模板加载失败：{exc}')
-            print('  将继续使用旧手动校准流程')
-            selected_calibration_profile = None
-            template_loaded = False
+    explicit_profile_name = str(calibration_profile_name or '').strip()
+    if explicit_profile_name:
+        selected_profile = load_calibration_profile_for_noninteractive(
+            explicit_profile_name,
+            no_batch_filter=no_batch_filter,
+            action_mode_value=action_mode,
+        )
+        template_loaded = selected_profile is not None
+    else:
+        selected_profile = prompt_calibration_profile_selection()
+        if selected_profile is not None:
+            try:
+                template_loaded = load_calibration_profile_into_runtime(
+                    selected_profile,
+                    no_batch_filter=no_batch_filter,
+                    action_mode_value=action_mode,
+                )
+            except Exception as exc:
+                print(f'  校准模板加载失败：{exc}')
+                print('  将继续使用旧手动校准流程')
+                selected_calibration_profile = None
+                template_loaded = False
+
+    if template_loaded:
+        print('  校准模板区域已加载，本次将使用模板参数')
+        if no_batch_filter:
+            print('  自动筛选归位已禁用，模板筛选区域不会启用')
 
     if template_loaded:
         while True:
@@ -6792,10 +6911,11 @@ def refresh_page():
 
 def run():
     global stop_event, forward_consecutive, no_forward_mode, simple_mouse_enabled
-    global action_mode
+    global action_mode, selected_calibration_profile
     stop_event = False
     simple_mouse_enabled = False
     action_mode = ACTION_MODE_FORWARD
+    selected_calibration_profile = None
     reset_focus_restore_calibration()
     reset_forward_click_calibration()
     reset_batch_filter_calibration()
@@ -6818,13 +6938,19 @@ def run():
             return run_coordinate_diagnostics_only(cli_args)
         if cli_args.get('preflight_only', False):
             return run_preflight_only(cli_args)
+        if should_show_startup_menu(cli_args):
+            startup_action = prompt_startup_menu()
+            if startup_action == STARTUP_MENU_EXIT:
+                return 0
+
+        fully_noninteractive = is_fully_noninteractive(cli_args)
         no_forward_mode = cli_args['no_forward']
         simple_mouse_enabled = bool(cli_args.get('simple_mouse', False))
         get_user_input(
             keywords_str=cli_args['keywords'],
             email_str=cli_args['email'],
             duration_str=cli_args['duration_seconds'],
-            auto=cli_args['auto'],
+            auto=fully_noninteractive,
             no_forward=no_forward_mode,
             no_batch_filter=cli_args.get('no_batch_filter', False),
             action_mode_value=cli_args.get('action_mode', ACTION_MODE_FORWARD),

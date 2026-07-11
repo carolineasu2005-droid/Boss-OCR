@@ -1,4 +1,5 @@
 from contextlib import ExitStack
+from io import StringIO
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
@@ -41,8 +42,296 @@ def sample_profile(*, missing=()):
     )
 
 
+class StartupMenuTests(unittest.TestCase):
+    @staticmethod
+    def args(**overrides):
+        values = {
+            "keywords": "",
+            "forwarding_email": "",
+            "action_mode": simple_brush.ACTION_MODE_FORWARD,
+            "no_forward": False,
+            "no_batch_filter": False,
+            "simple_mouse": False,
+            "duration_seconds": "",
+            "auto": False,
+            "calibration_profile": "",
+            "max_candidates": None,
+            "max_runtime_minutes": None,
+        }
+        values.update({
+            name: False
+            for name in simple_brush.MAC_STARTUP_MENU_BYPASS_FLAGS
+        })
+        values.update(overrides)
+        return values
+
+    def test_no_argument_menu_displays_all_options_and_retries_invalid_input(self):
+        output = StringIO()
+        answers = iter(["invalid", "3"])
+
+        result = simple_brush.prompt_startup_menu(
+            input_func=lambda _prompt: next(answers),
+            output=output,
+        )
+
+        self.assertEqual(result, simple_brush.STARTUP_MENU_EXIT)
+        menu_output = output.getvalue()
+        self.assertEqual(menu_output.count("1. 开始运行 BossOCR"), 2)
+        self.assertEqual(menu_output.count("2. 创建/更新校准模板"), 2)
+        self.assertEqual(menu_output.count("3. 退出"), 2)
+        self.assertIn("输入无效，请输入 1、2 或 3。", menu_output)
+
+    def test_menu_template_success_returns_to_menu(self):
+        output = StringIO()
+        answers = iter(["2", "3"])
+        with patch.object(
+            simple_brush.calibration_template,
+            "create_calibration_profile_interactive",
+            return_value=simple_brush.calibration_template.EXIT_SUCCESS,
+        ) as create:
+            result = simple_brush.prompt_startup_menu(
+                input_func=lambda _prompt: next(answers),
+                output=output,
+            )
+
+        self.assertEqual(result, simple_brush.STARTUP_MENU_EXIT)
+        create.assert_called_once()
+        self.assertIn("校准模板创建/更新完成", output.getvalue())
+        self.assertEqual(output.getvalue().count("1. 开始运行 BossOCR"), 2)
+
+    def test_menu_template_cancel_returns_to_menu(self):
+        output = StringIO()
+        answers = iter(["2", "3"])
+        with patch.object(
+            simple_brush.calibration_template,
+            "create_calibration_profile_interactive",
+            return_value=simple_brush.calibration_template.EXIT_CANCELLED,
+        ):
+            result = simple_brush.prompt_startup_menu(
+                input_func=lambda _prompt: next(answers),
+                output=output,
+            )
+
+        self.assertEqual(result, simple_brush.STARTUP_MENU_EXIT)
+        self.assertIn("已取消或未保存", output.getvalue())
+        self.assertEqual(output.getvalue().count("1. 开始运行 BossOCR"), 2)
+
+    def test_menu_template_failure_returns_to_menu(self):
+        output = StringIO()
+        answers = iter(["2", "3"])
+        with patch.object(
+            simple_brush.calibration_template,
+            "create_calibration_profile_interactive",
+            return_value=simple_brush.calibration_template.EXIT_ERROR,
+        ):
+            result = simple_brush.prompt_startup_menu(
+                input_func=lambda _prompt: next(answers),
+                output=output,
+            )
+
+        self.assertEqual(result, simple_brush.STARTUP_MENU_EXIT)
+        self.assertIn("校准模板创建失败", output.getvalue())
+        self.assertEqual(output.getvalue().count("1. 开始运行 BossOCR"), 2)
+
+    def test_menu_contains_unexpected_template_exception_and_returns(self):
+        output = StringIO()
+        answers = iter(["2", "3"])
+        with patch.object(
+            simple_brush.calibration_template,
+            "create_calibration_profile_interactive",
+            side_effect=RuntimeError("overlay failed"),
+        ):
+            result = simple_brush.prompt_startup_menu(
+                input_func=lambda _prompt: next(answers),
+                output=output,
+            )
+
+        self.assertEqual(result, simple_brush.STARTUP_MENU_EXIT)
+        self.assertIn("overlay failed", output.getvalue())
+        self.assertEqual(output.getvalue().count("1. 开始运行 BossOCR"), 2)
+
+    def test_run_choice_one_enters_original_input_once_before_runtime_setup(self):
+        events = []
+
+        def configure_input(**_kwargs):
+            events.append("input")
+            simple_brush.forward_keywords = []
+            simple_brush.forward_enabled = False
+
+        not_ready = simple_brush.BrowserPrepareResult(
+            ready=False,
+            platform="macos",
+            browser="chrome",
+            error_code="TEST_NOT_READY",
+        )
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", return_value="1") as user_input,
+            patch.object(
+                simple_brush,
+                "get_user_input",
+                side_effect=configure_input,
+            ) as get_input,
+            patch.object(
+                simple_brush.listener,
+                "start",
+                side_effect=lambda: events.append("listener"),
+            ),
+            patch.object(
+                simple_brush,
+                "prepare_browser",
+                side_effect=lambda: (events.append("browser") or not_ready),
+            ),
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(user_input.call_count, 1)
+        get_input.assert_called_once()
+        self.assertEqual(events, ["input", "listener", "browser"])
+
+    def test_run_choice_three_exits_without_ordinary_input(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", return_value="3"),
+            patch.object(simple_brush, "get_user_input") as get_input,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "prepare_browser") as prepare_browser,
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 0)
+        get_input.assert_not_called()
+        listener_start.assert_not_called()
+        prepare_browser.assert_not_called()
+
+    def test_run_template_branch_never_enters_business_flow(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", side_effect=["2", "3"]),
+            patch.object(
+                simple_brush.calibration_template,
+                "create_calibration_profile_interactive",
+                return_value=simple_brush.calibration_template.EXIT_SUCCESS,
+            ) as create,
+            patch.object(simple_brush, "get_user_input") as get_input,
+            patch.object(simple_brush, "initialize_ocr") as initialize_ocr,
+            patch.object(simple_brush.listener, "start") as listener_start,
+            patch.object(simple_brush, "prepare_browser") as prepare_browser,
+            patch.object(simple_brush, "view_candidate") as view_candidate,
+        ):
+            result = simple_brush.run()
+
+        self.assertEqual(result, 0)
+        create.assert_called_once()
+        get_input.assert_not_called()
+        initialize_ocr.assert_not_called()
+        listener_start.assert_not_called()
+        prepare_browser.assert_not_called()
+        view_candidate.assert_not_called()
+
+    def test_startup_menu_bypass_conditions_are_distinct(self):
+        self.assertTrue(simple_brush.should_show_startup_menu(self.args()))
+        for overrides in (
+            {"auto": True},
+            {"keywords": '"Python"'},
+            {"calibration_profile": "main"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(
+                    simple_brush.should_show_startup_menu(self.args(**overrides))
+                )
+
+    def test_every_existing_mac_special_cli_bypasses_menu(self):
+        for field_name in simple_brush.MAC_STARTUP_MENU_BYPASS_FLAGS:
+            with self.subTest(field_name=field_name):
+                self.assertFalse(
+                    simple_brush.should_show_startup_menu(
+                        self.args(**{field_name: True})
+                    )
+                )
+        for field_name, value in (
+            ("forwarding_email", "test@example.com"),
+            ("max_candidates", 1),
+            ("max_runtime_minutes", 1),
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertFalse(
+                    simple_brush.should_show_startup_menu(
+                        self.args(**{field_name: value})
+                    )
+                )
+
+    def test_fully_noninteractive_only_uses_existing_auto_or_keywords_rule(self):
+        self.assertTrue(
+            simple_brush.is_fully_noninteractive(self.args(auto=True))
+        )
+        self.assertTrue(
+            simple_brush.is_fully_noninteractive(
+                self.args(keywords='"Python"')
+            )
+        )
+        for overrides in (
+            {"calibration_profile": "main"},
+            {"action_mode": simple_brush.ACTION_MODE_FAVORITE},
+            {"no_forward": True},
+            {"no_batch_filter": True},
+            {"simple_mouse": True},
+            {"duration_seconds": "60"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(
+                    simple_brush.is_fully_noninteractive(self.args(**overrides))
+                )
+
+    def test_explicit_profile_alone_keeps_other_input_interactive(self):
+        profile = sample_profile()
+        with (
+            patch("builtins.input", side_effect=["1", "", ""]) as user_input,
+            patch.object(
+                simple_brush,
+                "load_calibration_profile_for_noninteractive",
+                return_value=profile,
+            ) as load_profile,
+            patch.object(
+                simple_brush,
+                "prompt_calibration_profile_selection",
+            ) as select_profile,
+        ):
+            simple_brush.get_user_input(calibration_profile_name="main")
+
+        self.assertEqual(user_input.call_count, 3)
+        load_profile.assert_called_once_with(
+            "main",
+            no_batch_filter=False,
+            action_mode_value=simple_brush.ACTION_MODE_FAVORITE,
+        )
+        select_profile.assert_not_called()
+
+    def test_no_profile_keeps_existing_interactive_template_selection(self):
+        with (
+            patch("builtins.input", side_effect=["1", "", "n", ""]) as user_input,
+            patch.object(
+                simple_brush,
+                "prompt_calibration_profile_selection",
+                return_value=None,
+            ) as select_profile,
+        ):
+            simple_brush.get_user_input()
+
+        select_profile.assert_called_once_with()
+        self.assertEqual(user_input.call_count, 4)
+
+
 class SimpleBrushOCRTests(unittest.TestCase):
     def setUp(self):
+        startup_menu_patcher = patch.object(
+            simple_brush,
+            "should_show_startup_menu",
+            return_value=False,
+        )
+        startup_menu_patcher.start()
+        self.addCleanup(startup_menu_patcher.stop)
         self.saved = {
             name: getattr(simple_brush, name)
             for name in (
@@ -1623,6 +1912,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
 
     def test_run_resets_focus_restore_calibration_state(self):
         simple_brush.action_mode = simple_brush.ACTION_MODE_FAVORITE
+        simple_brush.selected_calibration_profile = Mock(profile_name="previous")
         simple_brush.favorite_button_region = simple_brush.ScreenRegion(1, 2, 3, 4)
         simple_brush.favorite_button_calibration_attempted = True
         simple_brush.favorite_button_calibration_in_progress = True
@@ -1676,6 +1966,7 @@ class SimpleBrushOCRTests(unittest.TestCase):
         self.assertFalse(simple_brush.batch_filter_calibration_in_progress)
         self.assertFalse(simple_brush.batch_filter_enabled)
         self.assertEqual(simple_brush.action_mode, simple_brush.ACTION_MODE_FORWARD)
+        self.assertIsNone(simple_brush.selected_calibration_profile)
         self.assertIsNone(simple_brush.favorite_button_region)
         self.assertFalse(simple_brush.favorite_button_calibration_attempted)
         self.assertFalse(simple_brush.favorite_button_calibration_in_progress)

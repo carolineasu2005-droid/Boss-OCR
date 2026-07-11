@@ -2415,6 +2415,11 @@ class BrowserPrepareTests(unittest.TestCase):
                 },
             ),
             patch.object(
+                simple_brush,
+                "should_show_startup_menu",
+                return_value=False,
+            ),
+            patch.object(
                 simple_brush, "get_user_input", side_effect=configure_input
             ),
             patch.object(
