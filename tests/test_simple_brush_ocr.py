@@ -1588,6 +1588,20 @@ class SimpleBrushOCRTests(unittest.TestCase):
         )
         self.assertTrue(simple_brush.batch_filter_enabled)
 
+    def test_calibration_profile_argument_alone_does_not_prompt(self):
+        profile = sample_profile()
+        match = Mock(matches=True, mismatches={})
+
+        with (
+            patch.object(simple_brush, "load_profile", return_value=profile),
+            patch.object(simple_brush, "compare_system_info", return_value=match),
+            patch("builtins.input") as user_input,
+        ):
+            simple_brush.get_user_input(calibration_profile_name="main")
+
+        user_input.assert_not_called()
+        self.assertIs(simple_brush.selected_calibration_profile, profile)
+
     def test_noninteractive_profile_respects_no_batch_filter(self):
         profile = sample_profile()
         with (
@@ -3010,6 +3024,89 @@ class SimpleBrushOCRTests(unittest.TestCase):
                 "BOSS直聘 - 个人 - Microsoft Edge", "msedge.exe"
             )
         )
+
+
+class StartupMenuTests(unittest.TestCase):
+    def test_interactive_menu_shows_and_run_delegates_to_existing_flow(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", return_value="1") as user_input,
+            patch.object(simple_brush, "run", return_value=0) as run,
+        ):
+            self.assertEqual(simple_brush.main(), 0)
+
+        self.assertIn("开始运行 BossOCR", user_input.call_args.args[0])
+        self.assertIn("创建或更新校准模板", user_input.call_args.args[0])
+        run.assert_called_once_with()
+
+    def test_template_generator_success_returns_to_startup_menu(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", side_effect=["2", "0"]),
+            patch.object(simple_brush, "calibration_template_main", return_value=0) as calibrate,
+            patch.object(simple_brush, "run") as run,
+        ):
+            self.assertEqual(simple_brush.main(), 0)
+
+        calibrate.assert_called_once_with()
+        run.assert_not_called()
+
+    def test_template_generator_cancel_returns_to_startup_menu(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", side_effect=["2", "0"]),
+            patch.object(simple_brush, "calibration_template_main", return_value=2) as calibrate,
+        ):
+            self.assertEqual(simple_brush.main(), 0)
+        calibrate.assert_called_once_with()
+
+    def test_template_generator_exception_is_reported_then_returns_to_menu(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", side_effect=["2", "0"]),
+            patch.object(simple_brush, "calibration_template_main", side_effect=RuntimeError("boom")),
+            patch("builtins.print") as output,
+        ):
+            self.assertEqual(simple_brush.main(), 0)
+
+        self.assertTrue(
+            any("校准模板启动失败：boom" in str(call.args) for call in output.call_args_list)
+        )
+
+    def test_exit_does_not_enter_main_program(self):
+        with (
+            patch.object(simple_brush.sys, "argv", ["simple_brush.py"]),
+            patch("builtins.input", return_value="0"),
+            patch.object(simple_brush, "run") as run,
+        ):
+            self.assertEqual(simple_brush.main(), 0)
+        run.assert_not_called()
+
+    def test_invalid_startup_menu_input_reprompts(self):
+        with (
+            patch("builtins.input", side_effect=["bad", "0"]) as user_input,
+            patch("builtins.print") as output,
+        ):
+            self.assertEqual(simple_brush.choose_startup_action(), "exit")
+        self.assertEqual(user_input.call_count, 2)
+        output.assert_called_once_with("  输入无效，请输入 1、2 或 0。")
+
+    def test_noninteractive_options_bypass_startup_menu(self):
+        cases = (
+            ["simple_brush.py", "--auto"],
+            ["simple_brush.py", "--keywords", '"Python"'],
+            ["simple_brush.py", "--calibration-profile", "main"],
+        )
+        for argv in cases:
+            with (
+                self.subTest(argv=argv),
+                patch.object(simple_brush.sys, "argv", argv),
+                patch("builtins.input") as user_input,
+                patch.object(simple_brush, "run", return_value=0) as run,
+            ):
+                self.assertEqual(simple_brush.main(), 0)
+                user_input.assert_not_called()
+                run.assert_called_once_with()
 
 
 if __name__ == "__main__":

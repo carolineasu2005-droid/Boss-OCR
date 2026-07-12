@@ -46,6 +46,7 @@ from calibration_profiles import (
     scan_profiles,
     screen_region_from_dict,
 )
+from calibration_template import main as calibration_template_main
 from ocr_detector import MSSScreenCapture, OCRKeywordDetector, RapidOCRBackend
 from ocr_text import parse_keyword_rules
 from mouse_motion import (
@@ -109,6 +110,15 @@ def parse_args():
         else:
             i += 1
     return args
+
+
+def is_noninteractive_startup(cli_args):
+    """Return whether command-line options must bypass the startup menu."""
+    return bool(
+        cli_args.get('auto')
+        or cli_args.get('keywords')
+        or cli_args.get('calibration_profile')
+    )
 
 # 修复 Windows 终端 UTF-8 输出
 try:
@@ -340,6 +350,36 @@ listener = keyboard.Listener(on_press=on_press)
 
 
 # ─── 用户交互输入 ───────────────────────────────────
+def choose_startup_action():
+    """Prompt an interactive user to run BossOCR, calibrate, or exit."""
+    while True:
+        raw = input(
+            '\n请选择操作：\n\n'
+            '1. 开始运行 BossOCR\n'
+            '2. 创建或更新校准模板\n'
+            '0. 退出\n> '
+        ).strip()
+        if raw == '1':
+            return 'run'
+        if raw == '2':
+            return 'calibrate'
+        if raw == '0':
+            return 'exit'
+        print('  输入无效，请输入 1、2 或 0。')
+
+
+def launch_calibration_template():
+    """Run the existing template generator and always return to this process."""
+    try:
+        calibration_template_main()
+    except KeyboardInterrupt:
+        print('\n校准模板流程已取消，未保存不完整模板。')
+    except Exception as exc:
+        print(f'\n校准模板启动失败：{exc}')
+    finally:
+        print('校准模板流程结束，返回启动菜单。')
+
+
 def parse_duration_seconds(raw_value):
     """Parse an optional non-negative integer duration in seconds."""
     value = '' if raw_value is None else str(raw_value).strip()
@@ -624,7 +664,7 @@ def get_user_input(
 ):
     """
     获取关键词、备选邮箱和本次运行时间。
-    auto=True 或 keywords 已传入时跳过交互。
+    auto=True、关键词或模板参数已传入时跳过交互。
     """
     global forward_keywords, backup_email, forward_enabled, run_duration_seconds
     global action_mode
@@ -634,7 +674,7 @@ def get_user_input(
     global selected_calibration_profile
 
     # ── 非交互模式（命令行传参或 --auto） ──
-    if auto or keywords_str:
+    if auto or keywords_str or calibration_profile_name:
         action_mode = action_mode_value or ACTION_MODE_FORWARD
         selected_calibration_profile = None
         focus_restore_calibration_requested = False
@@ -1986,10 +2026,30 @@ def run():
     return 0
 
 
+def main():
+    """Dispatch the interactive startup menu without changing CLI run behavior."""
+    try:
+        cli_args = parse_args()
+    except ValueError as exc:
+        print(f'[错误] {exc}')
+        return 2
+
+    if is_noninteractive_startup(cli_args):
+        return run()
+
+    while True:
+        action = choose_startup_action()
+        if action == 'run':
+            return run()
+        if action == 'exit':
+            return 0
+        launch_calibration_template()
+
+
 if __name__ == '__main__':
     exit_code = 0
     try:
-        exit_code = run() or 0
+        exit_code = main() or 0
     except KeyboardInterrupt:
         pass
     finally:

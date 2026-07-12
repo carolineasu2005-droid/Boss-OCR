@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, TextIO
 
@@ -30,6 +31,7 @@ CALIBRATION_PROFILE_USAGE_NOTICE = (
 CALIBRATION_PROFILE_OFFSET_RISK_NOTICE = (
     "如果窗口位置、窗口大小或页面缩放发生变化，旧模板中的点击区域可能发生偏移，建议重新校准。"
 )
+CALIBRATION_STEP_WAIT_SECONDS = 3
 
 STAGE_TITLES = {
     "A": "阶段 A：候选人基础区域",
@@ -90,10 +92,22 @@ def _steps_by_stage(steps: Iterable[CalibrationStep]):
     return grouped
 
 
+def wait_before_region_selection(
+    seconds: int = CALIBRATION_STEP_WAIT_SECONDS,
+    output: TextIO = sys.stdout,
+) -> None:
+    """Give the user time to read a template-step prompt before selection."""
+    print(f"{seconds} 秒后开始框选……", file=output)
+    for remaining in range(seconds, 0, -1):
+        print(remaining, file=output)
+        time.sleep(1)
+
+
 def collect_calibration_areas(
     *,
     steps: Iterable[CalibrationStep] = calibration_steps(),
     select_region: Callable[..., ScreenRegion] = select_screen_region,
+    wait_before_selection: Callable[..., None] = wait_before_region_selection,
     output: TextIO = sys.stdout,
 ) -> Dict[str, ScreenRegion]:
     areas: Dict[str, ScreenRegion] = {}
@@ -115,6 +129,7 @@ def collect_calibration_areas(
             print(f"[{stage}-{index}] {step.display_name}", file=output)
             print(step.precondition, file=output)
             print(step.instruction, file=output)
+            wait_before_selection(CALIBRATION_STEP_WAIT_SECONDS, output=output)
 
             region = select_region(
                 min_size=step.min_size,

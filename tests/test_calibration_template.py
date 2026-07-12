@@ -2,7 +2,7 @@ from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 
 import calibration_template
 from calibration_profiles import load_profile, profile_path
@@ -24,6 +24,10 @@ def fixed_system_info():
 
 
 class CalibrationTemplateTests(unittest.TestCase):
+    def setUp(self):
+        self.sleep = patch.object(calibration_template.time, "sleep").start()
+        self.addCleanup(patch.stopall)
+
     def test_successful_generation_saves_all_registered_areas(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -122,6 +126,43 @@ class CalibrationTemplateTests(unittest.TestCase):
             self.assertIn("min_size", kwargs)
             self.assertIn("instruction", kwargs)
             self.assertIn("subtitle", kwargs)
+
+    def test_each_step_waits_three_seconds_before_region_selection(self):
+        selected_regions = [region(index) for index in range(11)]
+        calls = []
+
+        def wait_before_selection(seconds, *, output):
+            calls.append(("wait", seconds, output))
+
+        def select_region(**_kwargs):
+            calls.append(("select",))
+            return selected_regions.pop(0)
+
+        output = StringIO()
+        calibration_template.collect_calibration_areas(
+            select_region=select_region,
+            wait_before_selection=wait_before_selection,
+            output=output,
+        )
+
+        self.assertEqual(
+            [item[0] for item in calls],
+            [item for _ in calibration_field_names() for item in ("wait", "select")],
+        )
+        self.assertEqual(
+            [item[1] for item in calls if item[0] == "wait"],
+            [calibration_template.CALIBRATION_STEP_WAIT_SECONDS]
+            * len(calibration_field_names()),
+        )
+
+    def test_wait_before_region_selection_counts_down_with_mocked_sleep(self):
+        output = StringIO()
+
+        calibration_template.wait_before_region_selection(output=output)
+
+        self.sleep.assert_has_calls([call(1), call(1), call(1)])
+        self.assertEqual(self.sleep.call_count, 3)
+        self.assertIn("3 秒后开始框选", output.getvalue())
 
 
 if __name__ == "__main__":
