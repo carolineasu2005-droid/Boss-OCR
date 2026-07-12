@@ -47,7 +47,9 @@ bash scripts/build_macos_beta.sh
 3. 检查 Python 版本、PyInstaller 和运行依赖；
 4. 清理 `build/macos` 与 `dist/BossOCR`；
 5. 使用 `BossOCR-macos.spec` 构建 console onedir 包；
-6. 验证 `dist/BossOCR/BossOCR` 已生成且可执行。
+6. 验证 `dist/BossOCR/BossOCR` 已生成且可执行；
+7. 从临时 CWD 使用绝对路径运行只选择“退出”的安全冒烟，随后删除临时目录；
+8. 拒绝包含 `logs/`、`calibration_profiles/`、日志、`.DS_Store` 或 Python 运行时缓存的 onedir。
 
 现有通用 `BossOCR.spec` 不会被修改或调用，因此 Windows 打包流程保持不变。
 
@@ -76,7 +78,9 @@ dist/BossOCR/BossOCR
   PYZ 模块清单；
 - onedir 顶层只有 `dist/BossOCR/BossOCR` 一个可执行入口；
 - 没有生成 `.app`；
-- 没有把 `calibration_profiles/*.json` 用户模板打入产物。
+- 没有把 `calibration_profiles/*.json` 用户模板打入产物；
+- 安全冒烟产生的日志和其他运行时文件只写入临时 CWD，不污染 `dist/BossOCR`；
+- 压缩前 `dist/BossOCR` 不包含日志、模板目录、`.DS_Store` 或 Python 缓存。
 
 ## 校准模板路径验证
 

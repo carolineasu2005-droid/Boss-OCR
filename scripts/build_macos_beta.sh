@@ -136,11 +136,55 @@ if find "${OUTPUT_DIR}" -path '*/calibration_profiles/*.json' -print -quit | gre
     exit 1
 fi
 
+SMOKE_DIR="$(mktemp -d)"
+cleanup_smoke_dir() {
+    rm -rf "${SMOKE_DIR}"
+}
+trap cleanup_smoke_dir EXIT
+
+set +e
+(
+    cd "${SMOKE_DIR}"
+    printf '3\n' | "${OUTPUT_BIN}"
+)
+SMOKE_EXIT=$?
+set -e
+
+if [[ "${SMOKE_EXIT}" -ne 0 ]]; then
+    echo "ERROR: BossOCR packaged smoke test failed with exit code ${SMOKE_EXIT}." >&2
+    exit "${SMOKE_EXIT}"
+fi
+
+rm -rf "${SMOKE_DIR}"
+trap - EXIT
+
+FORBIDDEN_OUTPUT="$(
+    find "${OUTPUT_DIR}" \
+        \( \
+            -type d -name 'logs' -o \
+            -path '*/logs/*' -o \
+            -type d -name 'calibration_profiles' -o \
+            -path '*/calibration_profiles/*' -o \
+            -name '*.log' -o \
+            -name '.DS_Store' -o \
+            -type d -name '__pycache__' -o \
+            -name '*.pyc' -o \
+            -name '*.pyo' \
+        \) -print
+)"
+
+if [[ -n "${FORBIDDEN_OUTPUT}" ]]; then
+    echo "ERROR: Forbidden runtime files found in packaged directory:" >&2
+    printf '%s\n' "${FORBIDDEN_OUTPUT}" >&2
+    exit 1
+fi
+
 echo
 echo "macOS beta onedir build completed."
 echo "Verified template modules: ${REQUIRED_TEMPLATE_MODULES[*]}"
 echo "Verified single entry: ${OUTPUT_BIN}"
-echo "Verified no .app and no calibration profile JSON in onedir."
+echo "Verified packaged smoke test from isolated temporary CWD."
+echo "Verified no .app, calibration profiles, logs, or runtime cache files in onedir."
 echo "Run from Terminal:"
 echo "  dist/BossOCR/BossOCR"
 echo
