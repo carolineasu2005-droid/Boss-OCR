@@ -24,6 +24,7 @@ calibration_profiles/*.json
 !docs/*.md
 !Issue-Next-7-windmouse-observable-motion-acceptance-report.md
 !Issue-calibration-template-module-acceptance-report.md
+!Issue-mac-calibration-template-module-acceptance-report.md
 !docs/TID-Windows-WindMouse-Observable-Motion.md
 !docs/calibration-template-smoke-test.md
 !release-notes/

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, TextIO
 
@@ -23,6 +24,8 @@ EXIT_SUCCESS = 0
 EXIT_CANCELLED = 2
 EXIT_NOT_OVERWRITTEN = 3
 EXIT_ERROR = 1
+
+CALIBRATION_STEP_DELAY_SECONDS = 3.0
 
 CALIBRATION_PROFILE_USAGE_NOTICE = (
     "调用校准模板前，请确保 Boss 页面窗口位置、大小、缩放状态与校准时基本一致。"
@@ -94,6 +97,7 @@ def collect_calibration_areas(
     *,
     steps: Iterable[CalibrationStep] = calibration_steps(),
     select_region: Callable[..., ScreenRegion] = select_screen_region,
+    sleep_fn: Callable[[float], None] = time.sleep,
     output: TextIO = sys.stdout,
 ) -> Dict[str, ScreenRegion]:
     areas: Dict[str, ScreenRegion] = {}
@@ -112,9 +116,14 @@ def collect_calibration_areas(
 
         for index, step in enumerate(stage_steps, start=1):
             print("", file=output)
-            print(f"[{stage}-{index}] {step.display_name}", file=output)
+            print(f"当前步骤：[{stage}-{index}] {step.display_name}", file=output)
             print(step.precondition, file=output)
             print(step.instruction, file=output)
+            print(
+                f"{CALIBRATION_STEP_DELAY_SECONDS:g} 秒后开始框选……",
+                file=output,
+            )
+            sleep_fn(CALIBRATION_STEP_DELAY_SECONDS)
 
             region = select_region(
                 min_size=step.min_size,
@@ -138,6 +147,7 @@ def create_calibration_profile_interactive(
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
     select_region: Callable[..., ScreenRegion] = select_screen_region,
+    sleep_fn: Callable[[float], None] = time.sleep,
     system_info_func: Callable[[], dict] = get_system_info,
 ) -> int:
     print("BossOCR 通用校准模板生成", file=output)
@@ -162,6 +172,7 @@ def create_calibration_profile_interactive(
         print(f"系统信息：{system_info}", file=output)
         areas = collect_calibration_areas(
             select_region=select_region,
+            sleep_fn=sleep_fn,
             output=output,
         )
         profile = build_profile(

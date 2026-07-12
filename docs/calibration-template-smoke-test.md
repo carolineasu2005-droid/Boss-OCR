@@ -1,6 +1,22 @@
 # 通用校准模板冒烟验收说明
 
-本文档用于验收 BossOCR 通用校准模板模块。Change 9 只补充测试与验收说明，不新增功能、不改变模板数据结构、不改变 CLI 行为。
+本文档用于验收 BossOCR 通用校准模板模块。它只记录既有流程的验证方式，不新增功能、不改变模板数据结构、不改变 CLI 行为。
+
+## 正式入口与 macOS 边界
+
+正式用户只启动一个 BossOCR 产物：源码入口为 `python simple_brush.py`，macOS onedir 入口为 `dist/BossOCR/BossOCR`。无参数启动后，主菜单必须只包含：
+
+```text
+1. 开始运行 BossOCR
+2. 创建/更新校准模板
+3. 退出
+```
+
+选择“创建/更新校准模板”在同一进程中执行，成功、取消或失败后均返回主菜单；取消、未确认覆盖或失败均不得保存不完整模板。`calibration_template.py` 仅是开发、自动化测试和排障的直接入口，不是正式用户入口，也不得打包成第二个 App。
+
+macOS 模板路径合同为 `PROFILE_DIR = Path("calibration_profiles")`：模板相对启动时 CWD 保存，而非相对源码或可执行文件。仓库根目录启动源码时为 `$PROJECT_ROOT/calibration_profiles`；在 `dist/BossOCR` 内启动 onedir 时为 `$PROJECT_ROOT/dist/BossOCR/calibration_profiles`；其他 CWD 则为 `$CWD/calibration_profiles`。
+
+macOS 必须为实际运行主体授予辅助功能、屏幕录制和输入监控权限；Terminal、IDE、Python 和 onedir 可执行文件可能是不同授权主体。权限变更后完全退出并重新启动该主体。校准和运行前保持 Boss 页面窗口位置、窗口大小和浏览器缩放状态一致；Retina 坐标门禁不做自动缩放或跨显示器适配。
 
 ## 自动化测试
 
@@ -33,7 +49,7 @@ venv\Scripts\python.exe -m unittest discover -s tests -v
 
 ## 人工冒烟前置条件
 
-1. Microsoft Edge 已登录 BOSS 直聘，并打开可测试的候选人页面。
+1. macOS Chrome 已登录 BOSS 直聘，并打开可测试的候选人页面。
 2. 使用测试账号、测试关键词和安全参数，首次验证建议开启 `--no-forward`。
 3. 校准与运行时保持同一台设备、同一主显示器、同一 Boss 页面窗口位置、窗口大小和浏览器缩放。
 4. 调用校准模板前，确认程序出现以下提示：
@@ -62,6 +78,8 @@ venv\Scripts\python.exe calibration_template.py
 10. 在不同分辨率或 DPI 下加载模板，确认交互模式出现风险提示；非交互模式应明确失败。
 11. 保持 Boss 页面窗口位置、大小、缩放状态与校准时一致，确认点击区域不发生明显偏移。
 12. 使用模板前确认窗口位置、大小、缩放一致性提示已经出现。
+13. 在目标 Mac 的 Retina 显示器上完成坐标门禁：display fingerprint、MSS request/result scale、Tk selection 到截图 crop mapping 和 crop preview 人工确认均通过；不得把此结果解释为 Retina 自动缩放。
+14. 确认实际运行主体已具备辅助功能、屏幕录制和输入监控权限；拒绝或缺失任一权限时停止，不继续 GUI 业务动作。
 
 ## 非交互模式检查
 
@@ -85,4 +103,4 @@ venv\Scripts\python.exe simple_brush.py --keywords '"测试关键词"' --no-forw
 
 ## 打包说明
 
-本 Change 不修改打包流程，也不新增第二个 EXE。当前源码运行入口为 `calibration_template.py`；如果后续发布包需要暴露独立校准入口，应在发布验收时确认 `calibration_profiles.py`、`calibration_steps.py`、`calibration_template.py` 已被收集，并单独评估是否需要更新 PyInstaller spec 或批处理入口。
+macOS onedir 只交付 `dist/BossOCR/BossOCR` 一个正式入口。构建验收必须确认 `calibration_profiles.py`、`calibration_steps.py`、`calibration_template.py` 被收集为模块，但不生成 `calibration_template` 可执行文件、第二个 App 或用户模板 JSON。模板创建由该唯一入口的主菜单调用。

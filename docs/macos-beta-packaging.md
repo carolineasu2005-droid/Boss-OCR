@@ -1,6 +1,6 @@
 # BossOCR macOS beta 打包与运行
 
-本方案生成可从终端运行的 PyInstaller `onedir` 产物：
+本方案生成唯一、可从终端运行的 PyInstaller `onedir` 正式产物：
 
 ```text
 dist/BossOCR/BossOCR
@@ -62,7 +62,7 @@ dist/BossOCR/BossOCR
 分发时必须保留整个 `dist/BossOCR` 目录，不能只复制同名可执行文件；onedir
 目录中的 Python、OCR 模型、动态库和其他依赖都是运行所需内容。
 
-无参数启动唯一入口后会显示：
+正式用户只启动这一个 BossOCR 产物；不提供第二个 App、第二个可执行文件或独立模板工具。无参数启动唯一入口后会显示：
 
 ```text
 1. 开始运行 BossOCR
@@ -70,8 +70,7 @@ dist/BossOCR/BossOCR
 3. 退出
 ```
 
-模板创建继续复用主程序静态导入的 `calibration_template.py`，不会启动第二个
-程序。构建脚本会在 PyInstaller 完成后验证：
+模板创建继续复用主程序静态导入的 `calibration_template.py`，在同一进程中完成，成功、取消或失败后均回到主菜单；取消或失败不保存不完整模板。`calibration_template.py` 只作为开发、自动化测试和排障时的直接调用入口，不是正式用户入口。构建脚本会在 PyInstaller 完成后验证：
 
 - `calibration_profiles`、`calibration_steps`、`calibration_template` 均已进入
   PYZ 模块清单；
@@ -97,13 +96,15 @@ PROFILE_DIR = Path("calibration_profiles")
 | 在 onedir 目录内启动 | `$PROJECT_ROOT/dist/BossOCR/calibration_profiles` |
 | 从其他 CWD 启动 onedir | `$OTHER_CWD/calibration_profiles` |
 
-这证明移动 CWD 会改变模板读写位置。本次不切换到 Application Support，不添加
-双路径搜索或迁移层，也不改变 Windows 当前相对路径合同。
+这证明移动 CWD 会改变模板读写位置。本次不切换到 Application Support，不添加双路径搜索或迁移层，也不改变 Windows 当前相对路径合同。调用模板前必须保持 Boss 页面窗口位置、大小和浏览器缩放状态与校准时一致；坐标是绝对屏幕坐标，macOS Retina 门禁已完成实机验证，但不提供自动缩放或跨显示器适配。
 
-待人工确认的最小方案是：只在 macOS frozen 运行时，让单一模板目录解析函数把
-相对目录锚定到 `Path(sys.executable).resolve().parent / "calibration_profiles"`；
-源码运行和 Windows 默认值继续保持当前合同。该方案会让 onedir 内模板位置稳定，
-但目标目录是否始终可写仍需确认，因此本 Change 不实施。
+非交互运行不会猜测模板。显式加载时传入：
+
+```bash
+dist/BossOCR/BossOCR --keywords '"测试关键词"' --auto --calibration-profile "模板名称"
+```
+
+不传 `--calibration-profile` 时继续旧手动校准；指定模板不存在、损坏、字段缺失或系统信息不匹配时，非交互流程明确失败且不等待输入。
 
 ## 另一台 Mac 的首次运行与权限
 
@@ -114,8 +115,7 @@ macOS 隐私权限不会随打包产物复制。另一台 Mac 必须给实际运
 - 输入监控。
 
 “实际运行主体”可能显示为 Terminal、iTerm、其他终端宿主或 BossOCR 可执行
-文件。权限变更后，应完全退出相关终端和 BossOCR 进程，再重新启动。不要假设
-开发机上已经授权就代表目标 Mac 也已授权。
+文件。权限变更后，应完全退出相关终端和 BossOCR 进程，再重新启动。不要假设开发机上已经授权就代表目标 Mac 也已授权。权限缺失、坐标门禁不通过、校准取消或校准失败时，应停止当前动作或回到主菜单/旧手动流程，绝不继续盲点。
 
 ## 未签名、未公证限制
 
